@@ -42,9 +42,11 @@ s = s.replace('<manifest xmlns:android="http://schemas.android.com/apk/res/andro
 io.open('build/AndroidManifest.xml', 'w', encoding='utf-8').write(s)
 PY
 
-echo "==> 2/6 aapt2 link"
+echo "==> 2/6 aapt2 compile + link（现在有 res/mipmap 了，必须先 compile）"
+"$BUILD_TOOLS/aapt2.exe" compile --dir app/src/main/res -o "$OUT/res.zip"
 "$BUILD_TOOLS/aapt2.exe" link -o "$OUT/base.apk" -I "$ANDROID_JAR" \
-  --manifest "$OUT/AndroidManifest.xml" --min-sdk-version 29 --target-sdk-version 34
+  --manifest "$OUT/AndroidManifest.xml" "$OUT/res.zip" \
+  --min-sdk-version 29 --target-sdk-version 34
 
 echo "==> 3/6 javac"
 # 源码是 UTF-8，而 Windows 默认 ANSI 是 GBK；不指定编码会把中文注释/字符串读成乱码
