@@ -23,6 +23,7 @@
 | 外环：PI 锁水位 + 追帧 | ✅ | 把实际延迟锁到 `--latency` |
 | N 路混音 + 软限幅 | ✅ | float32 累加，阈值 0.85 |
 | WASAPI 系统音频采集 | ✅ | loopback + AUTOCONVERTPCM |
+| 进程回环 `--include/--exclude` | ✅ | Win10 2004+，只抓/排除指定进程树 |
 | WASAPI 低延迟输出 | ✅ | 事件驱动，默认 10 ms 缓冲 |
 | 内置信号源 `--tone` | ✅ | 无音频设备也能测；两路正弦叠加可数值验证混音 |
 | 抖动注入 `--jitter` | ✅ | 模拟 WiFi，验抖动缓冲 |
@@ -163,6 +164,8 @@ build/audiohub-source.exe --hub 127.0.0.1:47000 --tone 660 --stream-id 2
 | `--cap-ms` | 20 | 采集缓冲，越小越激进 |
 | `--tone <hz>` | 关 | 不发采集，改发内置正弦波 |
 | `--jitter <ms>` | 0 | 零均值发送抖动，模拟 WiFi |
+| `--include <exe>` | 关 | 只抓这个进程的声音 |
+| `--exclude <exe>` | 关 | 排除这个进程，其它照抓 |
 | `--verbose` | 关 | 每包打印，仅调试 |
 
 ### 实测（同机回环，`--latency 60`）
@@ -262,9 +265,9 @@ stream 1  水位 56 ms (目标 60) | 比率 1.00018 | 迟到 0 溢出 0 | 欠载
 
 ## 已知限制
 
-- **单机不能同时跑"真实采集"的 source 和 hub**：source 抓的是系统混音，
-  其中包含 hub 自己的输出，会形成反馈回路。用 `--tone` 或换一台设备当源。
-  正解是 Windows 10 2004+ 的 process loopback（排除指定进程再采集），还没做。
+- **单机跑真实采集必须加 `--exclude audiohub-hub.exe`**：否则 source 抓到的
+  系统混音里包含 hub 自己的输出，形成环回反馈。加了这个参数就干净了
+  （已实测：hub 正在播 440 Hz 时，排除后的源端抓到 −120 dBFS）。
 - **没有设备发现**，只能命令行填 IP。
 - **Hub 不能同时采集本机音频**。如果要做，必须用 Windows 10 2004+ 的
   `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK` + `EXCLUDE` 模式排除自身进程树，

@@ -21,6 +21,7 @@
 
 #include "audiohub/audio_format.hpp"
 #include "audiohub/clock_sync.hpp"
+#include "audiohub/meter.hpp"
 #include "audiohub/packet.hpp"
 #include "audiohub/spsc_ring.hpp"
 #include "audiohub/udp_socket.hpp"
@@ -47,6 +48,8 @@ struct Options {
   int stream_id = 1;
   int tone_hz = 0;        // >0 时用内置正弦代替采集
   int jitter_ms = 0;      // 模拟网络抖动（零均值）
+  std::string include_name;  // 进程回环：只抓这个进程树
+  std::string exclude_name;  // 进程回环：排除这个进程树
   bool verbose = false;
 };
 
@@ -59,6 +62,8 @@ void PrintUsage() {
       "  --cap-ms <n>        采集缓冲毫秒数，默认 20。越小延迟越低、越容易断\n"
       "  --tone <hz>         不发采集，改发内置正弦波。用于单机测多源混音\n"
       "  --jitter <ms>       给发送时刻加零均值随机抖动，模拟 WiFi\n"
+      "  --include <exe>     只抓这个进程的声音（Win10 2004+）\n"
+      "  --exclude <exe>     排除这个进程的声音，其它照抓（Win10 2004+）\n"
       "  --verbose           每包打印一次（调试用，会明显影响性能）\n",
       static_cast<unsigned>(47000));
 }
@@ -91,6 +96,10 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
       opt->tone_hz = std::stoi(next("--tone"));
     } else if (a == "--jitter") {
       opt->jitter_ms = std::stoi(next("--jitter"));
+    } else if (a == "--include") {
+      opt->include_name = next("--include");
+    } else if (a == "--exclude") {
+      opt->exclude_name = next("--exclude");
     } else if (a == "--verbose") {
       opt->verbose = true;
     } else if (a == "-h" || a == "--help") {
@@ -144,6 +153,9 @@ int main(int argc, char** argv) {
   std::atomic<uint64_t> dropped_samples{0};
 
   std::vector<int16_t> scratch;
+  // 采集侧电平：链路出问题时第一个要看的东西——
+  // 到底"没抓到声音"还是"抓到但没送到"。
+  audiohub::Meter capture_meter;
 
   // --tone 模式完全不碰声卡：没有音频设备也能跑，而且信号可重复。
   // 这是验证"多源混音是否正确"最直接的手段——两个不同频率的正弦叠加后，
@@ -152,16 +164,43 @@ int main(int argc, char** argv) {
   const bool tone_mode = opt.tone_hz > 0;
 
   if (!tone_mode) {
-    const bool ok = capture.Start(
-        [&](const float* data, int frames) {
-          const size_t samples = static_cast<size_t>(frames) * audiohub::kChannels;
-          if (scratch.size() < samples) scratch.resize(samples);
-          for (size_t i = 0; i < samples; ++i) scratch[i] = FloatToS16(data[i]);
-          const size_t written = ring.Write(scratch.data(), samples);
-          if (written < samples) dropped_samples += (samples - written);
-          captured_frames += static_cast<uint64_t>(frames);
-        },
-        opt.capture_buffer_ms);
+    const audiohub::CaptureCallback on_capture = [&](const float* data, int frames) {
+      const size_t samples = static_cast<size_t>(frames) * audiohub::kChannels;
+      if (scratch.size() < samples) scratch.resize(samples);
+      capture_meter.Add(data, samples);
+      for (size_t i = 0; i < samples; ++i) scratch[i] = FloatToS16(data[i]);
+      const size_t written = ring.Write(scratch.data(), samples);
+      if (written < samples) dropped_samples += (samples - written);
+      captured_frames += static_cast<uint64_t>(frames);
+    };
+
+    // 进程回环：单机上跑 source+hub 时，整机回环会抓到 hub 自己的输出，
+    // 形成"采集→播放→再采集"的反馈回路。--exclude 掉 hub 就能解开。
+    uint32_t target_pid = 0;
+    bool exclude_target = true;
+    std::string target_name;
+    if (!opt.exclude_name.empty() || !opt.include_name.empty()) {
+      exclude_target = !opt.exclude_name.empty();
+      target_name = exclude_target ? opt.exclude_name : opt.include_name;
+      // 等一下目标进程出现（最多 5 秒）。
+      // 否则用户先起 source 再起 hub 就会直接报错，而这两个程序的启动顺序
+      // 本来是没有意义的——报错只应该发生在"确实没有这个进程"的时候。
+      for (int i = 0; i < 25 && target_pid == 0; ++i) {
+        target_pid = audiohub::FindProcessIdByName(target_name);
+        if (target_pid == 0) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      }
+      if (target_pid == 0) {
+        std::printf("找不到进程 %s —— 它必须正在运行，且名字要带 .exe\n", target_name.c_str());
+        return 4;
+      }
+      std::printf("进程回环   : %s %s (pid=%u)\n", exclude_target ? "排除" : "只抓",
+                  target_name.c_str(), target_pid);
+    }
+
+    const bool ok = target_pid != 0
+                        ? capture.StartProcessLoopback(on_capture, target_pid, exclude_target,
+                                                       opt.capture_buffer_ms)
+                        : capture.Start(on_capture, opt.capture_buffer_ms);
 
     if (!ok) {
       std::printf("启动采集失败: %s\n", capture.last_error().c_str());
@@ -313,8 +352,13 @@ int main(int argc, char** argv) {
     const uint64_t p = sent_packets.load();
     const double rtt = measured_rtt_ms.load();
 
-    std::printf("采集 %5.1f kfps | 发送 %4llu pkt/s | 约 %6.1f kbps | RTT %5.1f ms | 单程 %5.1f ms | 丢 %llu\n",
-                (f - last_frames) / 1000.0, static_cast<unsigned long long>(p - last_packets),
+    double capture_level = -120.0;
+    const bool has_level = capture_meter.Take(&capture_level);
+    std::printf(
+        "采集 %5.1f kfps 电平 %6.1f dBFS | 发送 %4llu pkt/s | 约 %6.1f kbps | RTT %5.1f ms "
+        "| 单程 %5.1f ms | 丢 %llu\n",
+        (f - last_frames) / 1000.0, has_level ? capture_level : -120.0,
+        static_cast<unsigned long long>(p - last_packets),
                 (p - last_packets) * (packet_samples * 2 + audiohub::kHeaderSize) * 8.0 / 1000.0,
                 rtt, rtt * 0.5, static_cast<unsigned long long>(dropped_samples.load()));
     last_frames = f;
