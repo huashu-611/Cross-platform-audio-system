@@ -26,8 +26,6 @@ import android.util.Log;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 
 /**
  * 前台的采集服务。
@@ -230,8 +228,6 @@ public class CaptureService extends Service {
     private void workerLoop() {
         final short[] block = new short[PacketProtocol.FRAMES_PER_PACKET * PacketProtocol.CHANNELS];
         final byte[] packet = new byte[PacketProtocol.PACKET_BYTES];
-        final ByteBuffer payload = ByteBuffer.wrap(packet, PacketProtocol.HEADER_BYTES,
-                PacketProtocol.PAYLOAD_BYTES).order(ByteOrder.LITTLE_ENDIAN);
         final DatagramPacket datagram =
                 new DatagramPacket(packet, packet.length, address, port);
 
@@ -265,8 +261,7 @@ public class CaptureService extends Service {
 
             PacketProtocol.writeHeader(packet, streamId, seq++, samplePos,
                     (int) (SystemClock.elapsedRealtime() - t0));
-            payload.clear();
-            payload.asShortBuffer().put(block);
+            PacketProtocol.writePayload(packet, PacketProtocol.HEADER_BYTES, block, block.length);
 
             try {
                 socket.send(datagram);

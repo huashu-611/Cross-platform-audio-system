@@ -196,6 +196,8 @@ int main(int argc, char** argv) {
   std::atomic<uint64_t> received_packets{0};
   std::atomic<uint64_t> received_bytes{0};
   std::atomic<uint64_t> malformed{0};
+  // 只 dump 前 24 个包，够定位问题又不至于把日志刷爆
+  int raw_dump_budget = 24;
 
   // ---------------- 渲染 ----------------
   std::atomic<uint64_t> render_underruns{0};
@@ -233,6 +235,19 @@ int main(int argc, char** argv) {
       if (n <= 0) {
         std::this_thread::sleep_for(std::chrono::microseconds(200));
         continue;
+      }
+
+      // 协议调试：把最初若干个包的原始字节打出来。
+      // 跨平台联调时"我觉得编码对了"是最常见的误判来源，
+      // 直接看字节比任何推理都可靠。
+      if (raw_dump_budget > 0) {
+        raw_dump_budget--;
+        char hex[64] = {0};
+        const int shown = n < 16 ? n : 16;
+        for (int i = 0; i < shown; ++i) {
+          std::snprintf(hex + i * 3, sizeof(hex) - i * 3, "%02X ", buffer[i]);
+        }
+        std::printf("[RAW] len=%d  %s\n", n, hex);
       }
 
       audiohub::PacketHeader header;

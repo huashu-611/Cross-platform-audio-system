@@ -47,6 +47,25 @@ final class PacketProtocol {
         putInt(dst, 12, captureTsMs);
     }
 
+    /**
+     * 把交织 int16 样本按小端写进 dst[dstOffset..]。
+     *
+     * <b>为什么不用 ByteBuffer.asShortBuffer()：</b>
+     * 实测 {@code ByteBuffer.wrap(packet, 16, 960).order(LITTLE_ENDIAN)} 之后
+     * {@code clear()} + {@code asShortBuffer().put(block)} 写入的位置是
+     * <b>packet[0]</b> 而不是 packet[16]——wrap 的 offset 并没有变成视图的
+     * arrayOffset。结果是音频把 16 字节协议头整个覆盖掉，对端拿音频当头解，
+     * 流编号全是乱码、九成以上的包因为版本位不对被丢弃。
+     * 这个坑不报任何错，只能靠抓包发现，所以这里显式按字节写。
+     */
+    static void writePayload(byte[] dst, int dstOffset, short[] samples, int count) {
+        for (int i = 0; i < count; ++i) {
+            final int v = samples[i];
+            dst[dstOffset + i * 2] = (byte) (v & 0xFF);
+            dst[dstOffset + i * 2 + 1] = (byte) ((v >> 8) & 0xFF);
+        }
+    }
+
     private static void putShort(byte[] d, int off, int v) {
         d[off] = (byte) (v & 0xFF);
         d[off + 1] = (byte) ((v >> 8) & 0xFF);
