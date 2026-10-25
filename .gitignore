@@ -66,3 +66,14 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# ===== C++ / CMake（本项目）=====
+build-*/
+out/
+cmake-build-*/
+.vs/
+.vscode/
+*.user
+*.ninja
+*.gcda
+*.gcno

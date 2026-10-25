@@ -1,0 +1,1288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>跨端音频汇聚系统 · 技术调研与架构设计</title>
+<style>
+  :root{
+    --bg:#f5f7fa;
+    --card:#ffffff;
+    --text:#1a2230;
+    --muted:#5d6b7f;
+    --line:#e2e8f0;
+    --accent:#0d6a6b;
+    --accent-soft:#e6f4f3;
+    --indigo:#4f46e5;
+    --warn:#b45309;
+    --warn-bg:#fffaf0;
+    --danger:#b91c1c;
+    --danger-bg:#fef4f4;
+    --ok:#15803d;
+    --ok-bg:#f0fdf4;
+    --code-bg:#f8fafc;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;
+    background:var(--bg);
+    color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    font-size:15px;
+    line-height:1.75;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1080px;margin:0 auto;padding:0 28px 100px}
+
+  /* ---------- header ---------- */
+  header{
+    background:linear-gradient(135deg,#0d6a6b 0%,#124e5f 55%,#1b3a52 100%);
+    color:#fff;
+    padding:56px 28px 46px;
+    margin-bottom:0;
+  }
+  header .inner{max-width:1080px;margin:0 auto}
+  header .eyebrow{font-size:12.5px;letter-spacing:.18em;text-transform:uppercase;opacity:.72;margin-bottom:14px}
+  header h1{font-size:33px;line-height:1.3;margin:0 0 14px;font-weight:650;letter-spacing:-.3px}
+  header p.lead{font-size:15.5px;margin:0 0 26px;opacity:.88;max-width:760px}
+  .chips{display:flex;flex-wrap:wrap;gap:9px}
+  .chip{
+    background:rgba(255,255,255,.14);
+    border:1px solid rgba(255,255,255,.22);
+    border-radius:100px;
+    padding:5px 13px;
+    font-size:12.5px;
+    backdrop-filter:blur(4px);
+  }
+
+  /* ---------- nav ---------- */
+  nav{
+    position:sticky;top:0;z-index:50;
+    background:rgba(255,255,255,.94);
+    backdrop-filter:blur(10px);
+    border-bottom:1px solid var(--line);
+    margin-bottom:34px;
+  }
+  nav .inner{max-width:1080px;margin:0 auto;padding:0 28px;display:flex;gap:4px;overflow-x:auto;scrollbar-width:none}
+  nav .inner::-webkit-scrollbar{display:none}
+  nav a{
+    color:var(--muted);text-decoration:none;font-size:13px;padding:13px 11px;
+    white-space:nowrap;border-bottom:2px solid transparent;transition:.15s;
+  }
+  nav a:hover{color:var(--accent);border-bottom-color:var(--accent)}
+
+  /* ---------- section ---------- */
+  section{
+    background:var(--card);
+    border:1px solid var(--line);
+    border-radius:14px;
+    padding:30px 34px 34px;
+    margin-bottom:22px;
+    box-shadow:0 1px 2px rgba(16,24,40,.03);
+  }
+  section > h2{
+    font-size:21px;margin:0 0 6px;font-weight:650;letter-spacing:-.2px;
+    display:flex;align-items:baseline;gap:11px;
+  }
+  section > h2 .num{
+    font-size:12px;font-weight:700;color:var(--accent);
+    background:var(--accent-soft);border-radius:6px;padding:3px 8px;
+    letter-spacing:.04em;flex:none;
+  }
+  section > h2 + p.sub{margin:0 0 22px;color:var(--muted);font-size:14px}
+  h3{font-size:16px;margin:30px 0 11px;font-weight:650;color:#0f2937}
+  h3:first-of-type{margin-top:8px}
+  h4{font-size:14px;margin:20px 0 8px;font-weight:650;color:#243447}
+  p{margin:0 0 13px}
+  ul,ol{margin:0 0 14px;padding-left:22px}
+  li{margin:5px 0}
+  strong{font-weight:650;color:#0f2937}
+  code{
+    font-family:"JetBrains Mono","Cascadia Code",Consolas,"Courier New",monospace;
+    font-size:12.8px;background:#eef2f7;color:#b02a5b;
+    padding:1.5px 5px;border-radius:4px;word-break:break-word;
+  }
+  a{color:var(--accent)}
+
+  /* ---------- table ---------- */
+  .scroll{overflow-x:auto;margin:0 0 18px;border:1px solid var(--line);border-radius:10px}
+  .hint{font-size:12px;color:#8494a6;margin:-12px 0 16px;display:flex;align-items:center;gap:5px}
+  .hint::before{content:"⇢";font-size:13px;color:#a9b8c8}
+  table{border-collapse:collapse;width:100%;font-size:13.2px;min-width:100%}
+  th{
+    background:#f4f7fa;text-align:left;padding:10px 13px;font-weight:650;
+    color:#243447;border-bottom:1px solid var(--line);white-space:nowrap;font-size:12.5px;
+  }
+  td{padding:9px 13px;border-bottom:1px solid #eef2f6;vertical-align:top}
+  tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:#fafcfe}
+  td.nowrap{white-space:nowrap}
+  .t-num{font-variant-numeric:tabular-nums}
+
+  /* ---------- callout ---------- */
+  .callout{
+    border-left:3px solid var(--accent);
+    background:var(--accent-soft);
+    padding:14px 18px;border-radius:0 9px 9px 0;margin:0 0 18px;font-size:14px;
+  }
+  .callout.warn{border-left-color:var(--warn);background:var(--warn-bg)}
+  .callout.danger{border-left-color:var(--danger);background:var(--danger-bg)}
+  .callout.ok{border-left-color:var(--ok);background:var(--ok-bg)}
+  .callout .t{font-weight:700;display:block;margin-bottom:4px;font-size:13px;letter-spacing:.02em}
+  .callout p:last-child{margin-bottom:0}
+
+  /* ---------- badge ---------- */
+  .b{display:inline-block;border-radius:5px;padding:1px 7px;font-size:11.5px;font-weight:650;white-space:nowrap;line-height:1.6}
+  .b-no{background:#fdeaea;color:#b42318}
+  .b-mid{background:#fff4e2;color:#a15c07}
+  .b-yes{background:#e8f7ee;color:#147a3d}
+  .b-i{background:#eef0fe;color:#4338ca}
+
+  /* ---------- code ---------- */
+  pre{
+    background:var(--code-bg);border:1px solid var(--line);border-left:3px solid #94a3b8;
+    border-radius:0 9px 9px 0;padding:15px 18px;overflow-x:auto;
+    font-size:12.6px;line-height:1.65;margin:0 0 16px;
+  }
+  pre code{background:none;color:#1e293b;padding:0;font-size:inherit}
+  pre .c{color:#64748b}
+
+  /* ---------- architecture ---------- */
+  .arch{background:#fbfcfe;border:1px solid var(--line);border-radius:12px;padding:26px 20px 20px;margin:0 0 20px}
+  .sources{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;margin-bottom:8px}
+  .src-box{
+    flex:1 1 0;min-width:150px;max-width:210px;background:#fff;border:1px solid #cfdbe6;
+    border-radius:9px;padding:11px 12px;text-align:center;box-shadow:0 1px 2px rgba(16,24,40,.04);
+  }
+  .src-box .nm{font-weight:650;font-size:13px;color:#0d5f6b}
+  .src-box .ds{font-size:11.5px;color:var(--muted);margin-top:3px;line-height:1.5}
+  .arrows{
+    display:grid;grid-template-columns:repeat(3,minmax(0,210px));
+    justify-content:center;gap:14px;height:26px;align-items:center;
+  }
+  .arrows span{color:#8fa8bc;font-size:17px;line-height:1;text-align:center}
+  .hub{
+    border:1.5px solid #0d6a6b;border-radius:11px;background:#fff;padding:0;overflow:hidden;
+    box-shadow:0 2px 8px rgba(13,106,107,.09);
+  }
+  .hub-hd{background:#0d6a6b;color:#fff;padding:8px 16px;font-size:12.5px;font-weight:650;letter-spacing:.04em}
+  .lanes{display:flex;flex-direction:column;gap:0;padding:4px 0}
+  .lane{display:flex;align-items:center;gap:11px;padding:8px 16px;font-size:12.5px}
+  .lane + .lane{border-top:1px dashed #e2e8f0}
+  .lane .k{color:#7b8b9e;font-size:11.5px;font-weight:650;width:64px;flex:none}
+  .lane .v{color:#243447}
+  .out-arrow{text-align:center;color:#9bb0c4;font-size:15px;padding:7px 0}
+  .out-box{
+    text-align:center;background:#eef4f7;border:1px dashed #93aec0;border-radius:9px;
+    padding:10px;font-size:12.5px;color:#1c3f52;font-weight:600;
+  }
+
+  /* ---------- matrix ---------- */
+  .matrix{display:grid;grid-template-columns:110px 1fr 1fr;gap:0;margin:0 0 20px;font-size:12.5px;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .matrix > div{padding:12px;border-right:1px solid var(--line);border-bottom:1px solid var(--line);background:#fff}
+  .matrix > div:nth-child(3n){border-right:none}
+  .matrix > div.hd{background:#f4f7fa;font-weight:650;color:#243447;text-align:center;font-size:12px}
+  .matrix .axis{background:#f9fbfc;font-weight:650;color:#3c4c60;display:flex;align-items:center;font-size:12px}
+  .matrix .empty{background:#fdf6f6;border:1px dashed #e0a3a3;border-radius:7px;margin:5px;color:#a03b3b;font-weight:650;text-align:center;padding:10px 6px}
+  .matrix .f{border-radius:7px;margin:5px;padding:9px 8px;line-height:1.7}
+  .matrix .f.f1{background:#eef7f6;border:1px solid #b9dcd8}
+  .matrix .f.f2{background:#f3f2fd;border:1px solid #cfcbf6}
+  .matrix .f b{display:block;font-size:12.5px;margin-bottom:2px}
+
+  /* ---------- bars ---------- */
+  .bars{margin:6px 0 20px}
+  .bar-row{display:grid;grid-template-columns:186px 1fr 84px;gap:11px;align-items:center;margin-bottom:8px;font-size:12.5px;white-space:nowrap}
+  .bar-row .lbl{color:#3c4c60}
+  .bar-track{background:#eef2f7;border-radius:5px;height:19px;position:relative;overflow:hidden}
+  .bar-fill{height:100%;border-radius:5px;background:linear-gradient(90deg,#0d6a6b,#169c95);display:flex;align-items:center;justify-content:flex-end;padding-right:7px;color:#fff;font-size:11px;font-weight:650}
+  .bar-fill.soft{background:linear-gradient(90deg,#7aa5c4,#9dbdd6)}
+  .bar-fill.red{background:linear-gradient(90deg,#c05252,#d97a7a)}
+  .bar-row .val{text-align:right;font-variant-numeric:tabular-nums;color:#243447;font-weight:600}
+  .total-row{
+    display:flex;justify-content:space-between;align-items:center;
+    border-top:2px solid var(--line);padding-top:10px;margin-top:4px;font-weight:650;font-size:13.5px;
+  }
+
+  /* ---------- kv ---------- */
+  .kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:12px;margin:0 0 18px}
+  .kv .item{background:#f8fbfc;border:1px solid #e3edf1;border-radius:9px;padding:13px 15px}
+  .kv .item .t{font-size:11.5px;color:var(--muted);letter-spacing:.05em;font-weight:650;margin-bottom:3px}
+  .kv .item .v{font-size:19px;font-weight:700;color:#0d5f6b;font-variant-numeric:tabular-nums;line-height:1.35}
+  .kv .item .n{font-size:12px;color:var(--muted);margin-top:2px}
+
+  /* ---------- step ---------- */
+  .steps{counter-reset:s;margin:0 0 16px}
+  .step{position:relative;padding:0 0 18px 44px;border-left:2px solid #e2e8f0;margin-left:13px}
+  .step:last-child{border-left-color:transparent;padding-bottom:0}
+  .step::before{
+    counter-increment:s;content:"P" counter(s);
+    position:absolute;left:-15px;top:-2px;width:30px;height:30px;border-radius:50%;
+    background:#0d6a6b;color:#fff;font-size:11.5px;font-weight:700;
+    display:flex;align-items:center;justify-content:center;
+  }
+  .step .sh{font-weight:650;font-size:14px;margin-bottom:2px}
+  .step .sm{font-size:12.5px;color:var(--muted);margin-bottom:5px}
+  .step .sb{font-size:13px}
+
+  footer{color:var(--muted);font-size:12.5px;text-align:center;padding:26px 0 0}
+
+  @media (max-width:720px){
+    .wrap{padding:0 14px 60px}
+    section{padding:22px 18px}
+    header{padding:40px 18px 34px}
+    header h1{font-size:25px}
+    .bar-row{grid-template-columns:110px 1fr 74px;font-size:11.5px}
+    .matrix{grid-template-columns:80px 1fr 1fr}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="inner">
+    <div class="eyebrow">Technical Research &amp; Architecture</div>
+    <h1>跨端音频汇聚系统<br>多设备 → 单一输出端的声音汇聚</h1>
+    <p class="lead">
+      让多台设备（手机 / 平板 / 电脑）各自正在播放的声音，同时送到同一台设备的扬声器或该设备插着的耳机上播出来。
+      输出端为 Windows PC 与 Android，首要指标是<strong>低延迟与音画同步</strong>。
+    </p>
+    <div class="chips">
+      <span class="chip">拓扑：N 源 → 1 宿</span>
+      <span class="chip">宿端：Windows / Android</span>
+      <span class="chip">目标：端到端 60–100 ms</span>
+      <span class="chip">2026-10-25</span>
+    </div>
+  </div>
+</header>
+
+<nav>
+  <div class="inner">
+    <a href="#tldr">结论</a>
+    <a href="#req">需求</a>
+    <a href="#survey">方案调研</a>
+    <a href="#gap">缺口</a>
+    <a href="#design">总体架构</a>
+    <a href="#capture">采集</a>
+    <a href="#proto">传输</a>
+    <a href="#clock">时钟</a>
+    <a href="#playout">播放</a>
+    <a href="#avsync">音画同步</a>
+    <a href="#tradeoff">取舍</a>
+    <a href="#risks">难点</a>
+    <a href="#roadmap">路线</a>
+    <a href="#code">代码</a>
+    <a href="#validate">验证</a>
+  </div>
+</nav>
+
+<div class="wrap">
+
+<!-- ============ TL;DR ============ -->
+<section id="tldr">
+  <h2><span class="num">00</span>结论先行</h2>
+  <p class="sub">如果你只读一段，读这段。</p>
+
+  <div class="callout danger">
+    <span class="t">核心结论</span>
+    <p><strong>没有任何一个现成开源项目能直接满足这个场景。</strong>不是"不太好用"，是<em>三个必要条件同时成立的项目不存在</em>：
+    ① 抓取「别的 App」的系统播放音频、② 多路汇聚到一台设备并混音、③ 延迟低到能对齐画面。市面上每个项目最多满足两条。</p>
+  </div>
+
+  <div class="kv">
+    <div class="item"><div class="t">现实可达成延迟</div><div class="v">60–100 ms</div><div class="n">有线/5G WiFi + 有线耳机</div></div>
+    <div class="item"><div class="t">「&lt;40 ms」目标</div><div class="v">不可达</div><div class="n">WiFi + Android 采集下无解</div></div>
+    <div class="item"><div class="t">蓝牙耳机场景</div><div class="v">+150~250 ms</div><div class="n">直接摧毁音画同步</div></div>
+    <div class="item"><div class="t">自研 MVP 规模</div><div class="v">~26 人日</div><div class="n">Windows + Android 双端</div></div>
+  </div>
+
+  <p><strong>五个判断：</strong></p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th style="width:30%">判断</th><th>依据（详见后文）</th></tr></thead>
+    <tbody>
+      <tr><td>现成方案全部不达标</td><td>1→N 的多房间方案（Snapcast / AirPlay / Cast）拓扑是反的；N→1 的方案（PulseAudio / VBAN）平台不对；多对多的方案（SonoBus / Jamulus）采集的是麦克风而不是系统播放音频</td></tr>
+      <tr><td>WebRTC 不适合做底层</td><td>NetEq 抖动缓冲目标值自适应到 40–200 ms，<code>jitterBufferTarget</code> 只能给下界，压不到 30 ms；对"延迟必须可预测"的本地场景是负资产</td></tr>
+      <tr><td>真正的敌人是「抖动」和「蓝牙」</td><td>固定 100 ms 偏移比 60±30 ms 的抖动更容易接受；蓝牙输出一次性 +150~250 ms，任何优化都白做</td></tr>
+      <tr><td>本场景的「同步」不是 Snapcast 那种同步</td><td>各源内容不同，没有共同内容时间轴。要做的是<strong>延迟锁定 + 漂移消除</strong>，不是采样级对齐</td></tr>
+      <tr><td>建议复用 Opus，其余自研</td><td>编码器不是瓶颈（10 ms 帧只占 12.5 ms）；瓶颈在采集、缓冲策略和时钟。<strong>自研量集中在这三块</strong></td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- ============ 需求 ============ -->
+<section id="req">
+  <h2><span class="num">01</span>需求的形式化</h2>
+  <p class="sub">把"想让声音从一台设备的喇叭出来"翻译成工程约束。</p>
+
+  <p>场景：N 台源设备各自播放不同内容，1 台 Hub（Windows PC 或 Android）的扬声器 / 有线耳机是唯一声音出口。源端可以是 Hub 自己。</p>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th style="width:64px">编号</th><th style="width:26%">需求</th><th>技术翻译</th></tr></thead>
+    <tbody>
+      <tr><td class="t-num">R1</td><td>源端要能抓「别人的 App」</td><td>只有系统级采集 API 可行（Android AudioPlaybackCapture / Windows WASAPI loopback / macOS Core Audio Tap）。应用内播放器抓自己的音频不算解法</td></tr>
+      <tr><td class="t-num">R2</td><td>单向、低延迟、允许丢包</td><td>UDP。丢一个 10 ms 帧用 PLC 补，比等 200 ms 重传好得多</td></tr>
+      <tr><td class="t-num">R3</td><td>Hub 侧 N 路同时混音</td><td>每源独立解码 + 抖动缓冲 + 求和；还要能跟 Hub 本机音频共存</td></tr>
+      <tr><td class="t-num">R4</td><td>每路延迟「低且稳定」</td><td>听者同时看着源设备的屏幕，所以是<strong>音画同步</strong>问题，不是"能听见就行"</td></tr>
+      <tr><td class="t-num">R5</td><td>长时间运行不漂移</td><td>源与 Hub 的晶振不同源，必须做异步采样率转换（ASRC）</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>三个最容易被忽略、但决定项目成败的约束</h3>
+  <div class="callout warn">
+    <span class="t">约束一 · 出口设备是天花板</span>
+    <p>Hub 如果接<strong>蓝牙耳机</strong>，链路一次性 +150~250 ms（A2DP 缓冲 + 编解码），你的 60 ms 优化瞬间归零。
+    产品上必须<strong>主动检测输出设备类型并警告</strong>，这比任何算法优化都重要。USB-C / 3.5 mm 有线耳机、USB DAC 才有意义。</p>
+  </div>
+  <div class="callout warn">
+    <span class="t">约束二 · 源端采集是硬上限</span>
+    <p>Android 的 <code>AudioPlaybackCapture</code> 抓不到：DRM 内容（Netflix / 部分音乐平台）、在 Manifest 里声明 <code>allowAudioPlaybackCapture=false</code> 的 App、以及非 <code>USAGE_MEDIA/GAME/UNKNOWN</code> 的音频。
+    这不是 bug，是设计。产品文案不能承诺"什么都能抓"。</p>
+  </div>
+  <div class="callout warn">
+    <span class="t">约束三 · 多源之间没有共同时间轴</span>
+    <p>Snapcast 的同步前提是"所有客户端播同一份内容"，所以可以对同一个采样序号对齐。
+    我们这里 A 在放 B 站、B 在放游戏、C 在放音乐 —— <strong>没有共同的内容时间轴</strong>。
+    需要的是"每路的延迟锁定到同一个目标值 L"，这是完全不同的问题（详见 §07）。</p>
+  </div>
+</section>
+
+<!-- ============ 调研 ============ -->
+<section id="survey">
+  <h2><span class="num">02</span>现成方案调研</h2>
+  <p class="sub">13 个项目，按「拓扑」而不是按「功能」分类，因为拓扑决定它能不能用。</p>
+
+  <h3>2.1 先分类，再比较</h3>
+  <p>音频网络传输项目按拓扑只有四种。你的需求是 <strong>N→1（多源汇聚）</strong>，这一格本身就是所有分类里最冷门的。</p>
+
+  <div class="matrix">
+    <div class="hd"></div>
+    <div class="hd">1 → N（一路分发）</div>
+    <div class="hd">N → 1（多源汇聚）</div>
+
+    <div class="axis">抓系统音频</div>
+    <div>
+      <div class="f f1"><b>Snapcast</b>AirPlay 2 / shairport-sync<br>Chromecast groups<br>LMS / Squeezelite<br>AudioRelay（PC→手机）</div>
+    </div>
+    <div>
+      <div class="empty">← 你要的东西在这里<br>没有成熟开源实现</div>
+    </div>
+
+    <div class="axis">只抓输入设备<br>（麦克风/声卡）</div>
+    <div>
+      <div class="f f2"><b>SonoBus / Jamulus</b>JackTrip / SoundJack</div>
+    </div>
+    <div>
+      <div class="f f1"><b>PulseAudio / PipeWire</b>网络 sink（Linux）<br><b>VBAN + Voicemeeter</b>（Windows）<br>Dante Via（商业）</div>
+    </div>
+  </div>
+
+  <p>右下角那格（抓系统音频 + 多源汇聚）其实有解 —— 但<strong>全是平台独占或闭源</strong>：PulseAudio/PipeWire 只在 Linux，VBAN 那条路的宿端 Voicemeeter 闭源且仅 Windows，Dante Via 是商业授权。这正是缺口所在。</p>
+
+  <h3>2.2 逐项对比</h3>
+  <p class="hint">表格较宽，可横向滚动查看全部列</p>
+  <div class="scroll">
+  <table>
+    <thead><tr>
+      <th>方案</th><th>原理</th><th>拓扑</th><th>源端</th><th>宿端</th><th>抓系统音频</th><th>延迟</th><th>音画同步</th><th>部署</th><th>许可</th>
+    </tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>Snapcast</strong></td>
+        <td>服务端抓 PCM → 打服务端时间戳 → TCP 分发；客户端按 <code>t + offset + buffer</code> 定时播出</td>
+        <td>1→N</td><td>Linux / Win / macOS</td><td>Linux/Win/macOS/Android/ESP32</td>
+        <td class="nowrap"><span class="b b-yes">是</span></td>
+        <td>默认 1000 ms<br>可压到 30–200 ms</td>
+        <td><span class="b b-mid">差</span> 缓冲大</td>
+        <td><span class="b b-mid">中</span></td>
+        <td>GPL-3.0</td>
+      </tr>
+      <tr>
+        <td><strong>AirPlay 2</strong><br>shairport-sync</td>
+        <td>ALAC/AAC over TCP + PTP 风格时钟，接收端大缓冲对齐</td>
+        <td>1→N</td><td>Apple 设备</td><td>Apple / 第三方音箱</td>
+        <td class="nowrap"><span class="b b-no">否</span></td>
+        <td>~2000 ms</td>
+        <td><span class="b b-no">不适用</span></td>
+        <td><span class="b b-yes">低</span></td>
+        <td>协议私有</td>
+      </tr>
+      <tr>
+        <td><strong>Chromecast groups</strong></td>
+        <td>Cast 协议，组内设备按 UTC 时间对齐播放</td>
+        <td>1→N</td><td>任意（发 Cast）</td><td>Cast 设备</td>
+        <td class="nowrap"><span class="b b-no">否</span></td>
+        <td>~1000 ms</td>
+        <td><span class="b b-mid">仅媒体</span></td>
+        <td><span class="b b-yes">低</span></td>
+        <td>协议私有</td>
+      </tr>
+      <tr>
+        <td><strong>PulseAudio</strong><br>module-native-protocol-tcp</td>
+        <td>客户端把 PCM 流灌进服务端的 sink，服务端天然多源混音</td>
+        <td>N→1</td><td>任意（装 PA 客户端）</td><td>Linux</td>
+        <td class="nowrap"><span class="b b-yes">是</span></td>
+        <td>20–120 ms<br>（<code>latency_msec</code> 可配）</td>
+        <td><span class="b b-mid">中</span></td>
+        <td><span class="b b-mid">中</span></td>
+        <td>LGPL</td>
+      </tr>
+      <tr>
+        <td><strong>PipeWire</strong><br>网络音频模块</td>
+        <td>同上，PipeWire 作服务端；兼容 pulse 协议，可对接 Snapcast</td>
+        <td>N→1</td><td>任意</td><td>Linux</td>
+        <td class="nowrap"><span class="b b-yes">是</span></td>
+        <td>20–100 ms</td>
+        <td><span class="b b-mid">中</span></td>
+        <td><span class="b b-mid">中</span></td>
+        <td>MIT</td>
+      </tr>
+      <tr>
+        <td><strong>JACK net</strong><br>zita-njbridge</td>
+        <td>把远端 JACK 端口映射到主机，共用主机 graph 时钟</td>
+        <td>N→1</td><td>Linux</td><td>Linux</td>
+        <td class="nowrap"><span class="b b-yes">是</span></td>
+        <td>2–20 ms</td>
+        <td><span class="b b-yes">好</span></td>
+        <td><span class="b b-no">高</span></td>
+        <td>GPL</td>
+      </tr>
+      <tr>
+        <td><strong>VBAN</strong><br>+ Voicemeeter</td>
+        <td>UDP 传未压缩 PCM（1–8 声道），Voicemeeter 收多路 VBAN 混音到母线</td>
+        <td>N→1</td><td>需装 VBAN 发送端</td><td>Windows</td>
+        <td class="nowrap"><span class="b b-yes">是</span></td>
+        <td>10–30 ms 有线<br>WiFi 丢包</td>
+        <td><span class="b b-yes">好</span></td>
+        <td><span class="b b-yes">低</span></td>
+        <td>协议开放<br>宿主闭源</td>
+      </tr>
+      <tr>
+        <td><strong>SonoBus</strong></td>
+        <td>JUCE + Opus，P2P 全互联，每 peer 混所有入流，手动抖动缓冲</td>
+        <td>N↔N</td><td>Win/mac/Linux/iOS/Android</td><td>同左</td>
+        <td class="nowrap"><span class="b b-no">否</span>（只抓输入）</td>
+        <td>10–40 ms 有线</td>
+        <td><span class="b b-mid">无机制</span></td>
+        <td><span class="b b-yes">低</span></td>
+        <td>GPL-3.0</td>
+      </tr>
+      <tr>
+        <td><strong>Jamulus</strong> / <strong>JackTrip</strong></td>
+        <td>低延迟音频 over IP，为乐手合奏设计，服务端混音</td>
+        <td>N↔N</td><td>Win/mac/Linux</td><td>同左</td>
+        <td class="nowrap"><span class="b b-no">否</span></td>
+        <td>10–40 ms</td>
+        <td><span class="b b-mid">无机制</span></td>
+        <td><span class="b b-mid">中</span></td>
+        <td>GPL-2.0</td>
+      </tr>
+      <tr>
+        <td><strong>AudioRelay</strong><br>SoundWire（商业）</td>
+        <td>PC 抓系统音频 → 手机播放；支持多手机同时收</td>
+        <td>1→N</td><td>Windows/macOS</td><td>Android</td>
+        <td class="nowrap"><span class="b b-yes">是</span>（仅 PC 端）</td>
+        <td>实测 ~50 ms</td>
+        <td><span class="b b-mid">中</span></td>
+        <td><span class="b b-yes">低</span></td>
+        <td>闭源</td>
+      </tr>
+      <tr>
+        <td><strong>sndcpy</strong><br>（scrcpy 作者的音频版）</td>
+        <td>Android AudioPlaybackCapture → 原始 PCM → adb 隧道 → PC 上 VLC 播放</td>
+        <td>1→1</td><td>Android</td><td>Win/mac/Linux</td>
+        <td class="nowrap"><span class="b b-yes">是</span></td>
+        <td>150–300 ms</td>
+        <td><span class="b b-no">差</span></td>
+        <td><span class="b b-yes">低</span></td>
+        <td>MIT</td>
+      </tr>
+      <tr>
+        <td><strong>WebRTC</strong><br>LiveKit / mediasoup</td>
+        <td>SRTP + ICE + NetEq 自适应抖动缓冲，SFU 可混流</td>
+        <td>N↔N</td><td>全平台 + 浏览器</td><td>全平台 + 浏览器</td>
+        <td class="nowrap"><span class="b b-mid">部分</span>（浏览器仅标签页）</td>
+        <td>100–250 ms<br>（NetEq 占 40–200）</td>
+        <td><span class="b b-mid">中</span></td>
+        <td><span class="b b-no">高</span></td>
+        <td>BSD</td>
+      </tr>
+      <tr>
+        <td><strong>Dante Via</strong><br>AES67 / Ravenna</td>
+        <td>专业 AV-over-IP，硬件或软件虚拟声卡，PTP 时钟</td>
+        <td>N↔N</td><td>Win/mac</td><td>Win/mac/硬件</td>
+        <td class="nowrap"><span class="b b-yes">是</span></td>
+        <td>1–10 ms</td>
+        <td><span class="b b-yes">极好</span></td>
+        <td><span class="b b-no">高</span></td>
+        <td>商业</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>2.3 为什么每一个都不能直接用</h3>
+
+  <h4>① Snapcast 类：拓扑反了</h4>
+  <p>Snapcast 的同步算法值得抄 —— 服务端给每个 PCM 块打单调时钟时间戳 <code>t_s</code>，客户端每次连发 timesync 消息估计 <code>offset d</code>（取最近 50 次的中位数抗抖动），
+  收到块后在 <code>t_s + d + bufferMs − latency</code> 时刻播出。这套设计在 1→N 场景里是最优解。</p>
+  <p>但它<strong>没有"多源混音"这一层</strong>。snapserver 可以配置多路 <code>[stream]</code>，但每个客户端只能订阅一路；服务端不做求和。
+  要拿它改造成你的场景，等于重写服务端的音频图 —— 工作量不比自研小，还背上了一个为 1 秒缓冲设计的 TCP 传输层。</p>
+
+  <h4>② PulseAudio / PipeWire / VBAN 类：拓扑对了，平台不对</h4>
+  <p><strong>PulseAudio 的 <code>module-native-protocol-tcp</code> 其实是最接近你需求的东西</strong>：任意客户端 <code>PULSE_SERVER=tcp:host</code>，音频直接灌进服务端的 sink，
+  服务端自动多源混音，<code>latency_msec</code> 从 16.0 起可配（旧版 tunnel 模块固定 250 ms）。实测 20–120 ms 可达。</p>
+  <p>问题只有一个但致命：<strong>它是 Linux 的</strong>。你的宿端是 Windows 和 Android，而 PulseAudio 的 Windows 移植早已荒废、Android 上不存在。
+  另外老 <code>module-tunnel-sink</code> 有个著名的坑：改延迟的代码是注释掉的，<code>tunnel-sink-new</code> 的动态延迟只会落在 11 / 75 / 200 ms 三档（取决于哪个 App 触发 sink 从 idle 转 active）。</p>
+  <p><strong>VBAN + Voicemeeter 是 Windows 上唯一开箱即用的多源汇聚</strong>：UDP 传未压缩 PCM（1–8 声道、任意采样率），Voicemeeter 收多路 VBAN 混音后输出到任一硬件口，有线 LAN 下 10–30 ms。
+  代价是 Voicemeeter 闭源、UI 极其难用、且 Android 端没有官方 VBAN 发送器（得自己按协议写，好在协议是公开的、结构简单）。
+  它非常适合<strong>做 P0 阶段的对照组</strong>：先证明"Windows 宿端 + 多源混音"体验成立，再决定要不要自研。</p>
+
+  <h4>③ SonoBus / Jamulus 类：混音模型对了，采集方式错了</h4>
+  <p>SonoBus 是全平台（Win / mac / Linux / iOS / Android）、GPL、JUCE + Opus、每个 peer 混所有入流、手动可调抖动缓冲 —— 从"传输 + 混音"角度看几乎是现成的。</p>
+  <p>但它采集的是<strong>输入设备</strong>（麦克风 / 声卡 line-in），<strong>不是系统播放音频</strong>。Windows 上还能靠 VB-Cable 把系统声音绕成"输入"，Android 上完全做不到 —— 没有虚拟声卡的公共 API。
+  所以它只能当<strong>参考实现</strong>读代码，不能当产品底座。</p>
+
+  <h4>④ sndcpy 方向对、延迟不对</h4>
+  <p>sndcpy 是 scrcpy 作者的音频版：Android <code>AudioPlaybackCapture</code> → 原始 PCM → adb 隧道 → PC 上 VLC 播。方向完全正确，采集部分可以直接借鉴。</p>
+  <p>但它的延迟 150–300 ms，瓶颈是 VLC 的 <code>--network-caching</code>（默认 1000 ms，手动压到 100 ms）加上 adb over TCP 的缓冲。
+  <strong>它证明了"采集可行"，也证明了"采集不是瓶颈"</strong> —— 这正是自研时该换掉的部分。</p>
+</section>
+
+<!-- ============ 缺口 ============ -->
+<section id="gap">
+  <h2><span class="num">03</span>缺口在哪</h2>
+  <p class="sub">一句话：现成组件够拼出一个系统，但没有一个成品。</p>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th style="width:20%">能力</th><th style="width:34%">现成可复用的</th><th>必须自研的原因</th></tr></thead>
+    <tbody>
+      <tr><td>系统音频采集</td><td>Android: sndcpy 的 AudioPlaybackCapture 用法<br>Windows: 系统自带 WASAPI loopback<br>macOS: Core Audio Tap</td><td>API 本身是系统给的，写法要自己实现并处理权限 / 前台服务 / 设备兼容</td></tr>
+      <tr><td>编码</td><td>libopus（BSD）</td><td><span class="b b-yes">无需自研</span> 直接复用</td></tr>
+      <tr><td>传输</td><td>VBAN 协议（简单、公开）</td><td>VBAN 无压缩，1.5 Mbps/源；且没有时间戳 / 丢包恢复概念</td></tr>
+      <tr><td>时钟同步</td><td>Snapcast 的 offset 估计思路</td><td>它的前提是"内容时间戳对齐"，我们要的是"延迟锁定"，算法不同</td></tr>
+      <tr><td>抖动缓冲</td><td>WebRTC NetEq 的思路</td><td>NetEq 目标值 40–200 ms，对我们要太低延迟反而是负担</td></tr>
+      <tr><td>混音 + 输出</td><td>WASAPI / AAudio</td><td>多源混音与响度管理要自己写</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="callout ok">
+    <span class="t">所以：自研，但只自研三块</span>
+    <p><strong>采集适配层、抖动缓冲策略、时钟锁定环</strong>。编码用 libopus，传输用 UDP + 自研 16 字节包头，输出用平台原生 API。
+    这个切分把"要写多少代码"从"一个音频系统"压缩到"约 3–4k 行核心代码"。</p>
+  </div>
+</section>
+
+<!-- ============ 架构 ============ -->
+<section id="design">
+  <h2><span class="num">04</span>总体架构</h2>
+  <p class="sub">三个角色、四个线程、一条数据通路。</p>
+
+  <div class="arch">
+    <div class="sources">
+      <div class="src-box"><div class="nm">源 A · Android</div><div class="ds">AudioPlaybackCapture<br>→ Opus 10 ms 帧<br>→ UDP</div></div>
+      <div class="src-box"><div class="nm">源 B · Windows</div><div class="ds">WASAPI Loopback<br>→ Opus 10 ms 帧<br>→ UDP</div></div>
+      <div class="src-box"><div class="nm">源 C · macOS</div><div class="ds">Core Audio Tap<br>→ Opus 10 ms 帧<br>→ UDP</div></div>
+    </div>
+    <div class="arrows"><span>↓</span><span>↓</span><span>↓</span></div>
+
+    <div class="hub">
+      <div class="hub-hd">HUB · Windows PC / Android（唯一出声的设备）</div>
+      <div class="lanes">
+        <div class="lane"><span class="k">线程 1</span><span class="v"><strong>Net</strong> — 收 UDP 包，按 stream_id 分发到各源的抖动缓冲（无锁 SPSC 环）</span></div>
+        <div class="lane"><span class="k">线程 2</span><span class="v"><strong>Decode</strong> — 每源一个 Opus 解码器 + 异步重采样（ASRC，比率由时钟环控制）</span></div>
+        <div class="lane"><span class="k">线程 3</span><span class="v"><strong>Mix</strong> — 每 5 ms 混一个 block：求和 → 每源增益 → 软限幅 → 写入输出环</span></div>
+        <div class="lane"><span class="k">线程 4</span><span class="v"><strong>Render</strong> — 设备回调，<em>只做 memcpy</em>（WASAPI / AAudio 实时线程，禁止加锁与分配）</span></div>
+        <div class="lane"><span class="k">控制面</span><span class="v"><strong>Ctrl</strong> — WebSocket/JSON：发现、加入、增益、缓冲档位、统计上报</span></div>
+      </div>
+    </div>
+
+    <div class="out-arrow">↓</div>
+    <div class="out-box">扬声器 / 3.5 mm 耳机 / USB-C DAC &nbsp;&nbsp;·&nbsp;&nbsp; <span style="color:#a03b3b">蓝牙耳机 → 延迟 +150~250 ms，必须拦截</span></div>
+  </div>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th style="width:110px">术语</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Source</strong></td><td>发送端。一台设备一条 <code>stream_id</code>，可同时跑多个 stream（例如"系统声音"和"仅某个 App"）</td></tr>
+      <tr><td><strong>Hub</strong></td><td>汇聚端。持有唯一时钟基准，负责混音与输出</td></tr>
+      <tr><td><strong>Session</strong></td><td>一次汇聚过程。Hub 生成 6 位配对码 + mDNS 广播，源扫码/输入加入</td></tr>
+      <tr><td><strong>L<sub>base</sub></strong></td><td>目标端到端延迟（可配 40/80/120 ms 三档）。所有源的延迟都被锁到这个值</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- ============ 采集 ============ -->
+<section id="capture">
+  <h2><span class="num">05</span>采集层</h2>
+  <p class="sub">平台的差异几乎全在这一层。这里是"能不能做"的分水岭。</p>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th style="width:96px">平台</th><th style="width:24%">API</th><th style="width:110px">最低版本</th><th>能抓什么</th><th style="width:30%">主要坑</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>Android</strong></td>
+        <td><code>AudioPlaybackCapture</code> + <code>AudioRecord</code></td>
+        <td>API 29<br>(Android 10)</td>
+        <td>其他 App 的 <code>USAGE_MEDIA / GAME / UNKNOWN</code> 播放音频</td>
+        <td>需 <code>RECORD_AUDIO</code> + MediaProjection 用户授权；目标 App 可主动关闭；DRM 内容抓不到；Android 14 起每次会话都要重新确认</td>
+      </tr>
+      <tr>
+        <td><strong>Windows</strong></td>
+        <td>WASAPI loopback<br>（<code>AUDCLNT_STREAMFLAGS_LOOPBACK</code>）</td>
+        <td>Vista+</td>
+        <td>系统混音后的全部输出</td>
+        <td>抓的是混音后信号，会包含 Hub 自己的输出 → 必须用 process loopback 排除自身进程树</td>
+      </tr>
+      <tr>
+        <td><strong>Windows</strong></td>
+        <td><code>AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK</code></td>
+        <td>Win10 2004<br>(19041)</td>
+        <td>指定进程树（INCLUDE / EXCLUDE 两种模式）</td>
+        <td>要通过 <code>ActivateAudioInterfaceAsync</code> + VT_BLOB 参数激活；回调对象必须同时实现 <code>IAgileObject</code>，否则返回 <code>E_ILLEGAL_METHOD_CALL</code> 且不告诉你原因</td>
+      </tr>
+      <tr>
+        <td><strong>macOS</strong></td>
+        <td>ScreenCaptureKit<br><code>SCStream.capturesAudio</code></td>
+        <td>13.0+</td>
+        <td>系统输出 / 指定 App</td>
+        <td>走的是"屏幕录制"权限；对无窗口的后台守护进程（如通话服务）抓不到</td>
+      </tr>
+      <tr>
+        <td><strong>macOS</strong></td>
+        <td>Core Audio process tap<br><code>CATapDescription</code></td>
+        <td>14.2+</td>
+        <td>HAL 层，任意进程 / 全局混音</td>
+        <td>链路长：tap → 私有 aggregate device → <code>AudioDeviceIOProc</code>；必须有 <code>NSAudioCaptureUsageDescription</code>，否则拿到的全是静音 0 而不是报错</td>
+      </tr>
+      <tr>
+        <td><strong>iOS</strong></td>
+        <td><span class="b b-no">不存在</span></td>
+        <td>—</td>
+        <td>—</td>
+        <td><strong>不能作为源。</strong>没有系统级音频采集 API，只能采自家 App 内的音频</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>5.1 采集端的关键实现点</h3>
+  <p><strong>Android 侧</strong>（决定项目上限的一块）：</p>
+  <ul>
+    <li>用 <code>AudioRecord</code> 而不是 <code>MediaRecorder</code>；<code>AudioPlaybackCaptureConfiguration</code> 里用 <code>addMatchingUsage()</code> 而不是 <code>excludeUsage()</code>（两者不能混用）</li>
+    <li>缓冲设成 <strong>2× burst</strong>，<code>PERFORMANCE_MODE_LOW_LATENCY</code>；采集回调跑在独立高优先级线程，绝不分配内存</li>
+    <li><strong>必须起前台服务</strong>（<code>foregroundServiceType="mediaProjection"</code>）+ <code>WifiLock(WIFI_MODE_FULL_HIGH_PERF)</code>，否则 3 分钟后 Doze 就把网络限流，延迟从 60 ms 跳到 500 ms</li>
+    <li>Android 14+ 的 MediaProjection 授权是<strong>每次会话一次</strong>，不能持久化；UI 上要做好"重新授权"的引导</li>
+  </ul>
+  <p><strong>Windows 侧</strong>：如果 Hub 同时要抓本机音频（Hub 自己也是源），必须用 <code>PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE</code> 排除自己，
+  否则 Hub 播放出来的远程音频会被自己再抓一遍 → 无限反馈。这是最容易踩且最难查的坑。</p>
+
+  <div class="callout">
+    <span class="t">统一内部格式</span>
+    <p>48 kHz / float32 / stereo。单声道源上混为双声道；44.1 kHz 源在采集侧重采样一次，避免链路中途多次转换。
+    <strong>不要在 Hub 侧做采样率转换</strong>（除了时钟环需要的极小比率调整），多级重采样会累积相位误差和延迟。</p>
+  </div>
+</section>
+
+<!-- ============ 传输 ============ -->
+<section id="proto">
+  <h2><span class="num">06</span>传输协议</h2>
+  <p class="sub">16 字节包头 + 一个 Opus 帧。就这么简单。</p>
+
+  <pre><code><span class="c">// 每包 16 字节头 + payload，UDP 单包，不跨 MTU</span>
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-------+-------+---------------+---------------+---------------+
+| ver 4 |flags 4|        stream_id (16)         |    seq (16)   |
++-------+-------+---------------+---------------+---------------+
+|                     capture_ts_us (32)                        |
++---------------------------------------------------------------+
+|                     sample_pos (32)                           |
++---------------------------------------------------------------+
+|                     Opus payload ...                          |</code></pre>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th style="width:120px">字段</th><th style="width:64px">位宽</th><th>作用</th></tr></thead>
+    <tbody>
+      <tr><td><code>ver / flags</code></td><td>4+4</td><td>版本；flags 标记 FEC / DTX / 静音段起点</td></tr>
+      <tr><td><code>stream_id</code></td><td>16</td><td>一路流一个 ID，Hub 用它选解码器与缓冲</td></tr>
+      <tr><td><code>seq</code></td><td>16</td><td>包序号，用于丢包检测（会回绕，判定时用差值）</td></tr>
+      <tr><td><code>capture_ts_us</code></td><td>32</td><td>源端<strong>单调时钟</strong>的采集时刻（微秒，约 71 分钟回绕，够用）</td></tr>
+      <tr><td><code>sample_pos</code></td><td>32</td><td><strong>关键字段</strong>：该帧第一个采样在本流中的绝对序号。丢包后靠它算"缺了多少采样"，不必靠 seq 反推</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>6.1 为什么是 UDP，不是 TCP</h3>
+  <p>TCP 的丢包重传会造成<strong>队头阻塞</strong>：一个包丢了，后面所有包都要等它重传到达才能交付。WiFi 下一次重传就是 1–2 个 RTT，30–80 ms，
+  而且这 30–80 ms 会永久累积进缓冲 —— 因为 TCP 不丢数据，你只能把缓冲越撑越大。对"延迟必须稳定在 60 ms"是灾难。</p>
+  <p>Snapcast 用 TCP 是对的，因为它的默认缓冲是 <strong>1000 ms</strong>，听音乐场景下 1000 ms 对 1030 ms 没有区别。我们不行。</p>
+
+  <h3>6.2 为什么也不是 WebRTC</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th style="width:24%">环节</th><th style="width:34%">WebRTC 的典型值</th><th>对我们的影响</th></tr></thead>
+    <tbody>
+      <tr><td>抖动缓冲（NetEq）</td><td>40–200 ms，自适应</td><td>我们只要 20–40 ms。<code>jitterBufferTarget</code> 只能设下界，实际值仍由 NetEq 决定</td></tr>
+      <tr><td>ICE / DTLS 握手</td><td>100–500 ms（一次性）</td><td>可接受，但增加了工程复杂度</td></tr>
+      <tr><td>Opus 默认 ptime</td><td>20 ms</td><td>可改，但 WebRTC 生态默认按 20 ms 优化</td></tr>
+      <tr><td>回声消除 / AGC</td><td>默认全开</td><td><strong>必须全关</strong>。AEC 和 AGC 会破坏音乐信号，也会加 10–20 ms 处理延迟</td></tr>
+      <tr><td>浏览器采集</td><td><code>getDisplayMedia</code> 只能抓标签页</td><td>无法抓整个系统音频</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p><strong>但 WebRTC 有一个思想要抄</strong>：NetEq 的 <code>Accelerate</code> / <code>Preemptive Expand</code> —— 缓冲过高时通过"去掉一个基音周期"加速播放，
+  过低时"插入一个基音周期"减速，<strong>改变时序但不改变音高</strong>。这正是我们外环要做的事，比丢帧/补零优雅得多。</p>
+
+  <h3>6.3 丢包处理</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th style="width:120px">手段</th><th style="width:26%">适用</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>Opus PLC</td><td><span class="b b-yes">默认，必开</span></td><td>丢一帧就用前一帧的频谱继续外推，人耳几乎听不出。<strong>不要补零</strong>，补零会听到"咔"</td></tr>
+      <tr><td>In-band FEC</td><td><span class="b b-mid">可选</span></td><td>Opus 在 VIOP 模式下可把前一帧的低码率副本塞进当前帧。丢包率 &gt; 1% 时开启</td></tr>
+      <tr><td>NACK 重传</td><td><span class="b b-mid">有条件</span></td><td>只在"重传包能在 playout deadline 之前到达"时才请求，否则请求了也没用，纯浪费带宽</td></tr>
+      <tr><td>拥塞控制</td><td><span class="b b-yes">简单即可</span></td><td>局域网内基本不需要。给个 AIMD 兜底，防止某个源把 WiFi 打满</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>6.4 参数档位</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th style="width:110px">档位</th><th>Opus 帧长</th><th>码率</th><th>抖动缓冲</th><th>L<sub>base</sub></th><th>适用</th></tr></thead>
+    <tbody>
+      <tr><td><strong>超低延迟</strong></td><td>10 ms</td><td>96 kbps</td><td>20 ms</td><td>40 ms</td><td>有线 LAN / USB 网络共享</td></tr>
+      <tr><td><strong>低延迟（默认）</strong></td><td>10 ms</td><td>128 kbps</td><td>30 ms</td><td>60 ms</td><td>5 GHz WiFi，同房间</td></tr>
+      <tr><td><strong>稳健</strong></td><td>20 ms</td><td>96 kbps</td><td>60 ms</td><td>120 ms</td><td>2.4 GHz / 隔墙 / 多人环境</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p style="color:var(--muted);font-size:13px">10 ms 帧的代价：Opus 在 CELT 层用 10 ms 帧时，要达到与 20 ms 帧同等音质需要约 +10% 码率（更短的 MDCT 窗降低了频率分辨率）。这个代价完全值得。</p>
+</section>
+
+<!-- ============ 时钟 ============ -->
+<section id="clock">
+  <h2><span class="num">07</span>时钟同步</h2>
+  <p class="sub">这是整套系统里最容易做错的一节，因为大多数人对"同步"的理解是错的。</p>
+
+  <h3>7.1 先澄清：我们需要的到底是哪种"同步"</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th style="width:22%">同步语义</th><th style="width:40%">定义</th><th>本场景</th></tr></thead>
+    <tbody>
+      <tr><td><strong>采样级同步</strong></td><td>多设备播同一份内容，同一采样在同一物理时刻出声（Snapcast / AirPlay 干的事）</td><td><span class="b b-no">不需要</span> 各源内容不同，没有共同时间轴</td></tr>
+      <tr><td><strong>延迟一致</strong></td><td>多源的端到端延迟差 &lt; 阈值（建议 &lt; 10 ms）</td><td><span class="b b-yes">需要</span> 否则切换源时"时快时慢"，很怪</td></tr>
+      <tr><td><strong>音画对齐</strong></td><td>单源的音频延迟<strong>稳定</strong>且低于感知阈值</td><td><span class="b b-yes">最重要</span> 见 §09</td></tr>
+      <tr><td><strong>时钟域同步</strong></td><td>源与 Hub 的采样率节奏一致，长时间不漂移</td><td><span class="b b-yes">需要</span> 否则 1 小时必崩</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="callout">
+    <span class="t">一句话记住</span>
+    <p>我们做的不是"让多台设备同时出声"，而是<strong>"让每一路的延迟都锁死在同一个目标值上，并且这个值不随时间和网络波动"</strong>。
+    前者是 Snapcast 的同步问题，后者是控制系统的锁定问题。</p>
+  </div>
+
+  <h3>7.2 双环结构</h3>
+  <p>把"抗抖动"和"消漂移"拆成两个时间尺度完全不同的环。混在一起做是最常见的失败原因。</p>
+
+  <h4>内环 · 毫秒级 · 每源抖动缓冲</h4>
+  <pre><code><span class="c">// 每个源的目标水位。jitter 用 RFC 3550 的到达间隔抖动递推式估计</span>
+target_ms = clamp(2.0 * jitter_p95_ms + 10.0, 20.0, 150.0)
+
+<span class="c">// 水位调整必须"慢"，否则音画偏移会呼吸</span>
+if (underrun)                 target_ms += 5.0;      <span class="c">// 一次 +5 ms</span>
+if (overrun &amp;&amp; 持续 &gt; 2s)     target_ms -= 2.0;      <span class="c">// 一次 -2 ms</span></code></pre>
+  <p>注意"加得快、减得慢"。加慢了会持续断音（用户立刻察觉），减快了会让延迟来回跳（音画同步开始漂）。</p>
+
+  <h4>外环 · 秒级 · offset 估计 + 重采样比率</h4>
+  <pre><code><span class="c">// 源端每 500 ms 发一次 ping，Hub 立即回 pong</span>
+<span class="c">// t1 = 源发送时刻，t2 = Hub 收到，t3 = Hub 回复，t4 = 源收到（各自单调时钟）</span>
+rtt   = (t4 - t1) - (t3 - t2);
+offset = ((t2 - t1) + (t3 - t4)) / 2;        <span class="c">// Hub 时钟 − 源时钟</span>
+
+if (rtt &gt; 2 * min_rtt) return;              <span class="c">// 丢弃被排队/重传污染的样本</span>
+push(offset_window, offset);                 <span class="c">// 窗口 50</span>
+clock_offset = median(offset_window);        <span class="c">// 中位数抗抖动（Snapcast 同款）</span></code></pre>
+  <p>有了 <code>offset</code>，源端每个包就能换算成 Hub 时间轴上的应播时刻：</p>
+  <pre><code>deadline_hub_us = capture_ts_us + clock_offset + L_base_us;</code></pre>
+  <p>然后把这个"应播时刻"和"实际播出时刻"的偏差喂给 PI 控制器，输出重采样比率（典型范围 ±0.2%）：</p>
+  <pre><code><span class="c">// 每 200 ms 调一次；慢比快重要</span>
+float pi_update(src_t* s, float meas_ms, float target_ms) {
+    float err = meas_ms - target_ms;
+    s-&gt;integ += err * KI * 0.2f;
+    s-&gt;integ  = clampf(s-&gt;integ, -0.002f, 0.002f);
+    return clampf(1.0f + KP * err + s-&gt;integ, 0.998f, 1.002f);
+}</code></pre>
+
+  <h3>7.3 为什么不用 NTP / PTP</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th style="width:110px">方案</th><th style="width:120px">精度</th><th>为什么不行 / 行</th></tr></thead>
+    <tbody>
+      <tr><td>系统 NTP</td><td>±10 ms</td><td>精度不够，且系统时钟会被 NTP 校正"跳变"，音频时钟必须单调</td></tr>
+      <tr><td>PTP (IEEE 1588)</td><td>±1 µs</td><td>需要网卡/交换机硬件支持，家用 WiFi 路由器基本没有</td></tr>
+      <tr><td><strong>自建 ping/pong + 中位数</strong></td><td><strong>±0.1–1 ms</strong></td><td><span class="b b-yes">选这个</span> 局域网 RTT 稳定，中位数滤波足够；且完全可控</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>而且我们的精度需求本来就不高 —— 目标是"延迟锁在 60±5 ms"，不是"采样级对齐"。±1 ms 的时钟误差完全够用。</p>
+
+  <h3>7.4 漂移：不处理一定会崩</h3>
+  <p>手机晶振典型偏差 ±20–100 ppm。<strong>100 ppm × 1 小时 = 360 ms</strong>。不补偿的话，一小时会话里缓冲要么被撑爆（延迟涨到几百 ms），要么被抽干（持续断音）。</p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th style="width:26%">重采样方案</th><th>额外延迟</th><th>CPU</th><th>音质</th><th>实现量</th><th>建议</th></tr></thead>
+    <tbody>
+      <tr><td>sample slip<br>（插/删 1 采样 + 10 采样交叉淡化）</td><td>0</td><td>极低</td><td>好（±0.02% 听不出）</td><td>~50 行</td><td><span class="b b-yes">先用这个</span></td></tr>
+      <tr><td>speex resampler（可变比率）</td><td>0</td><td>低</td><td>很好</td><td>~100 行</td><td>P2 再换</td></tr>
+      <tr><td>libsoxr（可变比率）</td><td>0</td><td>中</td><td>最好</td><td>需 <code>soxr_oneshot</code> 重建</td><td>不必要</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- ============ 播放 ============ -->
+<section id="playout">
+  <h2><span class="num">08</span>播放端（Hub）</h2>
+  <p class="sub">实时音频的规矩只有一条：回调里什么都别做。</p>
+
+  <h3>8.1 线程模型</h3>
+  <pre><code>[UDP socket]  ──▶  每源 jitter buffer (SPSC 无锁环)  ──▶  [Decode+ASRC 线程]
+                                                              │
+                                                              ▼
+[设备回调]  ◀──  输出环 (SPSC)  ◀──  [Mix 线程，每 5 ms 一个 block]</code></pre>
+  <p>设备回调线程（WASAPI 的 realtime 线程 / AAudio 的 MMAP 回调）里<strong>只允许 memcpy</strong>：不能 new、不能 free、不能加锁、不能打日志、不能碰网络。
+  任何一次超过周期长度的阻塞都会变成可听见的爆音，而且这种 bug 在开发机上几乎复现不出来。</p>
+
+  <h3>8.2 输出 API 选择</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th style="width:100px">平台</th><th style="width:28%">API</th><th>可达设备周期</th><th>取舍</th></tr></thead>
+    <tbody>
+      <tr><td rowspan="2">Windows</td><td>WASAPI shared + <code>IAudioClient3</code></td><td>2.67–10 ms<br>（取决于驱动是否 WaveRT）</td><td>能和别的 App 共存；老驱动只能到 10 ms</td></tr>
+      <tr><td>WASAPI exclusive</td><td>2–10 ms</td><td>更低更稳，但独占设备，Hub 本机的其他声音全静音</td></tr>
+      <tr><td>Android</td><td>AAudio + <code>LOW_LATENCY</code> + <code>EXCLUSIVE</code></td><td>5–20 ms（MMAP 路径）</td><td>Android 8.1+；缓冲设 2× burst；不加 <code>LOW_LATENCY</code> 会掉到 200 ms</td></tr>
+      <tr><td>macOS</td><td>CoreAudio HAL</td><td>2–10 ms</td><td>—</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p style="color:var(--muted);font-size:13px">参考实测（Google 官方 OboeTester 往返延迟）：全套低延迟配置 20 ms；只把 performance mode 关掉 → 205 ms；不用 MMAP 回调 → 62 ms。差距是数量级的，这些开关不是"优化"，是"能不能用"。</p>
+
+  <h3>8.3 必须扣掉的"隐藏延迟"</h3>
+  <p>你写进缓冲的时刻 ≠ 声音真正出来的时刻。设备侧还有 1–3 个周期的排队。<strong>不扣掉这部分，你以为的 60 ms 其实是 80 ms。</strong></p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th style="width:100px">平台</th><th>读取实际输出延迟的方法</th></tr></thead>
+    <tbody>
+      <tr><td>Windows</td><td><code>IAudioClient::GetCurrentPadding()</code> × 帧长 + 驱动报告的 <code>IAudioClock</code> 位置差</td></tr>
+      <tr><td>Android</td><td><code>AAudioStream_getTimestamp()</code> 返回 <code>framePosition</code> + <code>time</code>，可精确到硬件播放位置</td></tr>
+      <tr><td>macOS</td><td><code>kAudioDevicePropertyLatency</code> + <code>kAudioStreamPropertyLatency</code> + safety offset</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>这个值要作为已知常量从 <code>L_base</code> 中扣除，并在统计面板里显示"实测端到端延迟"，而不是"设计延迟"。</p>
+
+  <h3>8.4 混音</h3>
+  <ul>
+    <li><strong>float32 累加</strong>，每源独立增益（dB），末端软限幅（<code>tanh</code> 或 3 ms lookahead limiter）。多源直接相加会削顶</li>
+    <li><strong>响度归一化</strong>：对每源做短时 LUFS（BS.1770）测量，增益向 -23 LUFS 靠，时间常数 1–2 s。<strong>不要用 AGC</strong>，会泵</li>
+    <li><strong>主源优先</strong>：默认策略是"最近活跃的源为主，其余 duck 到 -12 dB"；同时提供手动混音台（推子 / 静音 / 独奏）</li>
+    <li><strong>静音检测</strong>：某源连续 500 ms 低于 -60 dBFS 就暂停解码，省 CPU 和带宽</li>
+  </ul>
+
+  <div class="callout warn">
+    <span class="t">自捕获反馈</span>
+    <p>如果 Hub 同时抓本机音频，会把自己播出来的远程音频再抓一遍 → 无限回声。Windows 上必须用 <code>PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE</code> 排除自身；
+    Android 上 Hub 抓本机音频同样会抓到自己的输出，需要用 <code>excludeUid()</code> 排除自己。</p>
+  </div>
+</section>
+
+<!-- ============ 音画同步 ============ -->
+<section id="avsync">
+  <h2><span class="num">09</span>音画同步</h2>
+  <p class="sub">这是整个项目最硬的一节，也是最需要提前对齐预期的一节。</p>
+
+  <h3>9.1 感知阈值：多少算"对得上"</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th style="width:26%">标准</th><th>音频超前</th><th>音频滞后</th><th>语义</th></tr></thead>
+    <tbody>
+      <tr><td>ITU-R BT.1359 可察觉</td><td class="t-num">+45 ms</td><td class="t-num">−125 ms</td><td>超过这个范围，普通观众开始觉得不对</td></tr>
+      <tr><td>ITU-R BT.1359 可接受</td><td class="t-num">+90 ms</td><td class="t-num">−185 ms</td><td>仍能看下去，但明显不同步</td></tr>
+      <tr><td>EBU R37（整链）</td><td class="t-num">+40 ms</td><td class="t-num">−60 ms</td><td>广播级要求</td></tr>
+      <tr><td>ATSC IS-191</td><td class="t-num">+15 ms</td><td class="t-num">−45 ms</td><td>最严格</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p><strong>符号约定很重要</strong>：正号 = 声音早于画面。人对"声音早了"比"声音晚了"敏感得多（45 vs 125 ms）。
+  所以工程上宁可让音频<strong>略微滞后</strong>，也不要让它超前 —— 这也意味着我们的延迟预算应该偏向"迟到一点"而不是"提前"。</p>
+
+  <h3>9.2 延迟预算：钱花在哪了</h3>
+  <div class="bars">
+    <div class="bar-row">
+      <div class="lbl">Android 采集缓冲</div>
+      <div class="bar-track"><div class="bar-fill" style="width:15.6%">10–25</div></div>
+      <div class="val">8–25 ms</div>
+    </div>
+    <div class="bar-row">
+      <div class="lbl">Opus 编码（10 ms 帧）</div>
+      <div class="bar-track"><div class="bar-fill" style="width:7.8%">12.5</div></div>
+      <div class="val">12.5 ms</div>
+    </div>
+    <div class="bar-row">
+      <div class="lbl">网络单程（5 GHz WiFi）</div>
+      <div class="bar-track"><div class="bar-fill soft" style="width:9.4%">3–15</div></div>
+      <div class="val">3–15 ms</div>
+    </div>
+    <div class="bar-row">
+      <div class="lbl">抖动缓冲</div>
+      <div class="bar-track"><div class="bar-fill" style="width:25%">20–40</div></div>
+      <div class="val">20–40 ms</div>
+    </div>
+    <div class="bar-row">
+      <div class="lbl">解码</div>
+      <div class="bar-track"><div class="bar-fill" style="width:1.9%;min-width:5px"></div></div>
+      <div class="val">1–3 ms</div>
+    </div>
+    <div class="bar-row">
+      <div class="lbl">混音 + 环形缓冲</div>
+      <div class="bar-track"><div class="bar-fill soft" style="width:6.3%">5–10</div></div>
+      <div class="val">5–10 ms</div>
+    </div>
+    <div class="bar-row">
+      <div class="lbl">设备输出</div>
+      <div class="bar-track"><div class="bar-fill soft" style="width:12.5%">10–20</div></div>
+      <div class="val">10–20 ms</div>
+    </div>
+    <div class="bar-row">
+      <div class="lbl" style="color:#a03b3b;font-weight:600">蓝牙耳机（额外）</div>
+      <div class="bar-track"><div class="bar-fill red" style="width:100%">+150 ~ +250</div></div>
+      <div class="val" style="color:#a03b3b">+150~250 ms</div>
+    </div>
+    <div class="total-row"><span>合计（有线耳机）</span><span class="t-num">60 – 130 ms</span></div>
+    <div class="total-row" style="border-top:none;padding-top:2px;color:#a03b3b"><span>合计（蓝牙耳机）</span><span class="t-num">210 – 380 ms</span></div>
+  </div>
+
+  <p>条形图按 160 ms 满宽缩放。<strong>结论很清楚</strong>：</p>
+  <ul>
+    <li>60–100 ms 是可达区间，落在 BT.1359 的"可察觉但可接受"里，<strong>看视频勉强能忍，看口型特写会出戏</strong></li>
+    <li>&lt;40 ms 需要砍掉抖动缓冲和采集缓冲，而这两项由 WiFi 和 Android 音频栈决定，<strong>不是你能优化的</strong></li>
+    <li>蓝牙耳机一键把整个预算翻倍 —— 这不是技术问题，是产品必须拦截的问题</li>
+  </ul>
+
+  <h3>9.3 三条策略，按场景选</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th style="width:96px">策略</th><th style="width:30%">做法</th><th>能到什么程度</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>S1 硬压</strong></td>
+        <td>USB 网络共享 / 有线 + 有线耳机 + 10 ms 帧 + 20 ms 缓冲</td>
+        <td>55–70 ms，BT.1359 可察觉区下沿</td>
+        <td>失去无线便利性</td>
+      </tr>
+      <tr>
+        <td><strong>S2 视频侧补偿</strong></td>
+        <td>源端播放器把视频延迟 <code>L_audio − L_video_local</code>，让音画在"到达耳朵/眼睛"时对齐</td>
+        <td><strong>可以做到真正严丝合缝</strong></td>
+        <td>只能对自家播放器生效；抓第三方 App 时做不到</td>
+      </tr>
+      <tr>
+        <td><strong>S3 场景降级</strong></td>
+        <td>音乐 / 播客 / 游戏环境音不要求音画同步，只要求"延迟低且稳"</td>
+        <td>体验良好</td>
+        <td>视频场景不适用</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="callout warn">
+    <span class="t">必须提前对齐的预期</span>
+    <p>如果目标是"手机上看 B 站，声音从电脑耳机出来，口型完全对得上" —— <strong>在不改造播放器的前提下，这件事做不到</strong>。
+    可达的是"能感知到轻微延迟但可接受"（60–100 ms），或者走 S2 用自家播放器。</p>
+  </div>
+
+  <h3>9.4 校准工具（必做，不是可选）</h3>
+  <p>没有测量就没有优化。三个层次的校准：</p>
+  <ul>
+    <li><strong>自动测量</strong>：Hub 播一个 1 kHz 单周期脉冲，源端用麦克风录回来，互相关取峰值 → 得到含设备输出的真实端到端延迟。精度 ±1 ms</li>
+    <li><strong>半自动</strong>：屏幕上闪白块 + 同时出声，用户按"早了/晚了"微调（类似音游校准）</li>
+    <li><strong>关键指标</strong>：不只看<strong>均值</strong>，更要看<strong>标准差</strong>。均值 70 ms / σ=3 ms 是可接受的；均值 60 ms / σ=25 ms 是灾难</li>
+  </ul>
+</section>
+
+<!-- ============ 取舍 ============ -->
+<section id="tradeoff">
+  <h2><span class="num">10</span>关键取舍</h2>
+  <p class="sub">每个决策都有代价，写清楚比选对更重要。</p>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th style="width:15%">决策点</th><th style="width:24%">选项 A</th><th style="width:24%">选项 B</th><th>建议与理由</th></tr></thead>
+    <tbody>
+      <tr><td><strong>帧长</strong></td><td>10 ms（延迟优先）</td><td>20 ms（码率优先）</td><td><strong>A 为默认，B 做成档位</strong>。10 ms 多 10% 码率换 10 ms 延迟，非常划算</td></tr>
+      <tr><td><strong>编码</strong></td><td>Opus</td><td>裸 PCM</td><td><strong>Opus 默认；有线场景提供 PCM 档</strong>。PCM 省掉 12.5 ms 编码延迟，代价是 1.5 Mbps/源</td></tr>
+      <tr><td><strong>传输</strong></td><td>UDP 自研</td><td>WebRTC</td><td><strong>UDP</strong>。我们需要"延迟可预测"，WebRTC 优化的是"连通性 + 弱网鲁棒"</td></tr>
+      <tr><td><strong>可靠性</strong></td><td>PLC only</td><td>FEC + NACK</td><td><strong>PLC 打底 + 可选 FEC</strong>。NACK 只在包还能赶上 deadline 时才有意义</td></tr>
+      <tr><td><strong>Hub 输出</strong></td><td>普通播放器（OS 混音）</td><td>虚拟声卡</td><td><strong>先 A，后 B 可选</strong>。A 零安装；B 能接管所有 App 的音频并做统一处理，但要装驱动（Windows 需签名）</td></tr>
+      <tr><td><strong>混音位置</strong></td><td>Hub 集中混</td><td>源端分布式混</td><td><strong>集中</strong>。分布式要跨源对齐时钟，复杂度指数级上升，收益为零</td></tr>
+      <tr><td><strong>采样率</strong></td><td>统一 48 kHz</td><td>各源原生</td><td><strong>统一</strong>。多级重采样会累积相位误差和不可控延迟</td></tr>
+      <tr><td><strong>实现语言</strong></td><td>Rust / C++ 核心</td><td>C# / Unity</td><td><strong>核心用 native</strong>。音频实时线程不能有 GC 和不可预测的调度（见 §12）</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- ============ 难点 ============ -->
+<section id="risks">
+  <h2><span class="num">11</span>潜在难点</h2>
+  <p class="sub">按"翻车概率 × 排查难度"排序。前四个是真正会让项目失败的。</p>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th style="width:44px">#</th><th style="width:22%">难点</th><th style="width:44%">为什么会翻车</th><th>对策</th></tr></thead>
+    <tbody>
+      <tr><td class="t-num">1</td><td><strong>蓝牙耳机</strong></td><td>一次性 +150~250 ms，且不可控、不可测（不同编码器/固件差异极大）。用户插上蓝牙耳机，整个系统立刻"看起来是坏的"</td><td>检测输出设备类型（Windows <code>PKEY_Device_EnumeratorName</code> / Android <code>AudioDeviceInfo.TYPE_BLUETOOTH_A2DP</code>），强制警告并提供"切到有线"引导</td></tr>
+      <tr><td class="t-num">2</td><td><strong>Android 采集授权与黑名单</strong></td><td>每次会话都要 MediaProjection 授权；App 可以声明不可被捕获；DRM 内容静音。用户遇到"没声音"时无法自查</td><td>做"诊断面板"：显示当前抓到的 usage、是否被目标 App 拒绝、音量电平条。别让用户猜</td></tr>
+      <tr><td class="t-num">3</td><td><strong>Android 后台与省电</strong></td><td>Doze + 后台网络限制，3 分钟后 WiFi 被降频，延迟从 60 ms 跳到 500 ms。开发时插着电测不出来</td><td>前台服务 + <code>WifiLock(HIGH_PERF)</code> + 引导加入电池优化白名单；把"当前是否在省电模式"显示在 UI 上</td></tr>
+      <tr><td class="t-num">4</td><td><strong>WiFi 抖动</strong></td><td>2.4 GHz 与蓝牙共用频段，微波炉/无线鼠标都能造成 50 ms 抖动。抖动直接吃掉缓冲预算</td><td>强制/引导 5 GHz；显示实时 jitter 值；抖动超阈值时自动切到"稳健档"并提示</td></tr>
+      <tr><td class="t-num">5</td><td>时钟漂移</td><td>长会话必现，1 小时 360 ms</td><td>ASRC + PI 环（§07.4）。P2 阶段必须做完，不能推到"以后"</td></tr>
+      <tr><td class="t-num">6</td><td>多源响度失衡</td><td>一个源 100% 音量、另一个 30%，混在一起体验极差</td><td>短时 LUFS 归一化 + 手动混音台 + 默认 ducking 策略</td></tr>
+      <tr><td class="t-num">7</td><td>自捕获 / 反馈</td><td>Hub 播放的声音被自己抓回来，无限叠加</td><td>process loopback EXCLUDE 自身进程树 / <code>excludeUid()</code></td></tr>
+      <tr><td class="t-num">8</td><td>Windows 采样率不匹配</td><td>设备 44.1 kHz 而源 48 kHz，系统隐式重采样加 5–20 ms 且不可控</td><td>用 <code>AUDCLNT_STREAMOPTIONS_MATCH_FORMAT</code>，或自己重采样并计入预算</td></tr>
+      <tr><td class="t-num">9</td><td>音画同步"不可测"</td><td>没有校准工具时，所有优化都是玄学，团队成员各说各话</td><td>P0 阶段先把测量工具做出来（§09.4）</td></tr>
+      <tr><td class="t-num">10</td><td>iOS 不能做源</td><td>没有系统级采集 API</td><td>需求阶段就明确：iOS 只做 Hub 接收端或自家 App 内音频</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- ============ 路线 ============ -->
+<section id="roadmap">
+  <h2><span class="num">12</span>落地路线</h2>
+  <p class="sub">每个阶段都有可验收的数字，不靠"感觉差不多了"。</p>
+
+  <div class="steps">
+    <div class="step">
+      <div class="sh">Windows → Windows 单源打通</div>
+      <div class="sm">约 5 人日 · 目标：证明链路成立，把测量工具做出来</div>
+      <div class="sb">WASAPI loopback 采集 → Opus 10 ms → UDP → 单源抖动缓冲 → WASAPI shared 输出。<strong>同时做延迟测量工具</strong>（脉冲 + 麦克风互相关）。</div>
+      <div class="sb" style="color:var(--muted);margin-top:4px">验收：有线 <strong>&lt;40 ms</strong>，5 GHz WiFi <strong>&lt;80 ms</strong>；连续 30 分钟无 xrun；延迟 σ &lt; 5 ms</div>
+    </div>
+    <div class="step">
+      <div class="sh">Android 源接入</div>
+      <div class="sm">约 8 人日 · 目标：把最难的一块（采集）验证掉</div>
+      <div class="sb">AudioPlaybackCapture + 前台服务 + MediaProjection 授权流 + WifiLock + 诊断面板。<strong>这一步会暴露 80% 的产品风险</strong>。</div>
+      <div class="sb" style="color:var(--muted);margin-top:4px">验收：主流视频/音乐 App 可抓（DRM 除外）；延迟 <strong>&lt;100 ms</strong>；锁屏 10 分钟不掉线</div>
+    </div>
+    <div class="step">
+      <div class="sh">多源混音 + 时钟锁定</div>
+      <div class="sm">约 8 人日 · 目标：从"能传"到"能用"</div>
+      <div class="sb">N 路并发、每源 ASRC + PI 环（已在 P0 完成，见仓库 <code>hub_main.cpp</code>）、响度归一化、混音台 UI（推子 / 静音 / 独奏 / 主源 ducking）。</div>
+      <div class="sb" style="color:var(--muted);margin-top:4px">验收：3 源并发，源间延迟差 <strong>&lt;10 ms</strong>；2 小时连续运行漂移 <strong>&lt;1 ms</strong></div>
+    </div>
+    <div class="step">
+      <div class="sh">体验与鲁棒性</div>
+      <div class="sm">约 5 人日</div>
+      <div class="sb">mDNS 自动发现 + 配对码、蓝牙设备拦截、延迟校准向导、断线重连、统计面板。</div>
+      <div class="sb" style="color:var(--muted);margin-top:4px">验收：新设备从安装到出声 <strong>&lt;60 秒</strong></div>
+    </div>
+    <div class="step">
+      <div class="sh">扩展（可选）</div>
+      <div class="sm">按需</div>
+      <div class="sb">macOS 源（Core Audio Tap）、Web 接收端（WebAudio 定时播放）、AES-GCM 加密（跨公网）、录制与回放。</div>
+    </div>
+  </div>
+
+  <div class="callout">
+    <span class="t">顺序为什么是这个</span>
+    <p>先 Windows→Windows 是因为它<strong>排除了平台采集的不确定性</strong>，能最快验证"传输 + 缓冲 + 输出"这套核心是否成立。
+    如果这一步都做不到 40 ms，后面 Android 只会更糟 —— 及早止损。</p>
+  </div>
+</section>
+
+<!-- ============ 技术栈 ============ -->
+<section id="stack">
+  <h2><span class="num">13</span>技术栈建议</h2>
+  <p class="sub">包括一个你大概会问的问题：能不能用 Unity 做。</p>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th style="width:20%">模块</th><th>建议</th><th style="width:34%">理由</th></tr></thead>
+    <tbody>
+      <tr><td>核心（采集/协议/缓冲/混音）</td><td>Rust，导出 C ABI</td><td>无 GC、内存安全、跨平台交叉编译好；<code>cpal</code> / <code>oboe</code> / <code>wasapi</code> 绑定成熟</td></tr>
+      <tr><td>编码</td><td><code>libopus</code>（BSD）</td><td>低延迟与音质的当前最优解，且许可证友好</td></tr>
+      <tr><td>重采样</td><td>speex-resampler 或自写 sample slip</td><td>可变比率是硬需求，libsoxr 的变比率接口不好用</td></tr>
+      <tr><td>Windows 采集</td><td><code>windows-rs</code> → WASAPI</td><td>process loopback 需要 <code>ActivateAudioInterfaceAsync</code>，C++/Rust 都好写</td></tr>
+      <tr><td>Windows 输出</td><td><code>IAudioClient3</code></td><td>shared 模式下拿到 2.67 ms 周期，这是最容易被忽略的红利</td></tr>
+      <tr><td>Android 采集</td><td>Kotlin + JNI（或纯 NDK <code>AAudio</code>）</td><td>MediaProjection 必须在 Java/Kotlin 层拿，AudioRecord 可以走 NDK</td></tr>
+      <tr><td>Android 输出</td><td><code>Oboe</code> / <code>AAudio</code></td><td><code>LOW_LATENCY</code> + <code>EXCLUSIVE</code> 是数量级差异</td></tr>
+      <tr><td>UI</td><td>Android: Compose<br>Windows: Avalonia / WinUI / 或本地 Web</td><td>音频核心与 UI 完全解耦，UI 慢 10 ms 无所谓</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>13.1 用 Unity 做可行吗？</h3>
+  <p>你是 Unity 背景，这个问题值得认真回答：</p>
+  <ul>
+    <li><strong>可以做的</strong>：混音（<code>OnAudioFilterRead</code> 拿 float 缓冲做求和）、用 <code>AudioSettings.dspTime</code> 做时钟、UI、多端打包</li>
+    <li><strong>做不到的</strong>：Unity 在 Windows 上走 FMOD → WASAPI <em>shared</em>，缓冲通常约 1024 采样（48 kHz 下 <strong>≈21 ms</strong>）且<strong>不可调</strong>，也拿不到 <code>IAudioClient3</code>。
+      另外 Unity 主线程的 GC 和调度抖动会传导到音频回调</li>
+    <li><strong>结论</strong>：Unity 适合 <strong>P0 的原型</strong>（一天就能听到声音、验证混音手感），但会吃掉约 1/4 的延迟预算且抖动不可控。
+      目标定在 60–100 ms 时 <strong>勉强够用</strong>；要冲 40 ms 必须换 native</li>
+  </ul>
+  <div class="callout">
+    <span class="t">务实建议</span>
+    <p>用 Unity 做 <strong>Hub 的 UI + 混音台</strong>（它对延迟不敏感），把"采集 / 传输 / 抖动缓冲 / 输出"四件事放进一个 native 库（Rust 或 C++），Unity 通过 P/Invoke 调用。
+    这样既复用了你的熟练度，又不让 GC 进音频线程。<strong>不要试图用 Unity 的 AudioSource 走网络流</strong> —— 那会把所有缓冲控制权交给 FMOD。</p>
+  </div>
+</section>
+
+<!-- ============ 代码 ============ -->
+<section id="code">
+  <h2><span class="num">14</span>关键代码骨架</h2>
+  <p class="sub">三段最核心的伪代码，能直接翻译成 Rust/C。</p>
+
+  <h3>14.1 抖动缓冲 + 混音循环</h3>
+  <pre><code><span class="c">// 设备回调：唯一允许做的事就是 memcpy</span>
+void device_cb(float* out, int frames) {
+    size_t got = spsc_read(&amp;out_ring, out, frames);
+    if (got &lt; frames)
+        memset(out + got, 0, (frames - got) * 2 * sizeof(float));
+}
+
+<span class="c">// 混音线程：每 5 ms 生产一个 block（240 frames @ 48k）</span>
+void mixer_tick(void) {
+    float acc[BLOCK * 2] = {0};
+
+    for (int s = 0; s &lt; nsrc; ++s) {
+        float tmp[BLOCK * 2];
+        if (!jb_read(&amp;src[s].jb, tmp, BLOCK)) {
+            opus_plc(&amp;src[s].dec, tmp, BLOCK);   <span class="c">// 用 PLC 补，绝不补静音</span>
+        }
+        for (int i = 0; i &lt; BLOCK * 2; ++i)
+            acc[i] += tmp[i] * src[s].gain;
+    }
+    soft_limit(acc, BLOCK * 2);                  <span class="c">// tanh / lookahead limiter</span>
+    spsc_write(&amp;out_ring, acc, BLOCK);
+}</code></pre>
+
+  <h3>14.2 按 deadline 播出（而不是按到达顺序）</h3>
+  <pre><code><span class="c">// Hub 时间轴上，这一帧应该在这个时刻被听到</span>
+int64_t deadline = pkt-&gt;capture_ts_us + src-&gt;clock_offset + L_base_us;
+
+<span class="c">// 逆算它该在输出环的哪个位置（不需要排序，直接算出索引）</span>
+int64_t offset_frames = (deadline - now_hub_us) * 48000 / 1000000;
+if (offset_frames &lt; 0) {                 <span class="c">// 迟到：已经过了播出点</span>
+    stats-&gt;late_pkts++;
+    if (-offset_frames &gt; 48000 * 0.02)   <span class="c">// 迟到超过 20 ms 就丢弃</span>
+        return;
+}
+jb_write_at(&amp;src-&gt;jb, pcm, nframes, offset_frames);</code></pre>
+
+  <h3>14.3 延迟上报（给 UI 和自动化测试用）</h3>
+  <pre><code><span class="c">// 端到端延迟 = 采集时刻 → 真正出声时刻</span>
+latency_ms = (device_playout_us_now - (pkt-&gt;capture_ts_us + src-&gt;clock_offset)) / 1000.0;
+
+<span class="c">// 上报均值与标准差；标准差比均值更能说明体验好坏</span>
+stats_push(latency_ms);
+report(mean(lat_window), stddev(lat_window), jitter_p95, xrun_count);</code></pre>
+</section>
+
+<!-- ============ 验证 ============ -->
+<section id="validate">
+  <h2><span class="num">15</span>今天就能做的验证</h2>
+  <p class="sub">在写一行代码之前，用一天时间把三个假设测掉。</p>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th style="width:20%">实验</th><th style="width:26%">怎么做</th><th>能验证什么</th><th style="width:120px">预计耗时</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>SonoBus</strong></td>
+        <td>Hub 和 2–3 台设备装 SonoBus，同一房间组网，把抖动缓冲手动压到最小</td>
+        <td><strong>延迟手感的上限</strong>：如果连它都到不了 40 ms，说明网络/设备就是瓶颈，自研也没用</td>
+        <td>2 小时</td>
+      </tr>
+      <tr>
+        <td><strong>Voicemeeter + VBAN</strong></td>
+        <td>Windows 装 Voicemeeter Banana，开 VBAN 接收；另一台 PC 用 VBAN 发送</td>
+        <td><strong>Windows 宿端多源混音的真实体验</strong>，以及"多源响度失衡"到底有多烦</td>
+        <td>3 小时</td>
+      </tr>
+      <tr>
+        <td><strong>sndcpy</strong></td>
+        <td>Android 开 USB 调试，跑 sndcpy，观察哪些 App 有声、哪些没声</td>
+        <td><strong>Android 采集的覆盖面</strong>：你的目标 App 到底能不能被抓</td>
+        <td>1 小时</td>
+      </tr>
+      <tr>
+        <td><strong>延迟自测</strong></td>
+        <td>手机拍一段"拍手"的慢动作视频，同时录下 Hub 喇叭的声音，数帧差</td>
+        <td><strong>基线延迟</strong>，以及你对"多少 ms 算能忍"的主观阈值</td>
+        <td>1 小时</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="callout ok">
+    <span class="t">这四个实验的共同价值</span>
+    <p>它们能在一日内回答"这件事值不值得自研"。如果 SonoBus 压到最小缓冲后你听着觉得"完全够用"，
+    那可能只需要做一个"把系统音频路由到 SonoBus 输入"的适配层，而不是重写整个音频栈。</p>
+  </div>
+</section>
+
+<!-- ============ 参考 ============ -->
+<section id="refs">
+  <h2><span class="num">16</span>参考</h2>
+  <p class="sub">只列实际查阅过的来源。</p>
+
+  <h4>标准与感知阈值</h4>
+  <ul style="font-size:13.5px">
+    <li>ITU-R BT.1359-1, <em>Relative timing of sound and vision for broadcasting</em> — 可察觉 +45/−125 ms，可接受 +90/−185 ms</li>
+    <li>EBU R37, <em>The relative timing of the sound and vision components of a television signal</em> — 单环节 +5/−15 ms，整链 +40/−60 ms</li>
+    <li>ATSC IS-191 — 音频不超前 15 ms、不滞后 45 ms</li>
+  </ul>
+
+  <h4>项目与文档</h4>
+  <ul style="font-size:13.5px">
+    <li>Snapcast — <code>github.com/badaix/snapcast</code>；同步算法见 issue #782 与 <code>common/time_provider.cpp</code></li>
+    <li>SonoBus — <code>sonobus.net</code> / <code>github.com/sonosaurus/sonobus</code>（JUCE + Opus + AOO）</li>
+    <li>sndcpy — <code>github.com/rom1v/sndcpy</code></li>
+    <li>Opus — <code>opus-codec.org</code>（RFC 6716 / 7587）；帧长 2.5–60 ms，CELT 算法延迟 = 帧长 + 2.5 ms</li>
+    <li>Android — <em>Capture video and audio playback</em>（<code>developer.android.com/media/platform/av-capture</code>）；<em>Low latency audio</em>（Oboe/AAudio）</li>
+    <li>Windows — WASAPI loopback 与 <code>AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK</code>（Win10 2004+，官方 ApplicationLoopback 示例）</li>
+    <li>macOS — ScreenCaptureKit（13+）、Core Audio process taps（14.2+，<code>CATapDescription</code>）</li>
+    <li>PulseAudio — <em>Network Setup</em> 文档；16.0 release notes（tunnel 延迟可配、RTP 模块支持 Opus）</li>
+    <li>Voicemeeter / VBAN — <code>voicemeeter.com</code>（UDP、PCM 1–8 声道、任意采样率）</li>
+  </ul>
+
+  <h4>说明</h4>
+  <p style="font-size:13px;color:var(--muted)">
+    文中延迟数字分为两类：<strong>设计推导值</strong>（采集/编码/缓冲等可计算的环节）与<strong>实测量级</strong>（引用他人测试或社区报告）。
+    两者都随设备、网络、系统版本大幅变化，落地时必须以 §09.4 的校准工具在你自己的硬件上重测。
+    特别是「AudioRelay ~50 ms」「Snapcast 30–200 ms」这类数字来自第三方测试，不是厂商承诺值。
+  </p>
+</section>
+
+<footer>
+  跨端音频汇聚系统 · 技术调研与架构设计 · 2026-10-25
+</footer>
+
+</div>
+</body>
+</html>
