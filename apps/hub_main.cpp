@@ -53,6 +53,7 @@ struct Options {
   int latency_ms = 60;
   int block_frames = audiohub::kFramesPerPacket;
   int render_latency_ms = 10;
+  std::string log_path;  // 非空时把输出重定向到文件
 };
 
 void PrintUsage() {
@@ -62,7 +63,8 @@ void PrintUsage() {
       "  --port <n>        监听端口，默认 47000（控制口自动用 port+1）\n"
       "  --latency <ms>    目标端到端延迟，默认 60。可选 40/60/120\n"
       "  --render-ms <n>   WASAPI 输出缓冲毫秒数，默认 10\n"
-      "  --block <frames>  混音块大小（帧），默认 %d（5 ms）\n",
+      "  --block <frames>  混音块大小（帧），默认 %d（5 ms）\n"
+      "  --log <file>      把输出写到文件（后台运行时看统计用）\n",
       audiohub::kFramesPerPacket);
 }
 
@@ -84,6 +86,8 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
       opt->render_latency_ms = std::stoi(next("--render-ms"));
     } else if (a == "--block") {
       opt->block_frames = std::stoi(next("--block"));
+    } else if (a == "--log") {
+      opt->log_path = next("--log");
     } else if (a == "-h" || a == "--help") {
       PrintUsage();
       return false;
@@ -151,8 +155,17 @@ int main(int argc, char** argv) {
   Options opt;
   if (!ParseArgs(argc, argv, &opt)) return 1;
 
+  // --log：把输出写进文件。后台运行（无控制台）时只能靠这个看统计。
+  if (!opt.log_path.empty()) {
+    if (std::freopen(opt.log_path.c_str(), "w", stdout) == nullptr) {
+      std::printf("无法打开日志文件: %s\n", opt.log_path.c_str());
+      return 1;
+    }
+  }
+
   // 行缓冲：这两支程序经常被重定向到日志文件，默认的块缓冲会在进程被强杀时
   // 丢掉最后几 KB 输出——排查现场正是最需要那段输出的时候。
+  // freopen 之后必须重新设置，否则又回到块缓冲。
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
 
   const auto t0 = Clock::now();
@@ -422,6 +435,9 @@ int main(int argc, char** argv) {
       }
     }
     last_packets = p;
+    // 显式 flush：freopen 之后 setvbuf 未必生效，不 flush 的话
+    // --log 的日志要攒满 4 KB 才落盘，后台跑的时候看着像"没输出"。
+    std::fflush(stdout);
   }
 
   running.store(false);

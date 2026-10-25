@@ -50,6 +50,7 @@ struct Options {
   int jitter_ms = 0;      // 模拟网络抖动（零均值）
   std::string include_name;  // 进程回环：只抓这个进程树
   std::string exclude_name;  // 进程回环：排除这个进程树
+  std::string log_path;   // 非空时把输出重定向到文件
   bool verbose = false;
 };
 
@@ -64,6 +65,7 @@ void PrintUsage() {
       "  --jitter <ms>       给发送时刻加零均值随机抖动，模拟 WiFi\n"
       "  --include <exe>     只抓这个进程的声音（Win10 2004+）\n"
       "  --exclude <exe>     排除这个进程的声音，其它照抓（Win10 2004+）\n"
+      "  --log <file>        把输出写到文件（后台运行时看统计用）\n"
       "  --verbose           每包打印一次（调试用，会明显影响性能）\n",
       static_cast<unsigned>(47000));
 }
@@ -100,6 +102,8 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
       opt->include_name = next("--include");
     } else if (a == "--exclude") {
       opt->exclude_name = next("--exclude");
+    } else if (a == "--log") {
+      opt->log_path = next("--log");
     } else if (a == "--verbose") {
       opt->verbose = true;
     } else if (a == "-h" || a == "--help") {
@@ -120,8 +124,17 @@ int main(int argc, char** argv) {
   Options opt;
   if (!ParseArgs(argc, argv, &opt)) return 1;
 
+  // --log：把输出写进文件。后台运行（无控制台）时只能靠这个看统计。
+  if (!opt.log_path.empty()) {
+    if (std::freopen(opt.log_path.c_str(), "w", stdout) == nullptr) {
+      std::printf("无法打开日志文件: %s\n", opt.log_path.c_str());
+      return 1;
+    }
+  }
+
   // 行缓冲：这两支程序经常被重定向到日志文件，默认的块缓冲会在进程被强杀时
   // 丢掉最后几 KB 输出——排查现场正是最需要那段输出的时候。
+  // freopen 之后必须重新设置，否则又回到块缓冲。
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
 
   const auto t0 = Clock::now();
@@ -363,6 +376,7 @@ int main(int argc, char** argv) {
                 rtt, rtt * 0.5, static_cast<unsigned long long>(dropped_samples.load()));
     last_frames = f;
     last_packets = p;
+    std::fflush(stdout);  // 理由同 hub：--log 时保证每秒落盘
 
     if (!tone_mode && !capture.running()) {
       std::printf("采集已停止: %s\n", capture.last_error().c_str());
