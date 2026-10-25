@@ -52,6 +52,13 @@ if(WIN32)
   add_executable(audiohub-hub apps/hub_main.cpp)
   target_link_libraries(audiohub-hub PRIVATE audiohub_win)
 
+  # 图形界面版：-mwindows 去掉控制台窗口，comctl32 提供 trackbar
+  if(MINGW OR MSVC)
+    add_executable(audiohub-hub-gui apps/hub_gui.cpp)
+    target_link_libraries(audiohub-hub-gui PRIVATE audiohub_win comctl32)
+    set_target_properties(audiohub-hub-gui PROPERTIES WIN32_EXECUTABLE ON)
+  endif()
+
   # 放进同一个目录，方便直接双击/命令行对照运行
   set_target_properties(audiohub-source audiohub-hub PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -68,6 +75,7 @@ add_executable(audiohub_tests
   tests/test_clock.cpp
   tests/test_asrc.cpp
   tests/test_mixer.cpp
+  tests/test_pipeline.cpp
 )
 target_link_libraries(audiohub_tests PRIVATE audiohub_core)
 target_include_directories(audiohub_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)

@@ -37,7 +37,7 @@ class Meter {
   }
 
   // 返回 false 表示这一轮没有任何数据（不是静音，是"没收到"）。
-  bool Take(double* dbfs) {
+  bool Take(double* dbfs) const {
     std::lock_guard<std::mutex> lock(mutex_);
     if (count_ == 0) return false;
     *dbfs = 10.0 * std::log10(sum_sq_ / static_cast<double>(count_) + 1e-12);
@@ -47,9 +47,11 @@ class Meter {
   }
 
  private:
-  std::mutex mutex_;
-  double sum_sq_ = 0.0;
-  uint64_t count_ = 0;
+  // Take() 是 const 的：HubCore::Sources()/Stats() 是 const 方法，
+  // 而电平表本质上是个"取走即清零"的累加器，语义上就该是 const 的。
+  mutable std::mutex mutex_;
+  mutable double sum_sq_ = 0.0;
+  mutable uint64_t count_ = 0;
 };
 
 }  // namespace audiohub

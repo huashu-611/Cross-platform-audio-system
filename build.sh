@@ -12,17 +12,19 @@ CXX="${CXX:-g++}"
 OUT=build
 mkdir -p "$OUT"
 
-CORE="src/packet.cpp src/jitter_buffer.cpp src/clock_sync.cpp src/asrc.cpp src/mixer.cpp src/udp_socket.cpp"
+CORE="src/packet.cpp src/jitter_buffer.cpp src/clock_sync.cpp src/asrc.cpp src/mixer.cpp src/udp_socket.cpp src/hub_core.cpp"
 # 静态链接 libstdc++/libgcc：否则 exe 依赖 MSYS2 的运行时 DLL，
 # 用户双击运行会报"找不到 libstdc++-6.dll"。多几百 KB，换免安装。
 STATIC="-static -static-libgcc -static-libstdc++"
 FLAGS="-std=c++17 -O2 -Wall -Wextra -Iinclude $STATIC"
 
 echo "==> 单元测试"
+# 测试只编纯核心（不含 hub_core.cpp：它依赖 WASAPI 实现，
+# 而测试用不到 HubCore，也不该为此把平台依赖拖进来）
 $CXX $FLAGS \
-  $CORE \
+  src/packet.cpp src/jitter_buffer.cpp src/clock_sync.cpp src/asrc.cpp src/mixer.cpp src/udp_socket.cpp \
   tests/test_main.cpp tests/test_packet.cpp tests/test_ring.cpp tests/test_jitter.cpp \
-  tests/test_clock.cpp tests/test_asrc.cpp tests/test_mixer.cpp \
+  tests/test_clock.cpp tests/test_asrc.cpp tests/test_mixer.cpp tests/test_pipeline.cpp \
   -lws2_32 -o "$OUT/audiohub_tests.exe"
 
 if [ "${WIN32:-1}" = "1" ]; then
@@ -33,6 +35,12 @@ if [ "${WIN32:-1}" = "1" ]; then
       $CORE -lole32 -lws2_32 -lmfplat -lmfreadwrite -lmfuuid \
       -o "$OUT/audiohub-${app}.exe"
   done
+
+  # 图形界面版：-mwindows 去掉控制台，-lcomctl32 给 trackbar 用
+  $CXX $FLAGS -Iplatform/win -mwindows \
+    apps/hub_gui.cpp platform/win/wasapi_audio.cpp platform/win/media_file.cpp \
+    $CORE -lole32 -lws2_32 -lmfplat -lmfreadwrite -lmfuuid -lcomctl32 \
+    -o "$OUT/audiohub-hub-gui.exe"
 fi
 
 echo "==> 运行测试"

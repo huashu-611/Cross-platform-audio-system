@@ -24,7 +24,8 @@
 | N 路混音 + 软限幅 | ✅ | float32 累加，阈值 0.85 |
 | WASAPI 系统音频采集 | ✅ | loopback + AUTOCONVERTPCM |
 | 进程回环 `--include/--exclude` | ✅ | Win10 2004+，只抓/排除指定进程树 |
-| Android 源端 | ⬜ 已打包未实测 | `android/`，APK 29 KB，装填 IP 即用 |
+| Android 源端 | ✅ 已真机验证 | `android/`，APK 29 KB |
+| Windows 图形界面 | ✅ | `audiohub-hub-gui.exe`，每路音量/静音 + 总音量 |
 | WASAPI 低延迟输出 | ✅ | 事件驱动，默认 10 ms 缓冲 |
 | 内置信号源 `--tone` | ✅ | 无音频设备也能测；两路正弦叠加可数值验证混音 |
 | 抖动注入 `--jitter` | ✅ | 模拟 WiFi，验抖动缓冲 |
@@ -113,6 +114,14 @@ cmake --build build --config Release
 ---
 
 ## 运行
+
+### 图形界面版（推荐日常用）
+
+双击 `build/audiohub-hub-gui.exe`。窗口顶部直接显示**手机上该填的 IP**，
+下面每一路源都有独立的音量滑杆和静音勾选，底部有总音量和目标延迟
+（40 / 60 / 120 ms 三档）。掉线的流会自动从列表消失。
+
+### 命令行版（脚本/测试用）
 
 先起汇聚端（出声的那台机器）：
 
