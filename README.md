@@ -24,6 +24,7 @@
 | N 路混音 + 软限幅 | ✅ | float32 累加，阈值 0.85 |
 | WASAPI 系统音频采集 | ✅ | loopback + AUTOCONVERTPCM |
 | 进程回环 `--include/--exclude` | ✅ | Win10 2004+，只抓/排除指定进程树 |
+| Android 源端 | ⬜ 已打包未实测 | `android/`，APK 29 KB，装填 IP 即用 |
 | WASAPI 低延迟输出 | ✅ | 事件驱动，默认 10 ms 缓冲 |
 | 内置信号源 `--tone` | ✅ | 无音频设备也能测；两路正弦叠加可数值验证混音 |
 | 抖动注入 `--jitter` | ✅ | 模拟 WiFi，验抖动缓冲 |
@@ -290,10 +291,12 @@ stream 1  水位 56 ms (目标 60) | 比率 1.00018 | 迟到 0 溢出 0 | 欠载
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| P0（当前） | Windows→Windows 单源打通 + 测量工具 | 有线 < 40 ms |
-| P1 | Android 源（AudioPlaybackCapture + 前台服务 + WifiLock） | < 100 ms，锁屏 10 min 不掉 |
-| P2 | 多源打磨：响度归一化、混音台、混音线程节拍精度 | 3 源，源间差 < 10 ms |
-| P3 | 发现配对、蓝牙拦截、校准向导、Opus 编码 | 新设备 60 s 内出声 |
+| P0 ✅ | Windows→Windows 单源打通 + 测量工具 + 单机可测 | 见 `docs/测试指南.md` |
+| P1 ⬜ | **Android 源端**（`android/`，APK 已打包，未实机验证） | < 100 ms，锁屏 10 min 不掉 |
+| P2 ⬜ | 多源打磨：响度归一化、混音台、混音线程节拍精度 | 3 源，源间差 < 10 ms |
+| P3 ⬜ | 发现配对（mDNS）、蓝牙拦截、校准向导、Opus 编码 | 新设备 60 s 内出声 |
+
+Android 端的用法和已知限制见 [android/README.md](android/README.md)。
 
 ---
 
