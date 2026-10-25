@@ -9,9 +9,29 @@ const cards = new Map()   // streamId -> DOM 元素
 
 // ------------------------------------------------------------------ 工具
 
+const SEGMENTS = 14
+
 function pct (v) { return Math.round(v * 100) + '%' }
 function dbText (v) { return v <= -119 ? '静音' : v.toFixed(1) + ' dBFS' }
-function meterPct (level) { return Math.max(0, Math.min(100, (level + 60) / 0.6)) + '%' }
+
+// 电平映射到分段：-60dBFS 起表，最后两段是热区、最后一段是削波
+function meterPct (level) { return Math.max(0, Math.min(100, (level + 60) / 0.6)) }
+
+function buildMeter (el) {
+  el.innerHTML = ''
+  for (let i = 0; i < SEGMENTS; ++i) el.appendChild(document.createElement('i'))
+}
+
+function paintMeter (el, level) {
+  const lit = Math.round(meterPct(level) / 100 * SEGMENTS)
+  const segs = el.children
+  for (let i = 0; i < segs.length; ++i) {
+    const on = i < lit
+    const frac = i / SEGMENTS
+    segs[i].className =
+      on ? (frac > 0.92 ? 'on clip' : frac > 0.78 ? 'on hot' : 'on') : ''
+  }
+}
 
 document.getElementById('copyBtn').addEventListener('click', async (e) => {
   const text = document.getElementById('addr').textContent
@@ -34,7 +54,7 @@ function createCard (s) {
       '<div class="name"><span class="dot"></span>流 ' + s.id + '</div>' +
       '<div class="db"></div>' +
     '</div>' +
-    '<div class="meter"><i></i></div>' +
+    '<div class="meter"></div>' +
     '<div class="row">' +
       '<input type="range" min="0" max="150">' +
       '<span class="pct"></span>' +
@@ -48,6 +68,7 @@ function createCard (s) {
   const label = el.querySelector('.pct')
   const mute = el.querySelector('.mute')
   const paint = () => slider.style.setProperty('--p', (slider.value / 1.5) + '%')
+  buildMeter(el.querySelector('.meter'))
 
   // 初值来自后端状态，不要写死 100
   slider.value = Math.round(s.gain * 100)
@@ -106,24 +127,21 @@ function render (state) {
     b.classList.toggle('on', Number(b.dataset.v) === state.latency)
   })
 
-  // ---- 待确认的连接请求 ----
+  // ---- 待确认的连接请求：内嵌警示条 ----
   reqGrid.innerHTML = ''
   for (const p of state.pending || []) {
     const el = document.createElement('div')
-    el.className = 'card req'
+    el.className = 'req'
     el.innerHTML =
-      '<div class="top"><div class="name"><span class="dot warn"></span>' + p.name +
-      '</div><div class="db">' + p.ip + '</div></div>' +
-      '<div class="row"><span class="ask">请求把声音送到这里</span></div>' +
-      '<div class="row" style="margin-top:10px">' +
-        '<button class="btn ok">同意</button>' +
-        '<button class="btn no">拒绝</button>' +
-      '</div>'
+      '<span class="who">' + p.name + '</span>' +
+      '<span class="ip">' + p.ip + '</span>' +
+      '<span class="ask">请求把声音送到这里</span>' +
+      '<button class="btn ok">同意</button>' +
+      '<button class="btn no">拒绝</button>'
     el.querySelector('.ok').addEventListener('click', () => window.hub.accept(p.streamId))
     el.querySelector('.no').addEventListener('click', () => window.hub.reject(p.streamId))
     reqGrid.appendChild(el)
   }
-  if ((state.pending || []).length === 0) reqGrid.innerHTML = ''
 
   // ---- 发现的设备 ----
   peerGrid.innerHTML = ''
@@ -144,6 +162,8 @@ function render (state) {
     peerGrid.appendChild(el)
   }
   if ((state.peers || []).length === 0) peerGrid.innerHTML = ''
+  document.getElementById('sectPeer').style.display =
+    (state.peers || []).length ? '' : 'none'
 
   // 源卡片
   const sources = state.sources || []
@@ -166,7 +186,7 @@ function render (state) {
       grid.appendChild(el)
     }
     el.querySelector('.db').textContent = dbText(s.level)
-    el.querySelector('.meter i').style.width = meterPct(s.level)
+    paintMeter(el.querySelector('.meter'), s.level)
     el.querySelector('.dot').classList.toggle('off', s.muted)
     el.querySelector('.mute').classList.toggle('on', s.muted)
     el.querySelector('.mute').textContent = s.muted ? '已静音' : '静音'
