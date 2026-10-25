@@ -25,7 +25,8 @@
 | WASAPI 系统音频采集 | ✅ | loopback + AUTOCONVERTPCM |
 | 进程回环 `--include/--exclude` | ✅ | Win10 2004+，只抓/排除指定进程树 |
 | Android 源端 | ✅ 已真机验证 | `android/`，APK 29 KB |
-| Windows 图形界面 | ✅ | `audiohub-hub-gui.exe`，每路音量/静音 + 总音量 |
+| Windows 图形界面 | ✅ | `ui/` Electron 壳，每路音量/静音 + 总音量 |
+| 本地 HTTP 控制接口 | ✅ | `audiohub-hub.exe --http-port 4780` |
 | WASAPI 低延迟输出 | ✅ | 事件驱动，默认 10 ms 缓冲 |
 | 内置信号源 `--tone` | ✅ | 无音频设备也能测；两路正弦叠加可数值验证混音 |
 | 抖动注入 `--jitter` | ✅ | 模拟 WiFi，验抖动缓冲 |
@@ -117,9 +118,31 @@ cmake --build build --config Release
 
 ### 图形界面版（推荐日常用）
 
-双击 `build/audiohub-hub-gui.exe`。窗口顶部直接显示**手机上该填的 IP**，
-下面每一路源都有独立的音量滑杆和静音勾选，底部有总音量和目标延迟
-（40 / 60 / 120 ms 三档）。掉线的流会自动从列表消失。
+Electron 网页壳，比原生控件好看得多（毛玻璃卡片、渐变电平条、自定义滑杆）：
+
+```bash
+# 开发态（先 ./build.sh 生成 C++ 核心）
+cd ui && npm install && npm start
+
+# 打包成 Windows 便携 exe / 安装包
+cd ui && npm run dist        # 产物在 ui/release/
+```
+
+> **两个环境坑（都会以莫名其妙的错误呈现）**
+>
+> 1. 某些 Electron 宿主环境会给子进程设 `ELECTRON_RUN_AS_NODE=1`，
+>    Electron 就退化成纯 Node，`require('electron')` 返回的是二进制路径而不是 API。
+>    表现是 `Cannot read properties of undefined (reading 'whenReady')`。
+>    先 `unset ELECTRON_RUN_AS_NODE` 再启动。main.js 里已加针对性报错。
+> 2. 虚拟机 / 无 GPU 环境里 Chromium 的 GPU 进程会崩溃，整个应用起不来。
+>    开发态用 `npm run start:sandbox-off`（即 `electron . --no-sandbox`）。
+>    正式打包产物在正常 PC 上不需要这个参数。
+
+双击后自动做三件事：启动 C++ 音频核心、起本地 HTTP 控制口、打开界面窗口。
+每一路源有独立音量滑杆 + 静音 + 实时电平，底部有总音量和目标延迟
+（40 / 60 / 120 ms）。掉线的流自动从列表消失，音量会被记住。
+
+窗口顶部直接显示**手机上该填的 IP**，点「复制」即可。
 
 ### 命令行版（脚本/测试用）
 
@@ -163,6 +186,7 @@ build/audiohub-source.exe --hub 127.0.0.1:47000 --tone 660 --stream-id 2
 | `--port` | 47000 | 数据口；控制口自动用 `port+1` |
 | `--latency` | 60 | 目标端到端延迟（ms），可选 40 / 60 / 120 |
 | `--render-ms` | 10 | WASAPI 输出缓冲，越小延迟越低、越容易断 |
+| `--http-port` | 关 | 本地 HTTP 接口，图形界面靠它控制 |
 | `--block` | 240 | 混音块大小（帧），240 = 5 ms |
 
 `audiohub-source`

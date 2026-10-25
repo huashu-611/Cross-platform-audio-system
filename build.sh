@@ -12,7 +12,7 @@ CXX="${CXX:-g++}"
 OUT=build
 mkdir -p "$OUT"
 
-CORE="src/packet.cpp src/jitter_buffer.cpp src/clock_sync.cpp src/asrc.cpp src/mixer.cpp src/udp_socket.cpp src/hub_core.cpp"
+CORE="src/packet.cpp src/jitter_buffer.cpp src/clock_sync.cpp src/asrc.cpp src/mixer.cpp src/udp_socket.cpp src/hub_core.cpp src/http_api.cpp"
 # 静态链接 libstdc++/libgcc：否则 exe 依赖 MSYS2 的运行时 DLL，
 # 用户双击运行会报"找不到 libstdc++-6.dll"。多几百 KB，换免安装。
 STATIC="-static -static-libgcc -static-libstdc++"
@@ -36,13 +36,14 @@ if [ "${WIN32:-1}" = "1" ]; then
       -o "$OUT/audiohub-${app}.exe"
   done
 
-  # 图形界面版：-mwindows 去掉控制台，-lcomctl32 给 trackbar 用
-  $CXX $FLAGS -Iplatform/win -mwindows \
-    apps/hub_gui.cpp platform/win/wasapi_audio.cpp platform/win/media_file.cpp \
-    $CORE -lole32 -lws2_32 -lmfplat -lmfreadwrite -lmfuuid -lcomctl32 \
-    -o "$OUT/audiohub-hub-gui.exe"
 fi
 
 echo "==> 运行测试"
 "./$OUT/audiohub_tests.exe"
+# Electron 壳需要 C++ 核心的可执行文件；asar 里不能 spawn 二进制，
+# 必须放到 bin/ 并在打包时 asarUnpack
+mkdir -p ui/bin
+cp "$OUT/audiohub-hub.exe" ui/bin/audiohub-hub.exe
+echo "==> 已同步 ui/bin/audiohub-hub.exe（Electron 壳用）"
+
 echo "==> 产物在 $OUT/"

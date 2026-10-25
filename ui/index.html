@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AudioHub 汇聚端</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="brand">
+      <h1>AudioHub <span>汇聚端</span></h1>
+      <div class="sub">多台设备的声音，汇到这一副耳机里</div>
+    </div>
+    <div class="addr">
+      <div>
+        <div class="k">手机上填</div>
+        <div class="v" id="addr">—</div>
+      </div>
+      <button id="copyBtn">复制</button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner hidden"></div>
+
+  <div class="grid" id="grid"></div>
+
+  <div class="panel">
+    <div class="box">
+      <h3>总音量</h3>
+      <div class="row">
+        <input type="range" id="master" min="0" max="150" value="100">
+        <span class="pct" id="masterPct">100%</span>
+      </div>
+    </div>
+    <div class="box">
+      <h3>目标延迟</h3>
+      <div class="seg" id="lat">
+        <button data-v="40">40 ms</button>
+        <button data-v="60" class="on">60 ms</button>
+        <button data-v="120">120 ms</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="stats" id="stats"></div>
+</div>
+
+<script src="renderer.js"></script>
+</body>
+</html>

@@ -7,10 +7,12 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <sstream>
 #include <string>
 #include <thread>
 
 #include "audiohub/hub_core.hpp"
+#include "audiohub/http_api.hpp"
 #include "audiohub/udp_socket.hpp"
 
 namespace {
@@ -19,6 +21,7 @@ struct Options {
   uint16_t port = 47000;
   int latency_ms = 60;
   int render_latency_ms = 10;
+  uint16_t http_port = 0;  // 0 = 不开 HTTP 接口
   std::string log_path;
 };
 
@@ -29,6 +32,7 @@ void PrintUsage() {
       "  --port <n>        监听端口，默认 47000（控制口自动用 port+1）\n"
       "  --latency <ms>    目标端到端延迟，默认 60。可选 40/60/120\n"
       "  --render-ms <n>   WASAPI 输出缓冲毫秒数，默认 10\n"
+      "  --http-port <n>   打开本地 HTTP 接口（给图形界面用），默认关闭\n"
       "  --log <file>      把输出写到文件（后台运行时看统计用）\n"
       "\n"
       "需要调每路音量/静音的话，用图形界面版 audiohub-hub-gui.exe\n");
@@ -52,6 +56,8 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
       opt->render_latency_ms = std::stoi(next("--render-ms"));
     } else if (a == "--block") {
       (void)next("--block");  // 兼容旧脚本，已无效
+    } else if (a == "--http-port") {
+      opt->http_port = static_cast<uint16_t>(std::stoi(next("--http-port")));
     } else if (a == "--log") {
       opt->log_path = next("--log");
     } else if (a == "-h" || a == "--help") {
@@ -90,11 +96,110 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  // 供 HTTP 接口里的 /api/state 用：只取第一个 IP（不带 "127.0.0.1" 那个）
+  std::string ip_only;
+
+  // ---- 本地 HTTP 接口（图形界面走这条）----
+  // 只绑 127.0.0.1：这是本机控制通道，不该暴露到局域网。
+  std::unique_ptr<audiohub::HttpApi> http;
+  if (opt.http_port != 0) {
+    http = std::make_unique<audiohub::HttpApi>();
+    std::string http_error;
+    if (!http->Start(opt.http_port,
+                     [&](const std::string& method, const std::string& path,
+                         const std::string& body) -> std::string {
+                       if (path == "/api/state") {
+                         const auto stats = hub.Stats();
+                         const auto sources = hub.Sources();
+
+                         // 收包速率：接口被轮询的频率不固定，用增量/时间算
+                         static uint64_t last_total = 0;
+                         static double smoothed_kbps = 0;
+                         static auto last_tick = std::chrono::steady_clock::now();
+                         const auto now = std::chrono::steady_clock::now();
+                         const double dt =
+                             std::chrono::duration<double>(now - last_tick).count();
+                         uint64_t total = 0;
+                         for (const auto& s : sources) total += s.packets;
+                         if (dt > 0.05) {
+                           const double instant =
+                               static_cast<double>(total - last_total) * 976.0 * 8.0 / 1000.0 / dt;
+                           smoothed_kbps = smoothed_kbps * 0.7 + instant * 0.3;
+                           last_total = total;
+                           last_tick = now;
+                         }
+
+                         std::ostringstream o;
+                         o << "{\"ip\":\"" << audiohub::JsonEscape(ip_only) << ":"
+                           << opt.port << "\",\"latency\":" << stats.latency_ms
+                           << ",\"master\":" << hub.master_gain()
+                           << ",\"busLevel\":" << stats.bus_level_dbfs
+                           << ",\"kbps\":" << smoothed_kbps
+                           << ",\"malformed\":" << stats.malformed_packets
+                           << ",\"renderUnderruns\":" << stats.render_underruns
+                           << ",\"sources\":[";
+                         for (size_t i = 0; i < sources.size(); ++i) {
+                           const auto& s = sources[i];
+                           if (i) o << ",";
+                           o << "{\"id\":" << s.id << ",\"level\":" << s.level_dbfs
+                             << ",\"gain\":" << s.gain
+                             << ",\"muted\":" << (s.muted ? "true" : "false")
+                             << ",\"occupancy\":" << s.occupancy_ms
+                             << ",\"packets\":" << s.packets
+                             << ",\"underrun\":" << s.underrun_frames
+                             << ",\"overflow\":" << s.overflow_packets << "}";
+                         }
+                         o << "]}";
+                         return o.str();
+                       }
+
+                       if (method == "POST" && path == "/api/source") {
+                         double v = 0;
+                         bool b = false;
+                         uint16_t id = 0;
+                         if (audiohub::JsonFindNumber(body, "id", &v)) {
+                           id = static_cast<uint16_t>(v);
+                         }
+                         if (audiohub::JsonFindNumber(body, "gain", &v)) {
+                           hub.SetSourceGain(id, static_cast<float>(v));
+                         }
+                         if (audiohub::JsonFindBool(body, "muted", &b)) {
+                           hub.SetSourceMuted(id, b);
+                         }
+                         return "{\"ok\":true}";
+                       }
+                       if (method == "POST" && path == "/api/master") {
+                         double v = 0;
+                         if (audiohub::JsonFindNumber(body, "gain", &v)) {
+                           hub.SetMasterGain(static_cast<float>(v));
+                         }
+                         return "{\"ok\":true}";
+                       }
+                       if (method == "POST" && path == "/api/latency") {
+                         double v = 0;
+                         if (audiohub::JsonFindNumber(body, "ms", &v)) {
+                           hub.SetLatency(static_cast<int>(v));
+                         }
+                         return "{\"ok\":true}";
+                       }
+                       return "{\"ok\":false}";
+                     },
+                     &http_error)) {
+      std::printf("%s\n", http_error.c_str());
+      return 4;
+    }
+  }
+
   std::printf("\n");
   std::printf("  audiohub-hub 已启动\n");
   std::printf("  监听       : 0.0.0.0:%u（控制口 %u）\n", opt.port, opt.port + 1);
   std::printf("  目标延迟   : %d ms\n", opt.latency_ms);
-  std::printf("  本机地址   : %s\n", hub.local_ip().c_str());
+  {
+    const std::string all = hub.local_ip();
+    ip_only = all.substr(0, all.find(','));
+    std::printf("  本机地址   : %s\n", all.c_str());
+  }
+  if (http) std::printf("  HTTP 接口  : http://127.0.0.1:%u\n", opt.http_port);
   std::printf("  Ctrl+C 停止\n\n");
 
   const auto t0 = std::chrono::steady_clock::now();
