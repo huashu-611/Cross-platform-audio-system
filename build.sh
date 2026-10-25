@@ -29,8 +29,9 @@ if [ "${WIN32:-1}" = "1" ]; then
   echo "==> Windows 应用（WASAPI）"
   for app in hub source; do
     $CXX $FLAGS -Iplatform/win \
-      apps/${app}_main.cpp platform/win/wasapi_audio.cpp \
-      $CORE -lole32 -lws2_32 -o "$OUT/audiohub-${app}.exe"
+      apps/${app}_main.cpp platform/win/wasapi_audio.cpp platform/win/media_file.cpp \
+      $CORE -lole32 -lws2_32 -lmfplat -lmfreadwrite -lmfuuid \
+      -o "$OUT/audiohub-${app}.exe"
   done
 fi
 

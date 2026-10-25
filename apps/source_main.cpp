@@ -25,6 +25,7 @@
 #include "audiohub/packet.hpp"
 #include "audiohub/spsc_ring.hpp"
 #include "audiohub/udp_socket.hpp"
+#include "media_file.hpp"
 #include "wasapi_audio.hpp"
 
 namespace {
@@ -48,6 +49,7 @@ struct Options {
   int stream_id = 1;
   int tone_hz = 0;        // >0 时用内置正弦代替采集
   int jitter_ms = 0;      // 模拟网络抖动（零均值）
+  std::string file_path;     // 非空时播放文件而不是采集
   std::string include_name;  // 进程回环：只抓这个进程树
   std::string exclude_name;  // 进程回环：排除这个进程树
   std::string log_path;   // 非空时把输出重定向到文件
@@ -62,6 +64,7 @@ void PrintUsage() {
       "  --stream-id <n>     流编号，一台设备可跑多路，默认 1\n"
       "  --cap-ms <n>        采集缓冲毫秒数，默认 20。越小延迟越低、越容易断\n"
       "  --tone <hz>         不发采集，改发内置正弦波。用于单机测多源混音\n"
+      "  --file <path>       不发采集，改播音频文件（mp3/flac/wav/m4a，循环）\n"
       "  --jitter <ms>       给发送时刻加零均值随机抖动，模拟 WiFi\n"
       "  --include <exe>     只抓这个进程的声音（Win10 2004+）\n"
       "  --exclude <exe>     排除这个进程的声音，其它照抓（Win10 2004+）\n"
@@ -96,6 +99,8 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
       opt->capture_buffer_ms = std::stoi(next("--cap-ms"));
     } else if (a == "--tone") {
       opt->tone_hz = std::stoi(next("--tone"));
+    } else if (a == "--file") {
+      opt->file_path = next("--file");
     } else if (a == "--jitter") {
       opt->jitter_ms = std::stoi(next("--jitter"));
     } else if (a == "--include") {
@@ -166,21 +171,33 @@ int main(int argc, char** argv) {
   std::atomic<uint64_t> dropped_samples{0};
 
   std::vector<int16_t> scratch;
-  // 采集侧电平：链路出问题时第一个要看的东西——
-  // 到底"没抓到声音"还是"抓到但没送到"。
-  audiohub::Meter capture_meter;
+  // 发送电平：链路出问题时第一个要看的东西。
+  // 统计的是"实际写进 UDP 包的内容"，采集/信号源/文件三种模式口径一致。
+  audiohub::Meter send_meter;
+
+  // --file 模式：直接播文件。这是单机上唯一能"只从 hub 听一次"的办法——
+  // 用系统播放器放歌的话，原声会直接从同一块声卡出来，和 hub 的输出叠成回声。
+  audiohub::MediaFile media;
+  if (!opt.file_path.empty()) {
+    std::string error;
+    if (!media.Load(opt.file_path, &error)) {
+      std::printf("载入音频文件失败: %s\n", error.c_str());
+      return 5;
+    }
+  }
 
   // --tone 模式完全不碰声卡：没有音频设备也能跑，而且信号可重复。
   // 这是验证"多源混音是否正确"最直接的手段——两个不同频率的正弦叠加后，
   // 总功率应当恰好比单路高 3 dB（不相关信号功率相加）。
   audiohub::WasapiCapture capture;
   const bool tone_mode = opt.tone_hz > 0;
+  const bool file_mode = media.loaded();
+  const bool capture_mode = !tone_mode && !file_mode;
 
-  if (!tone_mode) {
+  if (capture_mode) {
     const audiohub::CaptureCallback on_capture = [&](const float* data, int frames) {
       const size_t samples = static_cast<size_t>(frames) * audiohub::kChannels;
       if (scratch.size() < samples) scratch.resize(samples);
-      capture_meter.Add(data, samples);
       for (size_t i = 0; i < samples; ++i) scratch[i] = FloatToS16(data[i]);
       const size_t written = ring.Write(scratch.data(), samples);
       if (written < samples) dropped_samples += (samples - written);
@@ -227,6 +244,10 @@ int main(int argc, char** argv) {
   std::printf("  流编号     : %d\n", opt.stream_id);
   if (tone_mode) {
     std::printf("  信号源     : 内置正弦 %d Hz\n", opt.tone_hz);
+  } else if (file_mode) {
+    std::printf("  信号源     : 文件 %s（%d Hz / %d ch -> 48k 双声道，%.1f 秒，循环）\n",
+                opt.file_path.c_str(), media.source_rate(), media.source_channels(),
+                media.seconds());
   } else {
     std::printf("  采集缓冲   : %d ms\n", opt.capture_buffer_ms);
   }
@@ -248,6 +269,7 @@ int main(int argc, char** argv) {
   std::thread sender([&] {
     uint32_t sample_pos = 0;
     uint32_t send_errors = 0;
+    size_t file_cursor = 0;
     constexpr double kTwoPi = 6.283185307179586;
     const double phase_step =
         tone_mode ? kTwoPi * opt.tone_hz / audiohub::kSampleRate : 0.0;
@@ -280,6 +302,15 @@ int main(int argc, char** argv) {
           payload[static_cast<size_t>(i) * audiohub::kChannels + 1] = v;
         }
         captured_frames += audiohub::kFramesPerPacket;
+      } else if (file_mode) {
+        // 顺序取 240 帧，到尾回绕。
+        const auto& pcm = media.pcm();
+        const size_t total = pcm.size();
+        for (size_t i = 0; i < packet_samples; ++i) {
+          payload[i] = pcm[file_cursor];
+          file_cursor = (file_cursor + 1) % total;
+        }
+        captured_frames += audiohub::kFramesPerPacket;
       } else if (ring.Available() >= packet_samples) {
         ring.Read(payload.data(), packet_samples);
       } else {
@@ -288,6 +319,7 @@ int main(int argc, char** argv) {
       }
 
       if (have_data) {
+        send_meter.AddInt16(payload.data(), packet_samples);
         header.seq++;
         header.sample_pos = sample_pos;
         header.capture_ts_ms = NowMs(t0);
@@ -366,9 +398,9 @@ int main(int argc, char** argv) {
     const double rtt = measured_rtt_ms.load();
 
     double capture_level = -120.0;
-    const bool has_level = capture_meter.Take(&capture_level);
+    const bool has_level = send_meter.Take(&capture_level);
     std::printf(
-        "采集 %5.1f kfps 电平 %6.1f dBFS | 发送 %4llu pkt/s | 约 %6.1f kbps | RTT %5.1f ms "
+        "采集 %5.1f kfps 发送电平 %6.1f dBFS | 发送 %4llu pkt/s | 约 %6.1f kbps | RTT %5.1f ms "
         "| 单程 %5.1f ms | 丢 %llu\n",
         (f - last_frames) / 1000.0, has_level ? capture_level : -120.0,
         static_cast<unsigned long long>(p - last_packets),
@@ -378,7 +410,7 @@ int main(int argc, char** argv) {
     last_packets = p;
     std::fflush(stdout);  // 理由同 hub：--log 时保证每秒落盘
 
-    if (!tone_mode && !capture.running()) {
+    if (capture_mode && !capture.running()) {
       std::printf("采集已停止: %s\n", capture.last_error().c_str());
       running.store(false);
       break;

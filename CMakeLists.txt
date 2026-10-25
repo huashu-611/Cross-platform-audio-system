@@ -35,9 +35,13 @@ endif()
 
 # ------------------------------------------------------------------ 平台层
 if(WIN32)
-  add_library(audiohub_win STATIC platform/win/wasapi_audio.cpp)
+  add_library(audiohub_win STATIC
+    platform/win/wasapi_audio.cpp
+    platform/win/media_file.cpp
+  )
   target_include_directories(audiohub_win PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/platform/win)
-  target_link_libraries(audiohub_win PUBLIC audiohub_core ole32)
+  # mfplat/mfreadwrite/mfuuid 是 Media Foundation，用于 --file 模式解码
+  target_link_libraries(audiohub_win PUBLIC audiohub_core ole32 mfplat mfreadwrite mfuuid)
 endif()
 
 # ------------------------------------------------------------------ 应用

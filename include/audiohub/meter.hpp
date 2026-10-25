@@ -22,6 +22,20 @@ class Meter {
     count_ += count;
   }
 
+  // int16 版本：源端统计的是"实际发上线的内容"，
+  // 采集/信号源/文件三种模式都走这里，标签才有可比性。
+  void AddInt16(const int16_t* data, size_t count) {
+    constexpr double kScale = 1.0 / (32768.0 * 32768.0);
+    double local = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+      const double v = static_cast<double>(data[i]);
+      local += v * v;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    sum_sq_ += local * kScale;
+    count_ += count;
+  }
+
   // 返回 false 表示这一轮没有任何数据（不是静音，是"没收到"）。
   bool Take(double* dbfs) {
     std::lock_guard<std::mutex> lock(mutex_);
