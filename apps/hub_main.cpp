@@ -278,6 +278,18 @@ int main(int argc, char** argv) {
                          if (audiohub::JsonFindBool(body, "on", &b)) hub.SetAutoAccept(b);
                          return "{\"ok\":true}";
                        }
+                       if (method == "POST" && path == "/api/invite") {
+                         std::string sip;
+                         double v = 0;
+                         if (audiohub::JsonGetString(body, "ip", &sip) &&
+                             audiohub::JsonFindNumber(body, "audioPort", &v)) {
+                           audiohub::Peer peer;
+                           peer.ip = sip;
+                           peer.audio_port = static_cast<uint16_t>(v);
+                           return hub.InvitePeer(peer) ? "{\"ok\":true}" : "{\"ok\":false}";
+                         }
+                         return "{\"ok\":false,\"error\":\"ip/audioPort missing\"}";
+                       }
                        if (method == "POST" && path == "/api/latency") {
                          double v = 0;
                          if (audiohub::JsonFindNumber(body, "ms", &v)) {

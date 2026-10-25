@@ -32,7 +32,9 @@
     "asarUnpack": [
       "bin/**/*"
     ],
+    "icon": "icon.ico",
     "win": {
+      "icon": "icon.ico",
       "target": [
         "portable",
         "nsis"

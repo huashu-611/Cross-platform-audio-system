@@ -182,11 +182,14 @@ struct HubCore::Impl {
     // 发现：广播自己 + 监听别人。广播失败（端口被占）不该让程序起不来，
     // 只是"自动发现"不可用，还能手填 IP。
     discovery.reset(new Discovery());
-    if (opts.advertise) {
+    {
       // 信标里带本机真实 IP：广播可能走虚拟网卡，来址不可信
       const std::string all = LocalIPv4List();
-      const std::string local = all.substr(0, all.find(','));
-      discovery->StartAdvertise(display_name, local, port, http_port_for_discovery, true, false);
+      local_ip_for_invite = all.substr(0, all.find(','));
+    }
+    if (opts.advertise) {
+      discovery->StartAdvertise(display_name, local_ip_for_invite, port,
+                                http_port_for_discovery, true, false);
     } else {
       discovery->StartBrowse();
     }
@@ -702,6 +705,24 @@ struct HubCore::Impl {
 
   void SetAutoAccept(bool on) { auto_accept_.store(on); }
   bool auto_accept() const { return auto_accept_.load(); }
+
+  // 邀请：发 CONN-INVITE 给对端的握手口（音频口+2）。
+  // 对方确认后会主动发 CONN-REQ，走正常握手；音频流向不变（手机→PC）。
+  bool InvitePeer(const std::string& peer_ip, uint16_t peer_audio_port) {
+    if (peer_ip.empty() || peer_audio_port == 0) return false;
+    const std::string invite = "CONN-INVITE|" + display_name + "|" + local_ip_for_invite + ":" +
+                               std::to_string(port) + "|" +
+                               std::to_string(invite_seq_++) + "\n";
+    const uint16_t hs_port = static_cast<uint16_t>(peer_audio_port + kControlPortOffset);
+    const bool ok = handshake_socket.SendToAddr(peer_ip, hs_port, invite.data(), invite.size());
+    if (ok) {
+      Emit("[>] 已发出邀请: " + peer_ip + ":" + std::to_string(hs_port));
+    }
+    return ok;
+  }
+
+  std::string local_ip_for_invite;
+  uint32_t invite_seq_ = 1;
 };
 
 HubCore::HubCore() : impl_(new Impl()) {}
@@ -733,6 +754,7 @@ void HubCore::RejectConnection(uint16_t stream_id) { impl_->RejectConnection(str
 void HubCore::Disconnect(uint16_t stream_id) { impl_->Disconnect(stream_id); }
 void HubCore::SetAutoAccept(bool on) { impl_->SetAutoAccept(on); }
 bool HubCore::auto_accept() const { return impl_->auto_accept(); }
+bool HubCore::InvitePeer(const Peer& peer) { return impl_->InvitePeer(peer.ip, peer.audio_port); }
 
 std::string HubCore::local_ip() const { return LocalIPv4List(); }
 void HubCore::SetEventCallback(std::function<void(const std::string&)> cb) {

@@ -187,6 +187,22 @@ bool JsonFindNumber(const std::string& json, const std::string& key, double* out
   }
 }
 
+bool JsonGetString(const std::string& json, const std::string& key, std::string* out) {
+  const std::string needle = "\"" + key + "\"";
+  const size_t k = json.find(needle);
+  if (k == std::string::npos) return false;
+  size_t pos = json.find(':', k + needle.size());
+  if (pos == std::string::npos) return false;
+  ++pos;
+  while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) ++pos;
+  if (pos >= json.size() || json[pos] != '"') return false;
+  ++pos;
+  const size_t end = json.find('"', pos);
+  if (end == std::string::npos) return false;
+  *out = json.substr(pos, end - pos);
+  return true;
+}
+
 bool JsonFindBool(const std::string& json, const std::string& key, bool* out) {
   const std::string needle = "\"" + key + "\"";
   const size_t k = json.find(needle);

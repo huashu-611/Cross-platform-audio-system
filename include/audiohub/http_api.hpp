@@ -39,5 +39,6 @@ class HttpApi {
 std::string JsonEscape(const std::string& s);
 bool JsonFindNumber(const std::string& json, const std::string& key, double* out);
 bool JsonFindBool(const std::string& json, const std::string& key, bool* out);
+bool JsonGetString(const std::string& json, const std::string& key, std::string* out);
 
 }  // namespace audiohub

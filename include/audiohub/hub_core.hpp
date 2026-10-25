@@ -98,6 +98,9 @@ class HubCore {
   void SetAutoAccept(bool on);
   bool auto_accept() const;
 
+  // 邀请一台已发现的设备把声音送过来（发起方是 PC，但音频流向不变）
+  bool InvitePeer(const Peer& peer);
+
   std::string local_ip() const;
   void SetEventCallback(std::function<void(const std::string&)> cb);
 

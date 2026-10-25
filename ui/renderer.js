@@ -140,7 +140,7 @@ function render (state) {
       '<div class="row" style="margin-top:10px">' +
         '<button class="btn go">请求连接</button>' +
       '</div>'
-    el.querySelector('.go').addEventListener('click', () => window.hub.requestConnect(p))
+    el.querySelector('.go').addEventListener('click', () => window.hub.invitePeer({ ip: p.ip, audioPort: p.audioPort }))
     peerGrid.appendChild(el)
   }
   if ((state.peers || []).length === 0) peerGrid.innerHTML = ''

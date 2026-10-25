@@ -26,6 +26,7 @@ contextBridge.exposeInMainWorld('hub', {
   setLatency: (ms) => ipcRenderer.invoke('hub:setLatency', { ms }),
 
   // 连接握手
+  invitePeer: (peer) => ipcRenderer.invoke('hub:invite', peer),
   accept: (streamId) => ipcRenderer.invoke('hub:accept', { streamId }),
   reject: (streamId) => ipcRenderer.invoke('hub:reject', { streamId }),
   disconnect: (streamId) => ipcRenderer.invoke('hub:disconnect', { streamId }),

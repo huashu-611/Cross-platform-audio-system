@@ -4,8 +4,8 @@
   --line: rgba(255,255,255,.09);
   --text: #e8eef5;
   --dim: #7d8b9a;
-  --accent: #2dd4bf;
-  --accent-dim: rgba(45,212,191,.16);
+  --accent: #3b82f6;
+  --accent-dim: rgba(59,130,246,.16);
   --warn: #fbbf24;
   --bad: #f87171;
 }
@@ -16,8 +16,8 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
                "Microsoft YaHei", "Noto Sans SC", sans-serif;
   background:
-    radial-gradient(1100px 520px at 12% -8%, #16303a 0%, transparent 60%),
-    radial-gradient(900px 480px at 92% 4%, #1b2340 0%, transparent 62%),
+    radial-gradient(1100px 520px at 12% -8%, #16233f 0%, transparent 60%),
+    radial-gradient(900px 480px at 92% 4%, #1b2d4a 0%, transparent 62%),
     var(--bg);
   color: var(--text);
   min-height: 100vh;
@@ -39,17 +39,17 @@ h1 span { color: var(--accent); }
 .addr {
   display: flex; align-items: center; gap: 10px;
   background: var(--accent-dim);
-  border: 1px solid rgba(45,212,191,.32);
+  border: 1px solid rgba(59,130,246,.32);
   border-radius: 12px; padding: 10px 12px 10px 14px;
 }
 .addr .k { font-size: 11px; color: var(--accent); letter-spacing: .6px; text-transform: uppercase; }
 .addr .v { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .addr button {
-  background: rgba(45,212,191,.18); color: var(--accent);
-  border: 1px solid rgba(45,212,191,.3); border-radius: 8px;
+  background: rgba(59,130,246,.18); color: var(--accent);
+  border: 1px solid rgba(59,130,246,.3); border-radius: 8px;
   padding: 6px 11px; font-size: 12px; cursor: pointer; transition: .15s;
 }
-.addr button:hover { background: rgba(45,212,191,.3); }
+.addr button:hover { background: rgba(59,130,246,.3); }
 
 /* ---------- 错误条 ---------- */
 .banner {
@@ -86,12 +86,12 @@ h1 span { color: var(--accent); }
   padding: 7px 14px; font-size: 12.5px; cursor: pointer; transition: .15s; flex: 1;
 }
 .btn:hover { background: rgba(255,255,255,.13); }
-.btn.ok { background: rgba(45,212,191,.16); color: var(--accent); border-color: rgba(45,212,191,.35); }
-.btn.ok:hover { background: rgba(45,212,191,.28); }
+.btn.ok { background: rgba(45,212,191,.16); color: var(--accent); border-color: rgba(59,130,246,.35); }
+.btn.ok:hover { background: rgba(59,130,246,.28); }
 .btn.no { background: rgba(248,113,113,.12); color: var(--bad); border-color: rgba(248,113,113,.3); }
 .btn.no:hover { background: rgba(248,113,113,.24); }
-.btn.go { background: var(--accent-dim); color: var(--accent); border-color: rgba(45,212,191,.35); }
-.btn.go:hover { background: rgba(45,212,191,.3); }
+.btn.go { background: var(--accent-dim); color: var(--accent); border-color: rgba(59,130,246,.35); }
+.btn.go:hover { background: rgba(59,130,246,.3); }
 .bye {
   background: transparent; color: var(--dim);
   border: none; padding: 2px 0; font-size: 12px; cursor: pointer;
@@ -156,7 +156,7 @@ input[type=range]::-moz-range-thumb { width: 13px; height: 13px; border-radius: 
   font-size: 13px; cursor: pointer; transition: .15s;
 }
 .seg button:hover { background: rgba(255,255,255,.1); color: var(--text); }
-.seg button.on { background: var(--accent-dim); color: var(--accent); border-color: rgba(45,212,191,.4); }
+.seg button.on { background: var(--accent-dim); color: var(--accent); border-color: rgba(59,130,246,.4); }
 
 /* ---------- 空态 / 统计 ---------- */
 .empty { grid-column: 1/-1; text-align: center; padding: 46px 20px; color: var(--dim); font-size: 14px; }

@@ -181,6 +181,12 @@ ipcMain.handle('hub:setMaster', async (_e, arg) => {
   return httpRequest('POST', '/api/master', { gain })
 })
 
+ipcMain.handle('hub:invite', async (_e, arg) => {
+  const p = arg || {}
+  if (typeof p.ip !== 'string' || !Number.isInteger(p.audioPort)) return { ok: false }
+  return httpRequest('POST', '/api/invite', { ip: p.ip, audioPort: p.audioPort })
+})
+
 ipcMain.handle('hub:accept', async (_e, arg) => {
   const id = arg && Number.isInteger(arg.streamId) ? arg.streamId : null
   if (id === null) return { ok: false }
