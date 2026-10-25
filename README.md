@@ -24,7 +24,10 @@
 | N 路混音 + 软限幅 | ✅ | float32 累加，阈值 0.85 |
 | WASAPI 系统音频采集 | ✅ | loopback + AUTOCONVERTPCM |
 | WASAPI 低延迟输出 | ✅ | 事件驱动，默认 10 ms 缓冲 |
-| 单元测试 | ✅ | 30 个用例，无需声卡 |
+| 内置信号源 `--tone` | ✅ | 无音频设备也能测；两路正弦叠加可数值验证混音 |
+| 抖动注入 `--jitter` | ✅ | 模拟 WiFi，验抖动缓冲 |
+| 电平表 | ✅ | 每路 + 混音总线 dBFS |
+| 单元测试 | ✅ | 38 个用例，无需声卡 |
 | Opus 编码 | ⬜ | 接口已预留，P0 用 int16 PCM |
 | Android 端 | ⬜ | AudioPlaybackCapture + AAudio |
 | 设备发现 / 配对 | ⬜ | 现在靠命令行填 IP |
@@ -124,6 +127,22 @@ audiohub-source.exe --hub 192.168.1.20:47000
 
 多台源设备同时跑第二条命令即可，Hub 会自动按 `stream_id` 分流混音。
 
+**只有一台 PC 也能测多源**——开多个 source 实例，用不同 `--stream-id`：
+
+```bash
+# 终端 1
+build/audiohub-hub.exe --port 47000 --latency 60
+# 终端 2
+build/audiohub-source.exe --hub 127.0.0.1:47000 --tone 440 --stream-id 1
+# 终端 3
+build/audiohub-source.exe --hub 127.0.0.1:47000 --tone 660 --stream-id 2
+```
+
+耳机里会同时听到 440 + 660。Hub 应当显示：单路 −9.0 dBFS、总线 −6.0 dBFS
+（**差值 3.01 dB 就是混音正确的硬指标**）。
+
+完整的判定标准和排错见表见 [docs/测试指南.md](docs/测试指南.md)。
+
 ### 参数
 
 `audiohub-hub`
@@ -142,6 +161,8 @@ audiohub-source.exe --hub 192.168.1.20:47000
 | `--hub` | 127.0.0.1 | 支持 `ip:port` |
 | `--stream-id` | 1 | 一台设备跑多路时区分 |
 | `--cap-ms` | 20 | 采集缓冲，越小越激进 |
+| `--tone <hz>` | 关 | 不发采集，改发内置正弦波 |
+| `--jitter <ms>` | 0 | 零均值发送抖动，模拟 WiFi |
 | `--verbose` | 关 | 每包打印，仅调试 |
 
 ### 实测（同机回环，`--latency 60`）
@@ -241,6 +262,9 @@ stream 1  水位 56 ms (目标 60) | 比率 1.00018 | 迟到 0 溢出 0 | 欠载
 
 ## 已知限制
 
+- **单机不能同时跑"真实采集"的 source 和 hub**：source 抓的是系统混音，
+  其中包含 hub 自己的输出，会形成反馈回路。用 `--tone` 或换一台设备当源。
+  正解是 Windows 10 2004+ 的 process loopback（排除指定进程再采集），还没做。
 - **没有设备发现**，只能命令行填 IP。
 - **Hub 不能同时采集本机音频**。如果要做，必须用 Windows 10 2004+ 的
   `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK` + `EXCLUDE` 模式排除自身进程树，

@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -44,6 +45,8 @@ struct Options {
   uint16_t hub_port = 47000;
   int capture_buffer_ms = 20;
   int stream_id = 1;
+  int tone_hz = 0;        // >0 时用内置正弦代替采集
+  int jitter_ms = 0;      // 模拟网络抖动（零均值）
   bool verbose = false;
 };
 
@@ -54,6 +57,8 @@ void PrintUsage() {
       "  --hub <ip[:port]>   汇聚端地址，默认端口 %u（控制口自动用 port+1）\n"
       "  --stream-id <n>     流编号，一台设备可跑多路，默认 1\n"
       "  --cap-ms <n>        采集缓冲毫秒数，默认 20。越小延迟越低、越容易断\n"
+      "  --tone <hz>         不发采集，改发内置正弦波。用于单机测多源混音\n"
+      "  --jitter <ms>       给发送时刻加零均值随机抖动，模拟 WiFi\n"
       "  --verbose           每包打印一次（调试用，会明显影响性能）\n",
       static_cast<unsigned>(47000));
 }
@@ -82,6 +87,10 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
       opt->stream_id = std::stoi(next("--stream-id"));
     } else if (a == "--cap-ms") {
       opt->capture_buffer_ms = std::stoi(next("--cap-ms"));
+    } else if (a == "--tone") {
+      opt->tone_hz = std::stoi(next("--tone"));
+    } else if (a == "--jitter") {
+      opt->jitter_ms = std::stoi(next("--jitter"));
     } else if (a == "--verbose") {
       opt->verbose = true;
     } else if (a == "-h" || a == "--help") {
@@ -136,28 +145,40 @@ int main(int argc, char** argv) {
 
   std::vector<int16_t> scratch;
 
+  // --tone 模式完全不碰声卡：没有音频设备也能跑，而且信号可重复。
+  // 这是验证"多源混音是否正确"最直接的手段——两个不同频率的正弦叠加后，
+  // 总功率应当恰好比单路高 3 dB（不相关信号功率相加）。
   audiohub::WasapiCapture capture;
-  const bool ok = capture.Start(
-      [&](const float* data, int frames) {
-        const size_t samples = static_cast<size_t>(frames) * audiohub::kChannels;
-        if (scratch.size() < samples) scratch.resize(samples);
-        for (size_t i = 0; i < samples; ++i) scratch[i] = FloatToS16(data[i]);
-        const size_t written = ring.Write(scratch.data(), samples);
-        if (written < samples) dropped_samples += (samples - written);
-        captured_frames += static_cast<uint64_t>(frames);
-      },
-      opt.capture_buffer_ms);
+  const bool tone_mode = opt.tone_hz > 0;
 
-  if (!ok) {
-    std::printf("启动采集失败: %s\n", capture.last_error().c_str());
-    return 3;
+  if (!tone_mode) {
+    const bool ok = capture.Start(
+        [&](const float* data, int frames) {
+          const size_t samples = static_cast<size_t>(frames) * audiohub::kChannels;
+          if (scratch.size() < samples) scratch.resize(samples);
+          for (size_t i = 0; i < samples; ++i) scratch[i] = FloatToS16(data[i]);
+          const size_t written = ring.Write(scratch.data(), samples);
+          if (written < samples) dropped_samples += (samples - written);
+          captured_frames += static_cast<uint64_t>(frames);
+        },
+        opt.capture_buffer_ms);
+
+    if (!ok) {
+      std::printf("启动采集失败: %s\n", capture.last_error().c_str());
+      return 3;
+    }
   }
 
   std::printf("\n");
   std::printf("  audiohub-source 已启动\n");
   std::printf("  目标       : %s:%u\n", opt.hub_ip.c_str(), opt.hub_port);
   std::printf("  流编号     : %d\n", opt.stream_id);
-  std::printf("  采集缓冲   : %d ms\n", opt.capture_buffer_ms);
+  if (tone_mode) {
+    std::printf("  信号源     : 内置正弦 %d Hz\n", opt.tone_hz);
+  } else {
+    std::printf("  采集缓冲   : %d ms\n", opt.capture_buffer_ms);
+  }
+  if (opt.jitter_ms > 0) std::printf("  抖动注入   : ±%d ms\n", opt.jitter_ms);
   std::printf("  格式       : %d Hz / %d ch / int16 on wire\n", audiohub::kSampleRate,
               audiohub::kChannels);
   std::printf("  本机地址   : %s\n", audiohub::LocalIPv4List().c_str());
@@ -175,6 +196,10 @@ int main(int argc, char** argv) {
   std::thread sender([&] {
     uint32_t sample_pos = 0;
     uint32_t send_errors = 0;
+    constexpr double kTwoPi = 6.283185307179586;
+    const double phase_step =
+        tone_mode ? kTwoPi * opt.tone_hz / audiohub::kSampleRate : 0.0;
+    double phase = 0.0;
 
     // 按 5 ms 节拍发，而不是"有多少发多少"。
     //
@@ -182,6 +207,7 @@ int main(int argc, char** argv) {
     // 连发 4 个包然后干等 20 ms。网络上看平均码率是对的，但对端的抖动缓冲
     // 会看到 20 ms 一簇的到达图案，水位随之上下摆动十几毫秒。
     // 均匀发送能把这段抖动直接从链路上消掉。
+    std::mt19937 rng{std::random_device{}()};
     auto next = Clock::now();
     const auto tick = std::chrono::microseconds(audiohub::kFramesPerPacket * 1000000 /
                                                 audiohub::kSampleRate);
@@ -192,10 +218,20 @@ int main(int argc, char** argv) {
       // 关键：即使这一拍没数据，sample_pos 也要推进。
       // 否则源端时间轴会落后于真实时间，对端看到的"采样率"低于 48 kHz，
       // 水位会被一路抽干。跳过的这一拍在对端就是一次真实的丢包。
-      const bool have_data = ring.Available() >= packet_samples;
-      if (have_data) {
+      bool have_data = true;
+      if (tone_mode) {
+        for (int i = 0; i < audiohub::kFramesPerPacket; ++i) {
+          const int16_t v = FloatToS16(static_cast<float>(0.5 * std::sin(phase)));
+          phase += phase_step;
+          if (phase > kTwoPi) phase -= kTwoPi;
+          payload[static_cast<size_t>(i) * audiohub::kChannels + 0] = v;
+          payload[static_cast<size_t>(i) * audiohub::kChannels + 1] = v;
+        }
+        captured_frames += audiohub::kFramesPerPacket;
+      } else if (ring.Available() >= packet_samples) {
         ring.Read(payload.data(), packet_samples);
       } else {
+        have_data = false;
         dropped_samples += packet_samples;
       }
 
@@ -216,7 +252,15 @@ int main(int argc, char** argv) {
       }
       sample_pos += audiohub::kFramesPerPacket;
 
-      std::this_thread::sleep_until(next);
+      // 零均值抖动：只扰动到达时刻，不改变平均发包率。
+      // 单边抖动会让源端时间轴变慢，接收端水位被抽干——那是 bug，不是抖动。
+      std::chrono::steady_clock::time_point wake = next;
+      if (opt.jitter_ms > 0) {
+        std::uniform_real_distribution<double> dist(-opt.jitter_ms, opt.jitter_ms);
+        wake += std::chrono::microseconds(
+            static_cast<long long>(dist(rng) * 1000.0));
+      }
+      std::this_thread::sleep_until(wake);
       // 被系统挂起太久就别"补课"了，直接从当前时刻重新起拍。
       if (Clock::now() - next > std::chrono::milliseconds(100)) next = Clock::now();
     }
@@ -276,7 +320,7 @@ int main(int argc, char** argv) {
     last_frames = f;
     last_packets = p;
 
-    if (!capture.running()) {
+    if (!tone_mode && !capture.running()) {
       std::printf("采集已停止: %s\n", capture.last_error().c_str());
       running.store(false);
       break;

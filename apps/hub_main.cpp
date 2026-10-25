@@ -95,6 +95,36 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
   return true;
 }
 
+// 电平表：累加平方和，报告时换算成 dBFS 后清零。
+//
+// 为什么要有它：混音听起来"对"是最不可靠的判断。两个 0.5 幅度的正弦叠加，
+// 总电平必须恰好比单路高 3.01 dB（不相关信号功率相加）。差得多就是混音错了。
+struct Meter {
+  // 统计循环拿的是 const Stream&，所以取数接口得是 const 的；
+  // 计数器本身当然要变，标记 mutable。
+  mutable std::mutex mutex;
+  mutable double sum_sq = 0.0;
+  mutable uint64_t count = 0;
+
+  void Add(const float* data, size_t n) {
+    double local = 0.0;
+    for (size_t i = 0; i < n; ++i) local += static_cast<double>(data[i]) * data[i];
+    std::lock_guard<std::mutex> lock(mutex);
+    sum_sq += local;
+    count += n;
+  }
+
+  // 返回 false 表示这一秒没有数据。
+  bool Take(double* dbfs) const {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (count == 0) return false;
+    *dbfs = 10.0 * std::log10(sum_sq / static_cast<double>(count) + 1e-12);
+    sum_sq = 0.0;
+    count = 0;
+    return true;
+  }
+};
+
 // 外环（PI）每 40 个 tick 调一次 = 200 ms。
 // 调得比这更勤会让比率抖动传成音高抖动；更慢则跟不上缓慢的时钟漂移。
 constexpr int kAdjustEveryTicks = 40;
@@ -133,6 +163,7 @@ struct Stream {
   audiohub::JitterBuffer jitter;
   audiohub::Asrc asrc;
   audiohub::PiController pi;
+  Meter meter;
   std::vector<float> pull_buffer;
   std::vector<float> block_buffer;
   int tick_counter = 0;
@@ -277,6 +308,7 @@ int main(int argc, char** argv) {
   // ---------------- 混音线程 ----------------
   std::vector<float> mix_buffer(block_samples);
   std::vector<audiohub::MixInput> mix_inputs;
+  Meter bus_meter;
 
   std::thread mixer([&] {
     auto next = Clock::now();
@@ -347,6 +379,8 @@ int main(int argc, char** argv) {
             std::memset(s.block_buffer.data(), 0, block_samples * sizeof(float));
           }
 
+          s.meter.Add(s.block_buffer.data(), block_samples);
+
           audiohub::MixInput in;
           in.data = s.block_buffer.data();
           in.gain = 1.0f;
@@ -359,6 +393,7 @@ int main(int argc, char** argv) {
                          static_cast<int>(mix_inputs.size()), block, audiohub::kChannels);
       // 多源直接相加会过 1.0，必须限幅，否则削顶的爆音比延迟更难听。
       audiohub::SoftLimit(mix_buffer.data(), static_cast<int>(block_samples), 0.85f);
+      bus_meter.Add(mix_buffer.data(), block_samples);
       output_ring.Write(mix_buffer.data(), block_samples);
 
       std::this_thread::sleep_until(next);
@@ -388,10 +423,13 @@ int main(int argc, char** argv) {
       stream_count = streams.size();
     }
 
-    std::printf("\n[%lld s] 收 %llu pkt/s (%.0f kbps) | 渲染欠载 %llu | 坏包 %llu | 源 %zu 路\n",
+    double bus_level = -120.0;
+    const bool has_bus = bus_meter.Take(&bus_level);
+    std::printf("\n[%lld s] 收 %llu pkt/s (%.0f kbps) | 混音总线 %6.1f dBFS | 渲染欠载 %llu | 坏包 %llu | 源 %zu 路\n",
                 static_cast<long long>(elapsed_s),
                 static_cast<unsigned long long>(p - last_packets),
                 (p - last_packets) * (960.0 + 16) * 8 / 1000.0,
+                has_bus ? bus_level : -120.0,
                 static_cast<unsigned long long>(render_underruns.load()),
                 static_cast<unsigned long long>(malformed.load()),
                 stream_count);
@@ -401,11 +439,13 @@ int main(int argc, char** argv) {
       for (auto& kv : streams) {
         const Stream& s = *kv.second;
         const auto st = s.jitter.stats();
+        double level = -120.0;
+        const bool has_level = s.meter.Take(&level);
         std::printf(
-            "   stream %-3u 水位 %4d ms (目标 %d) | 比率 %.5f | 迟到 %llu 溢出 %llu "
-            "| 欠载 %llu 追帧 %d\n",
+            "   stream %-3u 水位 %4d ms (目标 %d) | 比率 %.5f | 电平 %6.1f dBFS "
+            "| 迟到 %llu 溢出 %llu | 欠载 %llu 追帧 %d\n",
             s.id, s.jitter.occupancy_ms(), s.jitter.target_delay_ms(), s.asrc.ratio(),
-            static_cast<unsigned long long>(st.packets_late),
+            has_level ? level : -120.0, static_cast<unsigned long long>(st.packets_late),
             static_cast<unsigned long long>(st.packets_overflow),
             static_cast<unsigned long long>(st.frames_underrun), s.catchup_count);
       }
