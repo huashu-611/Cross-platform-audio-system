@@ -181,6 +181,30 @@ ipcMain.handle('hub:setMaster', async (_e, arg) => {
   return httpRequest('POST', '/api/master', { gain })
 })
 
+ipcMain.handle('hub:accept', async (_e, arg) => {
+  const id = arg && Number.isInteger(arg.streamId) ? arg.streamId : null
+  if (id === null) return { ok: false }
+  return httpRequest('POST', '/api/accept', { streamId: id })
+})
+
+ipcMain.handle('hub:reject', async (_e, arg) => {
+  const id = arg && Number.isInteger(arg.streamId) ? arg.streamId : null
+  if (id === null) return { ok: false }
+  return httpRequest('POST', '/api/reject', { streamId: id })
+})
+
+ipcMain.handle('hub:disconnect', async (_e, arg) => {
+  const id = arg && Number.isInteger(arg.streamId) ? arg.streamId : null
+  if (id === null) return { ok: false }
+  return httpRequest('POST', '/api/disconnect', { streamId: id })
+})
+
+ipcMain.handle('hub:setAutoAccept', async (_e, arg) => {
+  const on = arg && typeof arg.on === 'boolean' ? arg.on : null
+  if (on === null) return { ok: false }
+  return httpRequest('POST', '/api/auto-accept', { on })
+})
+
 ipcMain.handle('hub:setLatency', async (_e, arg) => {
   const ms = arg && typeof arg.ms === 'number' ? Math.round(arg.ms) : null
   if (ms === null || ms < 20 || ms > 250) return { ok: false }

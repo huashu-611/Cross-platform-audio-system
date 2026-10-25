@@ -1,12 +1,12 @@
-// 汇聚端核心：接收多路音频、混音、输出。
+// 汇聚端核心：接收多路音频、混音、输出；外加设备发现与连接握手。
 //
-// 抽成独立库的原因：命令行版和图形界面版必须共用同一套逻辑，
-// 否则"UI 上调了音量但 CLI 测试时行为不一致"这类问题会反复出现。
-//
-// 线程模型（和之前一致，没有变）：
-//   [接收线程]  UDP -> 解包 -> 每源 JitterBuffer
-//   [混音线程]  每 5 ms：JB -> ASRC -> 求和(带每源增益) -> 软限幅 -> 输出环
-//   [渲染线程]  WASAPI 实时回调：只从输出环 memcpy
+// 线程模型：
+//   [广播线程]    每秒广播一次自己的存在（发现协议）
+//   [发现接收线程] 收集别人的广播，维护对端列表
+//   [控制线程]    连接握手（CONN-REQ/ACK/NAK/BYE）+ PING/PONG
+//   [接收线程]    UDP 音频 -> 解包 -> 每源 JitterBuffer
+//   [混音线程]    每 5 ms：JB -> ASRC -> 求和(带每源增益) -> 软限幅 -> 输出环
+//   [渲染线程]    WASAPI 实时回调：只从输出环 memcpy
 #pragma once
 
 #include <atomic>
@@ -15,6 +15,8 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+#include "audiohub/discovery.hpp"
 
 namespace audiohub {
 
@@ -29,6 +31,8 @@ struct SourceInfo {
   double ratio = 1.0;
   uint64_t underrun_frames = 0;
   uint64_t overflow_packets = 0;
+  bool confirmed = true;      // false = 握手还没通过，混音时按静音处理
+  std::string peer_name;      // 发现协议拿到的设备名，比"流 1"可读
 };
 
 struct HubStats {
@@ -42,6 +46,22 @@ struct HubStats {
   int device_latency_ms = 0;
 };
 
+// 一条待确认的连接请求
+struct PendingConnection {
+  uint16_t stream_id = 0;
+  std::string peer_name;
+  std::string peer_ip;
+  uint16_t peer_port = 0;
+  int64_t requested_at_ms = 0;
+};
+
+struct StartOptions {
+  bool advertise = true;           // 广播自己的存在
+  bool require_handshake = true;   // true = 未经确认的流按静音处理
+  bool auto_accept = false;        // 自动同意新连接请求
+  std::string display_name;        // 界面上显示的本机名
+};
+
 class HubCore {
  public:
   HubCore();
@@ -50,13 +70,11 @@ class HubCore {
   HubCore(const HubCore&) = delete;
   HubCore& operator=(const HubCore&) = delete;
 
-  // port 为数据端口，控制口自动用 port+1。失败时写 error 并返回 false。
-  bool Start(uint16_t port, int latency_ms, int render_latency_ms = 10,
+  bool Start(uint16_t port, int latency_ms, int render_latency_ms, const StartOptions& opts,
              std::string* error = nullptr);
   void Stop();
   bool running() const;
 
-  // 快照。UI 线程每 200 ms 取一次，不要持有迭代器跨调用。
   std::vector<SourceInfo> Sources() const;
   HubStats Stats() const;
 
@@ -65,14 +83,22 @@ class HubCore {
   void SetMasterGain(float gain);
   float master_gain() const;
 
-  // 改目标延迟：对所有已存在的流立即生效，新流也用这个值。
   void SetLatency(int ms);
   int latency() const;
 
-  // 本机 IPv4 列表，UI 用来提示"手机上填这个地址"。
-  std::string local_ip() const;
+  // ---- 发现 ----
+  std::vector<Peer> DiscoveredPeers() const;
+  void RefreshDiscovery();  // 立即发一轮探测，不用等下一个广播周期
 
-  // 状态变化回调（新流接入、设备失效等），在内部线程触发。
+  // ---- 连接握手 ----
+  std::vector<PendingConnection> PendingConnections() const;
+  void AcceptConnection(uint16_t stream_id);
+  void RejectConnection(uint16_t stream_id);
+  void Disconnect(uint16_t stream_id);
+  void SetAutoAccept(bool on);
+  bool auto_accept() const;
+
+  std::string local_ip() const;
   void SetEventCallback(std::function<void(const std::string&)> cb);
 
  private:

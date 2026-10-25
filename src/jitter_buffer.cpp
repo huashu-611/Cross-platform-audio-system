@@ -143,6 +143,16 @@ void JitterBuffer::InsertSilence(int frames) {
   pending_silence_frames_ += frames;
 }
 
+void JitterBuffer::Reset() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::fill(valid_bits_.begin(), valid_bits_.end(), 0ULL);
+  read_pos_ = 0;
+  highest_written_ = 0;
+  started_ = false;
+  pending_silence_frames_ = 0;
+  stats_ = JitterBufferStats{};
+}
+
 void JitterBuffer::FastForward(int frames) {
   if (frames <= 0) return;
   std::lock_guard<std::mutex> lock(mutex_);

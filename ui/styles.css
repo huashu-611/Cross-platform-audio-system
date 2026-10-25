@@ -77,6 +77,29 @@ h1 span { color: var(--accent); }
 .name { font-size: 14.5px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
 .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 9px var(--accent); }
 .dot.off { background: #4b5563; box-shadow: none; }
+.dot.warn { background: var(--warn); box-shadow: 0 0 9px var(--warn); }
+.dot.dim { background: #6b7280; box-shadow: none; }
+
+.btn {
+  background: rgba(255,255,255,.07); color: var(--text);
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 7px 14px; font-size: 12.5px; cursor: pointer; transition: .15s; flex: 1;
+}
+.btn:hover { background: rgba(255,255,255,.13); }
+.btn.ok { background: rgba(45,212,191,.16); color: var(--accent); border-color: rgba(45,212,191,.35); }
+.btn.ok:hover { background: rgba(45,212,191,.28); }
+.btn.no { background: rgba(248,113,113,.12); color: var(--bad); border-color: rgba(248,113,113,.3); }
+.btn.no:hover { background: rgba(248,113,113,.24); }
+.btn.go { background: var(--accent-dim); color: var(--accent); border-color: rgba(45,212,191,.35); }
+.btn.go:hover { background: rgba(45,212,191,.3); }
+.bye {
+  background: transparent; color: var(--dim);
+  border: none; padding: 2px 0; font-size: 12px; cursor: pointer;
+  text-align: left; transition: .15s;
+}
+.bye:hover { color: var(--bad); }
+.ask { font-size: 12.5px; color: var(--dim); }
+.card.req { border-color: rgba(251,191,36,.4); background: rgba(251,191,36,.06); }
 .db { font-size: 12.5px; color: var(--dim); font-variant-numeric: tabular-nums; }
 
 .meter { height: 7px; background: rgba(255,255,255,.07); border-radius: 4px; overflow: hidden; margin-bottom: 13px; }

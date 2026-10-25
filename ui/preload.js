@@ -23,5 +23,11 @@ contextBridge.exposeInMainWorld('hub', {
   setMaster: (gain) => ipcRenderer.invoke('hub:setMaster', { gain }),
 
   // 目标延迟
-  setLatency: (ms) => ipcRenderer.invoke('hub:setLatency', { ms })
+  setLatency: (ms) => ipcRenderer.invoke('hub:setLatency', { ms }),
+
+  // 连接握手
+  accept: (streamId) => ipcRenderer.invoke('hub:accept', { streamId }),
+  reject: (streamId) => ipcRenderer.invoke('hub:reject', { streamId }),
+  disconnect: (streamId) => ipcRenderer.invoke('hub:disconnect', { streamId }),
+  setAutoAccept: (on) => ipcRenderer.invoke('hub:setAutoAccept', { on })
 })

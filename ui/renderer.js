@@ -2,6 +2,8 @@
 // 所有对音频核心的操作都走 window.hub.* （preload 暴露的窄接口）。
 
 const grid = document.getElementById('grid')
+const peerGrid = document.getElementById('peerGrid')
+const reqGrid = document.getElementById('reqGrid')
 const banner = document.getElementById('banner')
 const cards = new Map()   // streamId -> DOM 元素
 
@@ -103,6 +105,45 @@ function render (state) {
   document.querySelectorAll('#lat button').forEach((b) => {
     b.classList.toggle('on', Number(b.dataset.v) === state.latency)
   })
+
+  // ---- 待确认的连接请求 ----
+  reqGrid.innerHTML = ''
+  for (const p of state.pending || []) {
+    const el = document.createElement('div')
+    el.className = 'card req'
+    el.innerHTML =
+      '<div class="top"><div class="name"><span class="dot warn"></span>' + p.name +
+      '</div><div class="db">' + p.ip + '</div></div>' +
+      '<div class="row"><span class="ask">请求把声音送到这里</span></div>' +
+      '<div class="row" style="margin-top:10px">' +
+        '<button class="btn ok">同意</button>' +
+        '<button class="btn no">拒绝</button>' +
+      '</div>'
+    el.querySelector('.ok').addEventListener('click', () => window.hub.accept(p.streamId))
+    el.querySelector('.no').addEventListener('click', () => window.hub.reject(p.streamId))
+    reqGrid.appendChild(el)
+  }
+  if ((state.pending || []).length === 0) reqGrid.innerHTML = ''
+
+  // ---- 发现的设备 ----
+  peerGrid.innerHTML = ''
+  const connectedIds = new Set((state.sources || []).map(x => x.id))
+  for (const p of state.peers || []) {
+    if (connectedIds.has(p.audioPort)) continue
+    const el = document.createElement('div')
+    el.className = 'card peer'
+    const role = (p.canReceive && p.canSend) ? '音源 / 汇聚' : (p.canReceive ? '汇聚端' : '音源')
+    el.innerHTML =
+      '<div class="top"><div class="name"><span class="dot dim"></span>' + p.name +
+      '</div><div class="db">' + role + '</div></div>' +
+      '<div class="row"><span class="ask">' + p.ip + ':' + p.audioPort + '</span></div>' +
+      '<div class="row" style="margin-top:10px">' +
+        '<button class="btn go">请求连接</button>' +
+      '</div>'
+    el.querySelector('.go').addEventListener('click', () => window.hub.requestConnect(p))
+    peerGrid.appendChild(el)
+  }
+  if ((state.peers || []).length === 0) peerGrid.innerHTML = ''
 
   // 源卡片
   const sources = state.sources || []

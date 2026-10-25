@@ -12,7 +12,7 @@ CXX="${CXX:-g++}"
 OUT=build
 mkdir -p "$OUT"
 
-CORE="src/packet.cpp src/jitter_buffer.cpp src/clock_sync.cpp src/asrc.cpp src/mixer.cpp src/udp_socket.cpp src/hub_core.cpp src/http_api.cpp"
+CORE="src/packet.cpp src/jitter_buffer.cpp src/clock_sync.cpp src/asrc.cpp src/mixer.cpp src/udp_socket.cpp src/hub_core.cpp src/http_api.cpp src/discovery.cpp"
 # 静态链接 libstdc++/libgcc：否则 exe 依赖 MSYS2 的运行时 DLL，
 # 用户双击运行会报"找不到 libstdc++-6.dll"。多几百 KB，换免安装。
 STATIC="-static -static-libgcc -static-libstdc++"

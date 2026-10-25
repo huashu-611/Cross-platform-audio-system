@@ -9,6 +9,9 @@
 #include <cstdlib>
 #include <sstream>
 #include <string>
+#include <vector>
+#include <windows.h>
+#include <shellapi.h>
 #include <thread>
 
 #include "audiohub/hub_core.hpp"
@@ -22,6 +25,10 @@ struct Options {
   int latency_ms = 60;
   int render_latency_ms = 10;
   uint16_t http_port = 0;  // 0 = 不开 HTTP 接口
+  bool no_discovery = false;
+  bool no_handshake = false;
+  bool auto_accept = false;
+  std::string name = "AudioHub";
   std::string log_path;
 };
 
@@ -33,6 +40,10 @@ void PrintUsage() {
       "  --latency <ms>    目标端到端延迟，默认 60。可选 40/60/120\n"
       "  --render-ms <n>   WASAPI 输出缓冲毫秒数，默认 10\n"
       "  --http-port <n>   打开本地 HTTP 接口（给图形界面用），默认关闭\n"
+      "  --name <s>        本机显示名，默认 AudioHub\n"
+      "  --no-discovery    关闭自动发现（只用手填 IP）\n"
+      "  --no-handshake    关闭连接确认，任何包都直接收\n"
+      "  --auto-accept     自动同意所有连接请求\n"
       "  --log <file>      把输出写到文件（后台运行时看统计用）\n"
       "\n"
       "需要调每路音量/静音的话，用图形界面版 audiohub-hub-gui.exe\n");
@@ -56,6 +67,14 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
       opt->render_latency_ms = std::stoi(next("--render-ms"));
     } else if (a == "--block") {
       (void)next("--block");  // 兼容旧脚本，已无效
+    } else if (a == "--name") {
+      opt->name = next("--name");
+    } else if (a == "--no-discovery") {
+      opt->no_discovery = true;
+    } else if (a == "--no-handshake") {
+      opt->no_handshake = true;
+    } else if (a == "--auto-accept") {
+      opt->auto_accept = true;
     } else if (a == "--http-port") {
       opt->http_port = static_cast<uint16_t>(std::stoi(next("--http-port")));
     } else if (a == "--log") {
@@ -75,6 +94,32 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+  // Windows 的 argv 是 ANSI 码页（中文系统是 GBK），写进 JSON 就不是合法 UTF-8。
+  // 统一转成 UTF-8，否则 --name 里带中文会让 /api/state 解析失败。
+  {
+    int w_argc = 0;
+    LPWSTR* w_argv = CommandLineToArgvW(GetCommandLineW(), &w_argc);
+    if (w_argv != nullptr && w_argc > 0) {
+      static std::vector<std::string> utf8_args;
+      static std::vector<char*> utf8_argp;
+      for (int i = 0; i < w_argc; ++i) {
+        const int n = WideCharToMultiByte(CP_UTF8, 0, w_argv[i], -1, nullptr, 0, nullptr, nullptr);
+        utf8_args.emplace_back(n > 0 ? static_cast<size_t>(n - 1) : 0, '\0');
+        if (n > 0) {
+          WideCharToMultiByte(CP_UTF8, 0, w_argv[i], -1, utf8_args.back().data(), n, nullptr,
+                              nullptr);
+        }
+        utf8_argp.push_back(utf8_args.back().data());
+      }
+      utf8_argp.push_back(nullptr);
+      LocalFree(w_argv);
+      argc = w_argc;
+      argv = utf8_argp.data();
+    }
+  }
+#endif
+
   Options opt;
   if (!ParseArgs(argc, argv, &opt)) return 1;
 
@@ -90,8 +135,14 @@ int main(int argc, char** argv) {
   audiohub::HubCore hub;
   hub.SetEventCallback([](const std::string& text) { std::printf("%s\n", text.c_str()); });
 
+  audiohub::StartOptions opts;
+  opts.advertise = !opt.no_discovery;
+  opts.require_handshake = !opt.no_handshake;
+  opts.auto_accept = opt.auto_accept;
+  opts.display_name = opt.name;
+
   std::string error;
-  if (!hub.Start(opt.port, opt.latency_ms, opt.render_latency_ms, &error)) {
+  if (!hub.Start(opt.port, opt.latency_ms, opt.render_latency_ms, opts, &error)) {
     std::printf("%s\n", error.c_str());
     return 2;
   }
@@ -137,13 +188,39 @@ int main(int argc, char** argv) {
                            << ",\"kbps\":" << smoothed_kbps
                            << ",\"malformed\":" << stats.malformed_packets
                            << ",\"renderUnderruns\":" << stats.render_underruns
-                           << ",\"sources\":[";
+                           << ",\"autoAccept\":" << (hub.auto_accept() ? "true" : "false")
+                           << ",\"peers\":[";
+                         {
+                           const auto peers = hub.DiscoveredPeers();
+                           for (size_t i = 0; i < peers.size(); ++i) {
+                             const auto& p = peers[i];
+                             if (i) o << ",";
+                             o << "{\"name\":\"" << audiohub::JsonEscape(p.name) << "\","
+                               << "\"ip\":\"" << p.ip << "\",\"audioPort\":" << p.audio_port
+                               << ",\"canReceive\":" << (p.can_receive ? "true" : "false")
+                               << ",\"canSend\":" << (p.can_send ? "true" : "false") << "}";
+                           }
+                         }
+                         o << "],\"pending\":[";
+                         {
+                           const auto pending = hub.PendingConnections();
+                           for (size_t i = 0; i < pending.size(); ++i) {
+                             const auto& p = pending[i];
+                             if (i) o << ",";
+                             o << "{\"streamId\":" << p.stream_id
+                               << ",\"name\":\"" << audiohub::JsonEscape(p.peer_name) << "\","
+                               << "\"ip\":\"" << p.peer_ip << "\"}";
+                           }
+                         }
+                         o << "],\"sources\":[";
                          for (size_t i = 0; i < sources.size(); ++i) {
                            const auto& s = sources[i];
                            if (i) o << ",";
                            o << "{\"id\":" << s.id << ",\"level\":" << s.level_dbfs
                              << ",\"gain\":" << s.gain
                              << ",\"muted\":" << (s.muted ? "true" : "false")
+                             << ",\"confirmed\":" << (s.confirmed ? "true" : "false")
+                             << ",\"peerName\":\"" << audiohub::JsonEscape(s.peer_name) << "\""
                              << ",\"occupancy\":" << s.occupancy_ms
                              << ",\"packets\":" << s.packets
                              << ",\"underrun\":" << s.underrun_frames
@@ -173,6 +250,32 @@ int main(int argc, char** argv) {
                          if (audiohub::JsonFindNumber(body, "gain", &v)) {
                            hub.SetMasterGain(static_cast<float>(v));
                          }
+                         return "{\"ok\":true}";
+                       }
+                       if (method == "POST" && path == "/api/accept") {
+                         double v = 0;
+                         if (audiohub::JsonFindNumber(body, "streamId", &v)) {
+                           hub.AcceptConnection(static_cast<uint16_t>(v));
+                         }
+                         return "{\"ok\":true}";
+                       }
+                       if (method == "POST" && path == "/api/reject") {
+                         double v = 0;
+                         if (audiohub::JsonFindNumber(body, "streamId", &v)) {
+                           hub.RejectConnection(static_cast<uint16_t>(v));
+                         }
+                         return "{\"ok\":true}";
+                       }
+                       if (method == "POST" && path == "/api/disconnect") {
+                         double v = 0;
+                         if (audiohub::JsonFindNumber(body, "streamId", &v)) {
+                           hub.Disconnect(static_cast<uint16_t>(v));
+                         }
+                         return "{\"ok\":true}";
+                       }
+                       if (method == "POST" && path == "/api/auto-accept") {
+                         bool b = false;
+                         if (audiohub::JsonFindBool(body, "on", &b)) hub.SetAutoAccept(b);
                          return "{\"ok\":true}";
                        }
                        if (method == "POST" && path == "/api/latency") {
@@ -219,9 +322,23 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(stats.malformed_packets));
 
     for (const auto& s : sources) {
-      std::printf("   stream %-3u 水位 %4d ms (目标 %d) | 比率 %.5f | 电平 %6.1f dBFS | 溢出 %llu 欠载 %llu\n",
-                  s.id, s.occupancy_ms, s.target_ms, s.ratio, s.level_dbfs,
-                  (unsigned long long)s.overflow_packets, (unsigned long long)s.underrun_frames);
+      std::printf("   %-14s 水位 %4d ms | 电平 %6.1f dBFS | 增益 %.2f | %s%s\n",
+                  s.peer_name.empty() ? ("流 " + std::to_string(s.id)).c_str() : s.peer_name.c_str(),
+                  s.occupancy_ms, s.level_dbfs, s.gain, s.confirmed ? "" : "待确认 ",
+                  s.muted ? "已静音" : "");
+    }
+
+    const auto pending = hub.PendingConnections();
+    for (const auto& p : pending) {
+      std::printf("   [等待确认] %s (%s) 流 %u\n", p.peer_name.c_str(), p.peer_ip.c_str(),
+                  p.stream_id);
+    }
+
+    const auto peers = hub.DiscoveredPeers();
+    if (!peers.empty()) {
+      std::printf("   发现 %zu 台设备:", peers.size());
+      for (const auto& p : peers) std::printf(" %s(%s)", p.name.c_str(), p.ip.c_str());
+      std::printf("\n");
     }
     std::fflush(stdout);
   }

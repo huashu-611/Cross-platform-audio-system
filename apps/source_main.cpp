@@ -19,6 +19,9 @@
 #include <thread>
 #include <vector>
 
+#include <windows.h>
+#include <shellapi.h>
+
 #include "audiohub/audio_format.hpp"
 #include "audiohub/clock_sync.hpp"
 #include "audiohub/meter.hpp"
@@ -53,6 +56,8 @@ struct Options {
   std::string include_name;  // 进程回环：只抓这个进程树
   std::string exclude_name;  // 进程回环：排除这个进程树
   std::string log_path;   // 非空时把输出重定向到文件
+  bool handshake = false;  // 先发 CONN-REQ，等对方确认后再发音频
+  std::string device_name = "PC 音源";
   bool verbose = false;
 };
 
@@ -69,6 +74,8 @@ void PrintUsage() {
       "  --include <exe>     只抓这个进程的声音（Win10 2004+）\n"
       "  --exclude <exe>     排除这个进程的声音，其它照抓（Win10 2004+）\n"
       "  --log <file>        把输出写到文件（后台运行时看统计用）\n"
+      "  --handshake         先发连接请求，对方确认后再发音频\n"
+      "  --device-name <s>   握手时上报的设备名\n"
       "  --verbose           每包打印一次（调试用，会明显影响性能）\n",
       static_cast<unsigned>(47000));
 }
@@ -109,6 +116,10 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
       opt->exclude_name = next("--exclude");
     } else if (a == "--log") {
       opt->log_path = next("--log");
+    } else if (a == "--handshake") {
+      opt->handshake = true;
+    } else if (a == "--device-name") {
+      opt->device_name = next("--device-name");
     } else if (a == "--verbose") {
       opt->verbose = true;
     } else if (a == "-h" || a == "--help") {
@@ -126,6 +137,31 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+  // 命令行是 ANSI 码页，--device-name 带中文时握手帧就不是合法 UTF-8
+  {
+    int w_argc = 0;
+    LPWSTR* w_argv = CommandLineToArgvW(GetCommandLineW(), &w_argc);
+    if (w_argv != nullptr && w_argc > 0) {
+      static std::vector<std::string> utf8_args;
+      static std::vector<char*> utf8_argp;
+      for (int i = 0; i < w_argc; ++i) {
+        const int n = WideCharToMultiByte(CP_UTF8, 0, w_argv[i], -1, nullptr, 0, nullptr, nullptr);
+        utf8_args.emplace_back(n > 0 ? static_cast<size_t>(n - 1) : 0, '\0');
+        if (n > 0) {
+          WideCharToMultiByte(CP_UTF8, 0, w_argv[i], -1, utf8_args.back().data(), n, nullptr,
+                              nullptr);
+        }
+        utf8_argp.push_back(utf8_args.back().data());
+      }
+      utf8_argp.push_back(nullptr);
+      LocalFree(w_argv);
+      argc = w_argc;
+      argv = utf8_argp.data();
+    }
+  }
+#endif
+
   Options opt;
   if (!ParseArgs(argc, argv, &opt)) return 1;
 
@@ -282,6 +318,32 @@ int main(int argc, char** argv) {
     // 会看到 20 ms 一簇的到达图案，水位随之上下摆动十几毫秒。
     // 均匀发送能把这段抖动直接从链路上消掉。
     std::mt19937 rng{std::random_device{}()};
+
+    // ---- 握手：请求对方确认后才开始发音频 ----
+    if (opt.handshake) {
+      audiohub::UdpSocket hs;
+      if (!hs.Open(0) || !hs.SetPeer(opt.hub_ip, static_cast<uint16_t>(opt.hub_port + 2))) {
+        std::printf("握手口连接失败\n");
+        return;
+      }
+      hs.SetReceiveTimeoutMs(1000);
+      const std::string req = "CONN-REQ|" + opt.device_name + "|" +
+                              std::to_string(opt.stream_id) + "\n";
+      bool confirmed = false;
+      for (int i = 0; i < 15 && !confirmed && running.load(); ++i) {
+        hs.SendToPeer(req.data(), req.size());
+        uint8_t rbuf[256];
+        const int n = hs.ReceiveFrom(rbuf, sizeof(rbuf), nullptr, nullptr);
+        if (n > 0 && std::memcmp(rbuf, "CONN-ACK", 8) == 0) confirmed = true;
+        else std::this_thread::sleep_for(std::chrono::milliseconds(700));
+      }
+      if (!confirmed) {
+        std::printf("对方未在 10 秒内确认连接\n");
+        return;
+      }
+      std::printf("对方已确认连接\n");
+    }
+
     auto next = Clock::now();
     const auto tick = std::chrono::microseconds(audiohub::kFramesPerPacket * 1000000 /
                                                 audiohub::kSampleRate);

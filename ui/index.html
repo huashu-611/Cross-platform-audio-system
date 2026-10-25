@@ -25,6 +25,10 @@
 
   <div id="banner" class="banner hidden"></div>
 
+  <div class="grid" id="reqGrid"></div>
+
+  <div class="grid" id="peerGrid"></div>
+
   <div class="grid" id="grid"></div>
 
   <div class="panel">
@@ -41,6 +45,13 @@
         <button data-v="40">40 ms</button>
         <button data-v="60" class="on">60 ms</button>
         <button data-v="120">120 ms</button>
+      </div>
+    </div>
+    <div class="box">
+      <h3>连接策略</h3>
+      <div class="seg" id="accept">
+        <button data-v="off" class="on">需要确认</button>
+        <button data-v="on">自动接受</button>
       </div>
     </div>
   </div>
