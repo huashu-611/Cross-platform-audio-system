@@ -48,6 +48,7 @@ public class MainActivity extends Activity {
     private LinearLayout screenControl;
 
     private TextView hubValue;
+    private TextView hubSub;
     private TextView sourceState;
     private Button sourceToggle;
     private LinearLayout peerList;
@@ -62,6 +63,8 @@ public class MainActivity extends Activity {
     // 新服务几百毫秒后才起，这个间隙会让界面误判成"会话结束"而弹回连接页。
     private boolean sessionActive = false;
     private int idleTicks = 0;
+    // 用户主动点了"断开"：在服务真正停掉之前，不能再被 sessionActive 拉回来
+    private boolean userLeft = false;
 
     private LinearLayout ctrlPeerList;
 
@@ -484,7 +487,8 @@ public class MainActivity extends Activity {
         hubValue.setTextSize(15);
         hubValue.setTextColor(COLOR_TEXT);
         hubInfoC.addView(hubValue);
-        hubInfoC.addView(sub("当前承担收流 / 混音 / 播放的一端"));
+        hubSub = sub("当前承担收流 / 混音 / 播放的一端");
+        hubInfoC.addView(hubSub);
         hubRowC.addView(hubInfoC);
         Button switchHub = textButton("切换", COLOR_ACCENT);
         switchHub.setOnClickListener(new View.OnClickListener() {
@@ -504,6 +508,7 @@ public class MainActivity extends Activity {
                         .setAction(ReceiverService.ACTION_STOP));
                 stopSource();
                 sessionActive = false;
+                userLeft = true;      // 立刻回连接界面，且不被服务状态拉回
                 idleTicks = 0;
                 refresh();
                 Toast.makeText(MainActivity.this, "已断开", Toast.LENGTH_SHORT).show();
@@ -608,6 +613,19 @@ public class MainActivity extends Activity {
     }
 
     private void pickRemoteHub(final Discovery.Device d) {
+        // 先把本地角色与界面切过去，握手放到后台。
+        // 之前是先阻塞握手再改状态：对方没点同意时会卡满 30 秒，
+        // 期间界面一点反应都没有，看起来就是"切换没生效"。
+        hubIp = d.ip;
+        hubPort = d.audioPort;
+        hubName = d.name;
+        saveHub();
+        sessionActive = true;
+        idleTicks = 0;
+        startService(new Intent(this, ReceiverService.class)
+                .setAction(ReceiverService.ACTION_STOP));
+        refresh();
+
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -617,26 +635,13 @@ public class MainActivity extends Activity {
                     @Override
                     public void run() {
                         if (!ok) {
-                            Toast.makeText(MainActivity.this, "对方未确认连接",
+                            Toast.makeText(MainActivity.this,
+                                    "对方还没有同意连接，界面已切换但声音还没接通",
                                     Toast.LENGTH_LONG).show();
                             return;
                         }
-                        hubIp = d.ip;
-                        hubPort = d.audioPort;
-                        hubName = d.name;
-                        saveHub();
-                        startService(new Intent(MainActivity.this, ReceiverService.class)
-                                .setAction(ReceiverService.ACTION_STOP));
-                        sessionActive = true;
-                        idleTicks = 0;
-                        sessionActive = true;
-                        idleTicks = 0;
-                        refresh();
-                        Toast.makeText(MainActivity.this,
-                                d.name + " 现在是汇聚端", Toast.LENGTH_SHORT).show();
-                        // 握手通过还不够——必须真的开始采集发送，
-                        // 否则对端永远收不到流，桌面端也就不会出现"已连接"，
-                        // 界面会一直停在连接界面（这个 bug 真出现过）。
+                        Toast.makeText(MainActivity.this, "已连接 " + d.name,
+                                Toast.LENGTH_SHORT).show();
                         ensurePermissionsThenStart();
                     }
                 });
@@ -735,6 +740,30 @@ public class MainActivity extends Activity {
     private void refresh() {
         // 汇聚端显示
         hubValue.setText(isLocalHub() ? "本机" : (hubName != null ? hubName : hubIp));
+        if (hubSub != null) {
+            if (isLocalHub()) {
+                hubSub.setText(ReceiverService.sRunning
+                        ? ("已接收 " + ReceiverService.sStreamCount + " 路 · 总线 "
+                           + String.format("%.1f", ReceiverService.sBusLevel) + " dBFS")
+                        : "接收服务未启动");
+            } else {
+                hubSub.setText(CaptureService.sRunning
+                        ? ("正在发送 · " + CaptureService.sPackets + " 包")
+                        : "尚未开始发送");
+            }
+        }
+        if (hubSub != null) {
+            if (isLocalHub()) {
+                hubSub.setText(ReceiverService.sRunning
+                        ? ("已接收 " + ReceiverService.sStreamCount + " 路 · 总线 "
+                           + String.format("%.1f", ReceiverService.sBusLevel) + " dBFS")
+                        : "接收服务未启动");
+            } else {
+                hubSub.setText(CaptureService.sRunning
+                        ? ("正在发送 · " + CaptureService.sPackets + " 包")
+                        : "尚未开始发送");
+            }
+        }
 
         // 本机声音
         final boolean srcRunning = CaptureService.sRunning;
@@ -752,7 +781,12 @@ public class MainActivity extends Activity {
         // 会话成立与否用粘滞标志判断，并给切换留出宽限：
         // 服务停了不代表会话结束（可能正在切换），连续 15 个 tick
         // （约 6 秒）都没有任何服务在跑，才认为会话真的结束了。
-        if (hubRunning || srcRunning) {
+        if (userLeft) {
+            // 服务还没停干净时不要重置会话；两个服务都停了才解除
+            if (!hubRunning && !srcRunning) userLeft = false;
+            sessionActive = false;
+            idleTicks = 0;
+        } else if (hubRunning || srcRunning) {
             sessionActive = true;
             idleTicks = 0;
         } else if (sessionActive) {
@@ -772,8 +806,10 @@ public class MainActivity extends Activity {
             String hubLabel;
             double hubLevel;
 
-            if (receiving) {
-                // 本机是汇聚端：大球是本机，小球是各路音源
+            if (isLocalHub()) {
+                // 本机是汇聚端：大球是本机，小球是各路音源。
+                // 注意判断依据是"角色"，不是"有没有流"——刚切换过来的那一秒
+                // 流还是 0，若按流判断就会错误地画成音源视图（图看起来没变）。
                 hubLabel = "本机";
                 hubLevel = ReceiverService.sBusLevel;
                 for (int i = 1; i <= ReceiverService.sStreamCount; ++i) {

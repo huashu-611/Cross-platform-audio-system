@@ -50,6 +50,20 @@ public final class InviteListener {
      */
     public static volatile String sRoleCommand = null;
 
+    // 收到 ROLE|hub 之后的一段时间内，自动同意来自该 IP 的 CONN-REQ。
+    //
+    // 为什么需要：PC 把本机设为汇聚端后，会立刻起一个音源进程发 CONN-REQ。
+    // 如果这条请求还要用户手动点"同意"，PC 那头等 30 秒就退出了 ——
+    // 表现就是"手机当了汇聚端但一点声音都没有"。
+    // 对端既然能下发 ROLE|hub，就是它主动任命本机，放行它的连接是合理的。
+    private static String autoAcceptIp = null;
+    private static long autoAcceptUntil = 0;
+
+    private static boolean shouldAutoAccept(String ip) {
+        return autoAcceptIp != null && autoAcceptIp.equals(ip)
+                && System.currentTimeMillis() < autoAcceptUntil;
+    }
+
 
     public static volatile boolean sInvitePending = false;
     public static volatile String sInviteName = "";
@@ -192,6 +206,9 @@ public final class InviteListener {
                 // ROLE|hub   或   ROLE|source|ip:port
                 if (parts.length >= 2 && "hub".equals(parts[1])) {
                     sRoleCommand = "hub";
+                    // 该对端随后发来的 CONN-REQ 自动放行（60 秒窗口）
+                    autoAcceptIp = fromIp;
+                    autoAcceptUntil = System.currentTimeMillis() + 60_000;
                 } else if (parts.length >= 3 && "source".equals(parts[1])
                         && parts[2].contains(":")) {
                     final int c = parts[2].lastIndexOf(':');
@@ -206,6 +223,20 @@ public final class InviteListener {
                     streamId = Integer.parseInt(parts[2]);
                 } catch (NumberFormatException e) {
                     continue;
+                }
+                if (shouldAutoAccept(fromIp)) {
+                    // 对端刚把本机任命为汇聚端：直接放行，不再让用户点
+                    final String ack = "CONN-ACK|" + selfName + "|" + streamId + "\n";
+                    final InviteListener self = instance;
+                    if (self != null && self.socket != null) {
+                        try {
+                            final byte[] data = ack.getBytes(StandardCharsets.UTF_8);
+                            self.socket.send(new DatagramPacket(data, data.length,
+                                    InetAddress.getByName(fromIp), fromPort));
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    return;
                 }
                 synchronized (sPending) {
                     boolean dup = false;
