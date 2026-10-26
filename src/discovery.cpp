@@ -33,8 +33,20 @@ constexpr int kPeerTimeoutMs = 5000;
 // 那张虚拟网卡（本机就是 192.168.24.1），于是真实 WiFi 网段里的手机
 // 一帧都收不到——表现为"扫描不到任何设备"。
 // 逐网段各发一份才能覆盖所有同网段的设备。
-std::vector<uint32_t> DirectedBroadcasts() {
-  std::vector<uint32_t> out;
+struct NicInfo {
+  std::string ip;          // 本机在该网卡上的地址
+  uint32_t directed = 0;   // 该网段的定向广播地址
+};
+
+// 枚举所有活动网卡的本机地址与该网段的定向广播地址。
+//
+// 为什么要"每个网卡各绑一个 socket 发"：
+//   sendto(255.255.255.255) 只从默认路由那张网卡出去。装了 Clash / VMware 的
+//   机器上默认网卡是虚拟网卡，限定广播根本到不了真实局域网。
+//   bind 到具体本机 IP 之后，内核一定从那张网卡发出去。
+std::vector<NicInfo> LocalNics() {
+  std::vector<NicInfo> out;
+#ifdef _WIN32
   ULONG size = 16384;
   std::vector<BYTE> buf(size);
   PIP_ADAPTER_ADDRESSES addrs = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data());
@@ -44,20 +56,34 @@ std::vector<uint32_t> DirectedBroadcasts() {
   }
   for (PIP_ADAPTER_ADDRESSES a = addrs; a != nullptr; a = a->Next) {
     if (a->OperStatus != IfOperStatusUp) continue;
+    if (a->IfType == IF_TYPE_TUNNEL || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK ||
+        a->IfType == IF_TYPE_PPP) {
+      continue;
+    }
     for (PIP_ADAPTER_UNICAST_ADDRESS ua = a->FirstUnicastAddress; ua != nullptr; ua = ua->Next) {
       if (ua->Address.lpSockaddr == nullptr) continue;
       if (ua->Address.lpSockaddr->sa_family != AF_INET) continue;
       const auto* sa = reinterpret_cast<const sockaddr_in*>(ua->Address.lpSockaddr);
       const uint32_t ip = ntohl(sa->sin_addr.s_addr);
-      if ((ip >> 24) == 127) continue;   // 回环跳过
+      if ((ip >> 24) == 127) continue;
+      if ((ip & 0xFFFF0000u) == 0xA9FE0000u) continue;   // 169.254
+      if ((ip & 0xFFFE0000u) == 0xC6120000u) continue;   // 198.18 Clash
+      if ((ip & 0xFFC00000u) == 0x64400000u) continue;   // 100.64 CGNAT
+
       const uint32_t prefix = ua->OnLinkPrefixLength;
       const uint32_t mask = (prefix == 0 || prefix > 32) ? 0xFFFFFFFFu
                                                         : (0xFFFFFFFFu << (32 - prefix));
-      out.push_back((ip & mask) | ~mask);
+      NicInfo info;
+      in_addr tmp{};
+      tmp.s_addr = htonl(ip);
+      char text[INET_ADDRSTRLEN] = {0};
+      ::inet_ntop(AF_INET, &tmp, text, sizeof(text));
+      info.ip = text;
+      info.directed = (ip & mask) | ~mask;
+      out.push_back(info);
     }
   }
-  std::sort(out.begin(), out.end());
-  out.erase(std::unique(out.begin(), out.end()), out.end());
+#endif
   return out;
 }
 
@@ -95,24 +121,48 @@ struct Discovery::Impl {
   mutable std::mutex mutex;
   std::map<std::string, Peer> peers;  // key = ip:audio_port
 
-  void SendBeacon() {
-    const std::string f = BuildBeacon(local_ip, audio_port, http_port, advertise_can_send,
-                                      advertise_can_receive, name);
-    // 逐个网段的定向广播 + 兜底的全网广播
-    for (const uint32_t bcast : DirectedBroadcasts()) {
-      sockaddr_in addr{};
-      addr.sin_family = AF_INET;
-      addr.sin_port = htons(kDiscoveryPort);
-      addr.sin_addr.s_addr = htonl(bcast);
-      ::sendto(sock, f.data(), static_cast<int>(f.size()), 0, reinterpret_cast<sockaddr*>(&addr),
-               sizeof(addr));
+  // 在每个网卡上各绑一个临时 socket 发一帧：这样限定广播 255.255.255.255
+  // 与该网段的定向广播都能"从正确的网卡出去"。
+  void SendOnEachNic(const std::string& frame) {
+    for (const NicInfo& nic : LocalNics()) {
+      SOCKET s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+      if (s == INVALID_SOCKET) continue;
+      int one = 1;
+      ::setsockopt(s, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&one), sizeof(one));
+
+      sockaddr_in local{};
+      local.sin_family = AF_INET;
+      local.sin_port = 0;
+      ::inet_pton(AF_INET, nic.ip.c_str(), &local.sin_addr);
+      if (::bind(s, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
+        ::closesocket(s);
+        continue;
+      }
+
+      // ① 限定广播：/24 的对端也认
+      sockaddr_in limited{};
+      limited.sin_family = AF_INET;
+      limited.sin_port = htons(kDiscoveryPort);
+      limited.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+      ::sendto(s, frame.data(), static_cast<int>(frame.size()), 0,
+               reinterpret_cast<sockaddr*>(&limited), sizeof(limited));
+
+      // ② 本网段定向广播：有些系统只对定向广播放行
+      if (nic.directed != 0) {
+        sockaddr_in directed{};
+        directed.sin_family = AF_INET;
+        directed.sin_port = htons(kDiscoveryPort);
+        directed.sin_addr.s_addr = htonl(nic.directed);
+        ::sendto(s, frame.data(), static_cast<int>(frame.size()), 0,
+                 reinterpret_cast<sockaddr*>(&directed), sizeof(directed));
+      }
+      ::closesocket(s);
     }
-    sockaddr_in all{};
-    all.sin_family = AF_INET;
-    all.sin_port = htons(kDiscoveryPort);
-    all.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-    ::sendto(sock, f.data(), static_cast<int>(f.size()), 0, reinterpret_cast<sockaddr*>(&all),
-             sizeof(all));
+  }
+
+  void SendBeacon() {
+    SendOnEachNic(BuildBeacon(local_ip, audio_port, http_port, advertise_can_send,
+                              advertise_can_receive, name));
   }
 
   // 直接回给探测方（单播），不等下一个广播周期
@@ -128,23 +178,7 @@ struct Discovery::Impl {
              sizeof(addr));
   }
 
-  void SendProbe() {
-    const std::string f = std::string(kMagic) + "|1|WHO\n";
-    for (const uint32_t bcast : DirectedBroadcasts()) {
-      sockaddr_in addr{};
-      addr.sin_family = AF_INET;
-      addr.sin_port = htons(kDiscoveryPort);
-      addr.sin_addr.s_addr = htonl(bcast);
-      ::sendto(sock, f.data(), static_cast<int>(f.size()), 0, reinterpret_cast<sockaddr*>(&addr),
-               sizeof(addr));
-    }
-    sockaddr_in all{};
-    all.sin_family = AF_INET;
-    all.sin_port = htons(kDiscoveryPort);
-    all.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-    ::sendto(sock, f.data(), static_cast<int>(f.size()), 0, reinterpret_cast<sockaddr*>(&all),
-             sizeof(all));
-  }
+  void SendProbe() { SendOnEachNic(std::string(kMagic) + "|1|WHO\n"); }
 
   void HandleFrame(const std::string& line, const std::string& from_ip, uint16_t from_port) {
     // 拆 | 分隔的字段；显示名是最后一段，所以可以含任意字符（含空格和 | 之外的东西）

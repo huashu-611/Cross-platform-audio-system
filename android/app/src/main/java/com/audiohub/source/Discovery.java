@@ -91,6 +91,24 @@ public final class Discovery {
     }
 
     /**
+     * 单播探测指定地址。
+     *
+     * 办公 / 校园 WiFi 普遍开了 AP 隔离或广播过滤，广播帧到不了对端，
+     * 但同一网段的**单播**通常是放行的。所以除了广播探测，还要能
+     * 直接对某个已知 IP 探一下——这就是广播不可用时唯一的自动发现手段。
+     */
+    public void probeTo(String ip) {
+        if (!running || socket == null || ip == null || ip.isEmpty()) return;
+        try {
+            final byte[] data = (MAGIC + "|1|WHO\n").getBytes(
+                    java.nio.charset.StandardCharsets.UTF_8);
+            socket.send(new DatagramPacket(data, data.length,
+                    java.net.InetAddress.getByName(ip), DISCOVERY_PORT));
+        } catch (Exception ignored) {
+        }
+    }
+
+    /**
      * 启动失败的原因。为空表示正常。
      * 常见原因：端口被别的实例占着。
      */

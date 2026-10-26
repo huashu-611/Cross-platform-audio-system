@@ -51,6 +51,9 @@ public class MainActivity extends Activity {
     private TextView sourceState;
     private Button sourceToggle;
     private LinearLayout peerList;
+    private TextView scanHint;
+    // 手动添加 / 上次连接的设备（广播被拦时靠它们）
+    private final java.util.List<Discovery.Device> manualPeers = new java.util.ArrayList<>();
 
     private HubGraphView graph;
     private LinearLayout volPanel;
@@ -122,6 +125,22 @@ public class MainActivity extends Activity {
         } else {
             // 进来就发一帧探测，让对端立刻回信标，不用等它下一次广播
             discovery.probe();
+            // 广播被拦的网络（办公/校园 WiFi 常见）里，单播探测是唯一手段
+            if (hubIp != null && !hubIp.isEmpty()) {
+                discovery.probeTo(hubIp);
+                addManualPeer(hubIp, hubName != null ? hubName : hubIp, hubPort);
+            }
+            scanHint.setTextColor(COLOR_DIM);
+            scanHint.setText("正在扫描附近设备…");
+            poller.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    final int n = discovery.peers().size();
+                    scanHint.setTextColor(n > 0 ? COLOR_ACCENT : COLOR_DIM);
+                    scanHint.setText(n > 0 ? ("已发现 " + n + " 台设备")
+                                           : "暂未发现设备，点「扫描」重试");
+                }
+            }, 1500);
         }
     }
 
@@ -262,7 +281,32 @@ public class MainActivity extends Activity {
         srcCard.addView(srcRow);
         screenConnect.addView(srcCard);
 
-        screenConnect.addView(sectLabel("设备"));
+        // 设备区标题行 + 主动扫描按钮
+        LinearLayout devRow = new LinearLayout(this);
+        devRow.setOrientation(LinearLayout.HORIZONTAL);
+        devRow.setGravity(Gravity.CENTER_VERTICAL);
+        TextView devLabel = sectLabel("设备");
+        devLabel.setLayoutParams(new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        devRow.addView(devLabel);
+        Button scanBtn = textButton("扫描", COLOR_ACCENT);
+        scanBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) { scanNow((Button) v); }
+        });
+        devRow.addView(scanBtn);
+        Button manualBtn = textButton("手动添加", COLOR_DIM);
+        manualBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) { showManualAddDialog(); }
+        });
+        devRow.addView(manualBtn);
+        screenConnect.addView(devRow);
+
+        scanHint = sub("");
+        scanHint.setPadding(0, 0, 0, dp(8));
+        screenConnect.addView(scanHint);
+
         peerList = new LinearLayout(this);
         peerList.setOrientation(LinearLayout.VERTICAL);
         screenConnect.addView(peerList);
@@ -590,8 +634,103 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void renderPeers(List<Discovery.Device> peers) {
+    /**
+     * 主动扫描：发一帧 WHO 让所有设备立刻回信标，1.2 秒后汇总结果。
+     * 不做成"一直转圈"：UDP 是尽力而为，等一个固定窗口就够了。
+     */
+    private void scanNow(final Button btn) {
+        btn.setEnabled(false);
+        btn.setText("扫描中…");
+        scanHint.setTextColor(COLOR_DIM);
+        scanHint.setText("正在向局域网广播探测…");
+        if (discovery != null) discovery.probe();
+
+        poller.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                btn.setEnabled(true);
+                btn.setText("扫描");
+                final int n = discovery != null ? discovery.peers().size() : 0;
+                if (n > 0) {
+                    scanHint.setTextColor(COLOR_ACCENT);
+                    scanHint.setText("扫描完成，发现 " + n + " 台设备");
+                } else {
+                    scanHint.setTextColor(COLOR_WARN);
+                    scanHint.setText("没有发现设备。请确认：① 电脑已打开 AudioHub；"
+                            + "② 手机与电脑在同一 WiFi / 网段（本机 " + Discovery.localIp() + "）");
+                }
+            }
+        }, 1200);
+    }
+
+    /** 手动填 IP 连过去：广播被拦时的兜底手段。 */
+    private void showManualAddDialog() {
+        final EditText input = new EditText(this);
+        input.setHint("电脑的 IP，例如 10.135.129.59");
+        input.setText(hubIp != null ? hubIp : "");
+        input.setInputType(android.text.InputType.TYPE_CLASS_TEXT);
+        input.setTextColor(COLOR_TEXT);
+        new AlertDialog.Builder(this)
+                .setTitle("手动添加设备")
+                .setMessage("填电脑上显示的地址（可只填 IP，端口默认 47000）")
+                .setView(input)
+                .setPositiveButton("连接", new android.content.DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(android.content.DialogInterface dialog, int which) {
+                        String text = input.getText().toString().trim();
+                        if (text.isEmpty()) return;
+                        int port = 47000;
+                        String ip = text;
+                        final int colon = text.lastIndexOf(':');
+                        if (colon > 0) {
+                            ip = text.substring(0, colon);
+                            port = parseInt(text.substring(colon + 1), 47000);
+                        }
+                        Discovery.Device d = new Discovery.Device();
+                        d.name = ip + "（手动）";
+                        d.ip = ip;
+                        d.audioPort = port;
+                        d.canSend = true;
+                        d.canReceive = true;
+                        manualPeers.clear();
+                        manualPeers.add(d);
+                        renderPeers(discovery != null ? discovery.peers()
+                                                      : new java.util.ArrayList<Discovery.Device>());
+                        // 先探一下，对方在线就会回信标
+                        if (discovery != null) discovery.probeTo(ip);
+                        pickRemoteHub(d);
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    /** 把一个已知地址放进手动列表（上次连过的那个）。 */
+    private void addManualPeer(String ip, String name, int port) {
+        for (Discovery.Device d : manualPeers) {
+            if (d.ip.equals(ip)) return;
+        }
+        Discovery.Device d = new Discovery.Device();
+        d.name = name + "（上次连接）";
+        d.ip = ip;
+        d.audioPort = port > 0 ? port : 47000;
+        d.canSend = true;
+        d.canReceive = true;
+        manualPeers.add(d);
+    }
+
+    private void renderPeers(List<Discovery.Device> autoPeers) {
         peerList.removeAllViews();
+        // 手动 / 上次连接的设备排在前面（广播被拦时只有它们能用）
+        final java.util.List<Discovery.Device> peers =
+                new java.util.ArrayList<>(manualPeers);
+        for (Discovery.Device d : autoPeers) {
+            boolean dup = false;
+            for (Discovery.Device m : manualPeers) {
+                if (m.ip.equals(d.ip) && m.audioPort == d.audioPort) { dup = true; break; }
+            }
+            if (!dup) peers.add(d);
+        }
         if (peers.isEmpty()) {
             TextView tv = new TextView(this);
             // 把本机 IP 显示出来：扫不到时最常见的原因是两台设备不在同一网段
@@ -689,5 +828,13 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) {
         }
         return "";
+    }
+
+    private static int parseInt(String text, int fallback) {
+        try {
+            return Integer.parseInt(text.trim());
+        } catch (Exception e) {
+            return fallback;
+        }
     }
 }

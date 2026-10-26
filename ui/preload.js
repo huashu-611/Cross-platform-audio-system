@@ -25,6 +25,9 @@ contextBridge.exposeInMainWorld('hub', {
   // 目标延迟
   setLatency: (ms) => ipcRenderer.invoke('hub:setLatency', { ms }),
 
+  // 主动扫描一轮，返回本次扫到的设备
+  scan: () => ipcRenderer.invoke('hub:scan'),
+
   // 连接握手
   invitePeer: (peer) => ipcRenderer.invoke('hub:invite', peer),
   accept: (streamId) => ipcRenderer.invoke('hub:accept', { streamId }),

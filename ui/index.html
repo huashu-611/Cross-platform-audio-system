@@ -30,8 +30,25 @@
     <div class="sect" id="sectReq" style="display:none">连接请求</div>
     <div class="grid" id="reqGrid"></div>
 
-    <div class="sect" id="sectPeer" style="display:none">发现的设备</div>
+    <div class="sectrow">
+      <div class="sect" id="sectPeer" style="margin:0">发现的设备</div>
+      <button class="scanbtn" id="scanBtn">扫描</button>
+    </div>
+    <div class="hint" id="scanHint"></div>
     <div class="grid" id="peerGrid"></div>
+
+    <div class="sectrow">
+      <div class="sect" style="margin:0">按 IP 直接邀请</div>
+    </div>
+    <div class="hint">广播被拦的网络（办公 / 校园 WiFi 常见）用这个。填手机上的地址，端口默认 47000</div>
+    <div class="grid">
+      <div class="card" style="max-width:560px">
+        <div class="row">
+          <input class="ipinput" id="manualIp" placeholder="例如 10.135.7.56:47000">
+          <button class="btn go" id="manualInviteBtn">邀请</button>
+        </div>
+      </div>
+    </div>
 
   </div>
 

@@ -185,6 +185,16 @@ ipcMain.handle('hub:setMaster', async (_e, arg) => {
   return httpRequest('POST', '/api/master', { gain })
 })
 
+// 主动扫描：让音频核心发一轮 WHO 探测，等对端回信标后再回读状态。
+// 只调 refresh 不等待的话，界面拿到的还是探测前那份 peers。
+ipcMain.handle('hub:scan', async () => {
+  await httpRequest('POST', '/api/refresh', {})
+  await new Promise((resolve) => setTimeout(resolve, 800))
+  const state = await httpRequest('GET', '/api/state')
+  if (!state) return { ok: false, peers: [] }
+  return { ok: true, peers: state.peers || [] }
+})
+
 ipcMain.handle('hub:invite', async (_e, arg) => {
   const p = arg || {}
   if (typeof p.ip !== 'string' || !Number.isInteger(p.audioPort)) return { ok: false }

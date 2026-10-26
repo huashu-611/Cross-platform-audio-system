@@ -181,8 +181,11 @@ function renderConnect (state) {
 
 // ============================================================ 主刷新
 
+let lastState = null
+
 function render (state) {
   if (!state) return
+  lastState = state
   if (state.error) {
     const b = $('banner')
     b.textContent = state.error
@@ -233,6 +236,65 @@ $('volMute').addEventListener('click', () => {
   if (!selected || selected.kind !== 'source') return
   window.hub.setSource(selected.id, { muted: true })
   $('volMute').classList.add('on')
+})
+
+// ---- 主动扫描 ----
+$('scanBtn').addEventListener('click', async () => {
+  const btn = $('scanBtn')
+  const hint = $('scanHint')
+  btn.disabled = true
+  btn.classList.add('busy')
+  btn.textContent = '扫描中…'
+  hint.className = 'hint'
+  hint.textContent = '正在向局域网广播探测…'
+
+  const res = await window.hub.scan()
+
+  btn.disabled = false
+  btn.classList.remove('busy')
+  btn.textContent = '扫描'
+
+  if (!res || !res.ok) {
+    hint.className = 'hint warn'
+    hint.textContent = '扫描失败：音频核心没有响应'
+    return
+  }
+  const n = res.peers.length
+  if (n === 0) {
+    hint.className = 'hint warn'
+    hint.textContent = '没有发现设备。请确认：① 手机已打开 App；② 手机和电脑在同一 WiFi / 网段'
+  } else {
+    hint.className = 'hint ok'
+    hint.textContent = '扫描完成，发现 ' + n + ' 台设备'
+  }
+  // 立即用扫描结果刷新一次列表，不等下一次 200ms 轮询
+  render(lastState)
+})
+
+// ---- 按 IP 直接邀请（广播被拦时的兜底） ----
+$('manualInviteBtn').addEventListener('click', async () => {
+  const raw = $('manualIp').value.trim()
+  const hint = $('scanHint')
+  if (!raw) {
+    hint.className = 'hint warn'
+    hint.textContent = '请先填对方的地址'
+    return
+  }
+  let ip = raw
+  let port = 47000
+  const colon = raw.lastIndexOf(':')
+  if (colon > 0) {
+    ip = raw.slice(0, colon)
+    port = parseInt(raw.slice(colon + 1), 10) || 47000
+  }
+  const res = await window.hub.invitePeer({ ip, audioPort: port })
+  if (res && res.ok) {
+    hint.className = 'hint ok'
+    hint.textContent = '已向 ' + ip + ':' + port + ' 发出邀请，等对方确认'
+  } else {
+    hint.className = 'hint warn'
+    hint.textContent = '邀请发送失败：地址格式不对或音频核心没响应'
+  }
 })
 
 $('leaveBtn').addEventListener('click', async () => {
