@@ -65,13 +65,11 @@ public class ReceiverService extends Service {
     public static volatile int sInvitePort = 0;
 
     private DatagramSocket dataSocket;
-    private DatagramSocket handshakeSocket;
     private AudioTrack track;
     private final Map<Integer, JitterBuffer> streams = new ConcurrentHashMap<>();
     private final Map<Integer, Float> gains = new ConcurrentHashMap<>();
     private Thread recvThread;
     private Thread playThread;
-    private Thread handshakeThread;
     private volatile boolean running;
     private WifiManager.WifiLock wifiLock;
     private PowerManager.WakeLock wakeLock;
@@ -105,9 +103,8 @@ public class ReceiverService extends Service {
             dataSocket.setReceiveBufferSize(1 << 20);
             dataSocket.setSoTimeout(50);
 
-            handshakeSocket = new DatagramSocket(null);
-            handshakeSocket.bind(new java.net.InetSocketAddress(port + 2));
-            handshakeSocket.setSoTimeout(50);
+            // 握手口（port+2）交给 InviteListener 常驻监听。
+            // 这里再绑一次会冲突，而且会导致"没开接收服务时收不到邀请"。
         } catch (Exception e) {
             fail("端口被占用: " + e.getMessage());
             return START_NOT_STICKY;
@@ -132,13 +129,8 @@ public class ReceiverService extends Service {
             @Override
             public void run() { playLoop(); }
         }, "audiohub-play");
-        handshakeThread = new Thread(new Runnable() {
-            @Override
-            public void run() { handshakeLoop(); }
-        }, "audiohub-hs");
         recvThread.start();
         playThread.start();
-        handshakeThread.start();
         return START_NOT_STICKY;
     }
 
@@ -285,55 +277,8 @@ public class ReceiverService extends Service {
         }
     }
 
-    /** 握手线程：处理 PC 发来的 CONN-INVITE，并应答 CONN-REQ。 */
-    private void handshakeLoop() {
-        final byte[] buf = new byte[1024];
-        while (running) {
-            final DatagramPacket pkt = new DatagramPacket(buf, buf.length);
-            final int n;
-            try {
-                handshakeSocket.receive(pkt);
-                n = pkt.getLength();
-            } catch (Exception e) {
-                continue;
-            }
-            final String line = new String(buf, 0, n,
-                    java.nio.charset.StandardCharsets.UTF_8).trim();
-            final String[] parts = line.split("\\|");
-            if (parts.length == 0) continue;
+    // ------------------------------------------------------------ 收尾
 
-            final String fromIp = pkt.getAddress().getHostAddress();
-            final int fromPort = pkt.getPort();
-
-            if ("CONN-INVITE".equals(parts[0]) && parts.length >= 3) {
-                // PC 邀请我们把声音送过去：入队等界面确认
-                pendingInvites.put(fromIp + ":" + fromPort, pkt.getData().clone());
-                sStatus = "收到 " + parts[1] + " 的连接邀请，请在界面确认";
-                sInviteName = parts[1];
-                sInviteIp = fromIp;
-                sInvitePort = fromPort;
-                sInvitePending = true;
-            } else if ("CONN-REQ".equals(parts[0]) && parts.length >= 3) {
-                // 另一台设备请求把声音送到这里（手机当汇聚端时）
-                final String ack = "CONN-ACK|" + "AudioHub 手机" + "|" + parts[2] + "\n";
-                try {
-                    handshakeSocket.send(new DatagramPacket(ack.getBytes(
-                            java.nio.charset.StandardCharsets.UTF_8), ack.length(),
-                            InetAddress.getByName(fromIp), fromPort));
-                } catch (Exception ignored) {
-                }
-            }
-        }
-    }
-
-    private void notifyInvite(String name, String ip, int port) {
-        Log.i(TAG, "收到邀请: " + name + " (" + ip + ":" + port + ")");
-    }
-
-    /**
-     * 接受邀请：向 PC 发 CONN-REQ，等 CONN-ACK。
-     * @return true = 对方已确认
-     */
     /** 供界面实时调某一路的音量（streamId 来自网络图上的球）。 */
     public static void setStreamGain(int streamId, float gain) {
         sGains.put(streamId, Math.max(0f, Math.min(4f, gain)));
@@ -341,6 +286,12 @@ public class ReceiverService extends Service {
 
     private static final Map<Integer, Float> sGains = new ConcurrentHashMap<>();
 
+    /**
+     * 向对端发 CONN-REQ 并等待 CONN-ACK。
+     * 这是"建立连接"的握手，与谁当汇聚端无关。
+     *
+     * @return true = 对方已确认
+     */
     public static boolean respondToInvite(String pcIp, int pcAudioPort, String deviceName) {
         DatagramSocket s = null;
         try {
@@ -348,8 +299,7 @@ public class ReceiverService extends Service {
             s.setSoTimeout(1000);
             final String req = "CONN-REQ|" + deviceName + "|1\n";
             final byte[] data = req.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            // 等 30 秒：对方需要在界面上点"同意"，10 秒往往不够。
-            // 窗口太短会让"我点了同意但手机已经放弃了"成为常见故障。
+            // 等 30 秒：对方要在界面上点"同意"，10 秒往往不够
             for (int i = 0; i < 30; ++i) {
                 s.send(new DatagramPacket(data, data.length,
                         InetAddress.getByName(pcIp), pcAudioPort + 2));
@@ -357,11 +307,12 @@ public class ReceiverService extends Service {
                 DatagramPacket r = new DatagramPacket(rbuf, rbuf.length);
                 try {
                     s.receive(r);
-                    if (r.getLength() >= 8 && new String(rbuf, 0, 8).equals("CONN-ACK")) {
+                    if (r.getLength() >= 8
+                            && new String(rbuf, 0, 8).equals("CONN-ACK")) {
                         return true;
                     }
                 } catch (java.net.SocketTimeoutException ignored) {
-                    // 重试
+                    // 继续重试
                 }
             }
             return false;
@@ -372,8 +323,6 @@ public class ReceiverService extends Service {
         }
     }
 
-    // ------------------------------------------------------------ 收尾
-
     private void stopAll() {
         running = false;
         sRunning = false;
@@ -381,16 +330,12 @@ public class ReceiverService extends Service {
         sStreamCount = 0;
         if (recvThread != null) { try { recvThread.join(400); } catch (Exception ignored) {} }
         if (playThread != null) { try { playThread.join(400); } catch (Exception ignored) {} }
-        if (handshakeThread != null) {
-            try { handshakeThread.join(400); } catch (Exception ignored) {}
-        }
-        recvThread = playThread = handshakeThread = null;
+        recvThread = playThread = null;
         if (track != null) {
             try { track.stop(); track.release(); } catch (Exception ignored) {}
             track = null;
         }
         if (dataSocket != null) { dataSocket.close(); dataSocket = null; }
-        if (handshakeSocket != null) { handshakeSocket.close(); handshakeSocket = null; }
         releaseLocks();
         sStatus = "已停止";
     }

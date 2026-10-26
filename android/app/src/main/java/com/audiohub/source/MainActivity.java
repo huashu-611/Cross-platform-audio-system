@@ -120,6 +120,13 @@ public class MainActivity extends Activity {
                 });
             }
         });
+        // 常驻握手监听：不管有没有开接收服务，都要能收到别人的邀请
+        InviteListener.setSelfName(android.os.Build.MODEL);
+        if (!InviteListener.get().start(47000)) {
+            // 端口被占不算致命：只是收不到邀请，手动连接仍可用
+            android.util.Log.w("AudioHub", "握手口 47002 绑定失败，可能已被占用");
+        }
+
         if (!discovery.start()) {
             Toast.makeText(this, discovery.lastError(), Toast.LENGTH_LONG).show();
         } else {
@@ -148,6 +155,7 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         poller.removeCallbacksAndMessages(null);
         if (discovery != null) discovery.stop();
+        InviteListener.get().stop();
         // 退出才释放多播锁
         if (multicastLock != null && multicastLock.isHeld()) {
             multicastLock.release();
@@ -649,18 +657,27 @@ public class MainActivity extends Activity {
             graph.setData(hubLabel, hubLevel, names, ids, levels);
         }
 
-        // PC 发来的邀请：弹窗确认
-        if (ReceiverService.sInvitePending && !inviteDialogShowing) {
+        // 对端发来的邀请：弹窗确认（同意后要真的建立连接）
+        if (InviteListener.sInvitePending && !inviteDialogShowing) {
             inviteDialogShowing = true;
-            ReceiverService.sInvitePending = false;
-            final String name = ReceiverService.sInviteName;
+            InviteListener.sInvitePending = false;
+            final String name = InviteListener.sInviteName;
+            final String ip = InviteListener.sInviteIp;
+            final int port = InviteListener.sInvitePort > 0 ? InviteListener.sInvitePort : 47000;
+
             new AlertDialog.Builder(this)
                     .setTitle("连接请求")
-                    .setMessage(name + " 请求把声音送到这里")
+                    .setMessage(name + "（" + ip + "）希望本机把声音送过去")
                     .setPositiveButton("同意", new android.content.DialogInterface.OnClickListener() {
                         @Override
                         public void onClick(android.content.DialogInterface dialog, int which) {
-                            Toast.makeText(MainActivity.this, "已同意", Toast.LENGTH_SHORT).show();
+                            Discovery.Device d = new Discovery.Device();
+                            d.name = name;
+                            d.ip = ip;
+                            d.audioPort = port;
+                            d.canSend = true;
+                            d.canReceive = true;
+                            pickRemoteHub(d);
                         }
                     })
                     .setNegativeButton("拒绝", null)
