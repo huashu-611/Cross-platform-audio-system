@@ -4,6 +4,7 @@
   "description": "AudioHub 汇聚端图形界面（Electron 壳 + C++ 音频核心）",
   "main": "main.js",
   "license": "Apache-2.0",
+  "author": "AudioHub",
   "scripts": {
     "start": "electron .",
     "start:sandbox-off": "electron . --no-sandbox",
@@ -18,7 +19,7 @@
     "productName": "AudioHub",
     "copyright": "Copyright © 2026 AudioHub",
     "directories": {
-      "output": "release"
+      "output": "dist"
     },
     "files": [
       "main.js",

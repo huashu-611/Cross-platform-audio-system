@@ -11,7 +11,13 @@
 // Transport: Chrome DevTools Protocol (electron --remote-debugging-port). The
 // second device is injected as a raw GRAPH frame over UDP, no phone required.
 //
-// Usage: node tools/ui-e2e.js      (exit 0 = all checks passed)
+// Usage:
+//   node tools/ui-e2e.js                              (开发态：electron.exe + ui/)
+//   node tools/ui-e2e.js 打包后的 exe                    (环境变量 AUDIOHUB_UI_EXE 指到 exe)
+//         例: $env:AUDIOHUB_UI_EXE="ui\dist\AudioHub-便携版.exe"; node tools/ui-e2e.js
+//
+// 打包态验证的是"果壳里的 exe 真的能跑"：界面从 asar 里加载、音频核心从
+// resources/app.asar.unpacked/bin 里启动、CDP 仍能连上。退出码 0 = 全部通过。
 
 'use strict';
 
@@ -25,6 +31,8 @@ const os = require('os');
 const ROOT = path.resolve(__dirname, '..');
 const UI_DIR = path.join(ROOT, 'ui');
 const ELECTRON = path.join(UI_DIR, 'node_modules', 'electron', 'dist', 'electron.exe');
+const UI_EXE = process.env.AUDIOHUB_UI_EXE ? path.resolve(process.env.AUDIOHUB_UI_EXE) : null;
+const PACKAGED = !!UI_EXE;
 const HUB_AUDIO_PORT = 47000;
 const HUB_HTTP_PORT = 4780;
 const DEBUG_PORT = 9333;
@@ -132,12 +140,19 @@ async function waitDebug(cdp, predicate, ms, what) {
 }
 
 async function main() {
-  if (!fs.existsSync(ELECTRON)) throw new Error('electron.exe missing: ' + ELECTRON);
+  if (PACKAGED) {
+    if (!fs.existsSync(UI_EXE)) throw new Error('packaged exe missing: ' + UI_EXE);
+    console.log('==> mode: packaged exe ' + UI_EXE);
+  } else if (!fs.existsSync(ELECTRON)) {
+    throw new Error('electron.exe missing: ' + ELECTRON);
+  }
 
   // Kill leftovers from previous runs so port 47000 is free.
-  try {
-    execFileSync('taskkill', ['/IM', 'audiohub-hub.exe', '/F'], { stdio: 'ignore' });
-  } catch (e) { /* none running */ }
+  for (const name of ['audiohub-hub.exe', 'audiohub-source.exe', 'AudioHub.exe']) {
+    try {
+      execFileSync('taskkill', ['/IM', name, '/F'], { stdio: 'ignore' });
+    } catch (e) { /* none running */ }
+  }
 
   const logPath = path.join(os.tmpdir(), 'audiohub-ui-e2e.log');
   const logStream = fs.createWriteStream(logPath);
@@ -145,15 +160,19 @@ async function main() {
   // （main.js 的 require('electron') 就只能拿到路径），所以启动前必须删掉。
   const childEnv = Object.assign({}, process.env);
   delete childEnv.ELECTRON_RUN_AS_NODE;
-  const electron = spawn(ELECTRON, ['.', '--no-sandbox', '--remote-debugging-port=' + DEBUG_PORT, '--disable-gpu'],
-    { cwd: UI_DIR, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: false });
+  const exe = PACKAGED ? UI_EXE : ELECTRON;
+  const args = PACKAGED
+    ? ['--no-sandbox', '--remote-debugging-port=' + DEBUG_PORT, '--disable-gpu']
+    : ['.', '--no-sandbox', '--remote-debugging-port=' + DEBUG_PORT, '--disable-gpu'];
+  const electron = spawn(exe, args,
+    { cwd: PACKAGED ? path.dirname(exe) : UI_DIR, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: false });
   electron.stdout.pipe(logStream, { end: false });
   electron.stderr.pipe(logStream, { end: false });
   console.log('==> electron pid ' + electron.pid + ' (log: ' + logPath + ')');
 
   let cdp = null;
   try {
-    const target = await waitPageTarget(30000);
+    const target = await waitPageTarget(PACKAGED ? 90000 : 30000);
     cdp = await connect(target.webSocketDebuggerUrl);
     await cdp.send('Runtime.enable', {});
 
@@ -226,8 +245,9 @@ async function main() {
     if (cdp && cdp.ws) { try { cdp.ws.close(); } catch (e) { } }
     try { execFileSync('taskkill', ['/PID', String(electron.pid), '/T', '/F'], { stdio: 'ignore' }); } catch (e) { }
     await sleep(500);
-    try { execFileSync('taskkill', ['/IM', 'audiohub-hub.exe', '/F'], { stdio: 'ignore' }); } catch (e) { }
-    try { execFileSync('taskkill', ['/IM', 'audiohub-source.exe', '/F'], { stdio: 'ignore' }); } catch (e) { }
+    for (const name of ['AudioHub.exe', 'audiohub-hub.exe', 'audiohub-source.exe']) {
+      try { execFileSync('taskkill', ['/IM', name, '/F'], { stdio: 'ignore' }); } catch (e) { }
+    }
     logStream.end();
   }
 

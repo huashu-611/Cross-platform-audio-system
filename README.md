@@ -113,7 +113,7 @@ ctest --test-dir build --output-on-failure
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\build.ps1        # 编译全部 + 跑单测
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\graph-smoke.ps1  # 图谱冒烟：起两个 hub 进程互发 GRAPH，结束自动清理
-node tools\ui-e2e.js                                                       # Electron 界面端到端（需先 cd ui && npm install）
+node tools\ui-e2e.js                                                       # Electron 界面端到端（开发态；打包态设 AUDIOHUB_UI_EXE=ui\dist\AudioHub-便携版.exe）
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\build-apk.ps1    # 重新打包 Android APK
 ```
 
@@ -134,15 +134,21 @@ cmake --build build --config Release
 
 ### 图形界面版（推荐日常用）
 
-Electron 网页壳，比原生控件好看得多（毛玻璃卡片、渐变电平条、自定义滑杆）：
+PC 端的正式交付形态是**一个 exe**：`ui/dist/AudioHub-便携版.exe`（单文件，内含 Electron
+运行时 + C++ 音频核心 + 界面，双击即用，不需要装 Node/npm）。它只是个"果壳"：
+窗口里跑的是本仓库的网页界面，音频仍然是同一套 C++ 核心（打包在 exe 内，启动时释放到
+临时目录运行）。
 
 ```bash
-# 开发态（先 ./build.sh 生成 C++ 核心）
-cd ui && npm install && npm start
+# 拿到 exe（开发者，先 cd ui && npm install）
+cd ui && npm run dist        # 产物：ui/dist/AudioHub-便携版.exe
 
-# 打包成 Windows 便携 exe / 安装包
-cd ui && npm run dist        # 产物在 ui/release/
+# 开发态调试界面（不打包，改完代码刷新即可）
+cd ui && npm start
 ```
+
+> 虚拟机 / 无 GPU 环境双击便携版若起不来，给 exe 加参数
+> `--no-sandbox --disable-gpu` 再启动（正常 PC 不需要）。
 
 > **两个环境坑（都会以莫名其妙的错误呈现）**
 >
@@ -151,7 +157,8 @@ cd ui && npm run dist        # 产物在 ui/release/
 >    表现是 `Cannot read properties of undefined (reading 'whenReady')`。
 >    先 `unset ELECTRON_RUN_AS_NODE` 再启动。main.js 里已加针对性报错。
 > 2. 虚拟机 / 无 GPU 环境里 Chromium 的 GPU 进程会崩溃，整个应用起不来。
->    开发态用 `npm run start:sandbox-off`（即 `electron . --no-sandbox`）。
+>    开发态用 `npm run start:sandbox-off`（即 `electron . --no-sandbox`）；
+>    打包好的便携版 exe 则加参数 `--no-sandbox --disable-gpu` 启动。
 >    正式打包产物在正常 PC 上不需要这个参数。
 
 双击后自动做三件事：启动 C++ 音频核心、起本地 HTTP 控制口、打开界面窗口。
