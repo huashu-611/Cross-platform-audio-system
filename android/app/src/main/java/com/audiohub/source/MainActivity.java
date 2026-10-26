@@ -60,6 +60,13 @@ public class MainActivity extends Activity {
 
     private final Handler poller = new Handler(Looper.getMainLooper());
     private Discovery discovery;
+
+    // 必须由字段持有：MulticastLock 的 finalize 会释放锁。
+    // 只在 onCreate 里用局部变量 acquire，方法返回后这个对象就没人引用，
+    // GC 一回收就把锁放了 —— 之后手机静默收不到任何广播，
+    // 表现为"扫描不到任何设备"，而且完全没有任何报错。
+    private android.net.wifi.WifiManager.MulticastLock multicastLock;
+    private android.net.wifi.WifiManager wifiManager;
     private boolean inviteDialogShowing;
 
     /** 汇聚端：null = 本机（默认，因为电脑跑着汇聚端）；否则是那台设备。 */
@@ -93,13 +100,12 @@ public class MainActivity extends Activity {
             }
         });
 
-        android.net.wifi.WifiManager wm = (android.net.wifi.WifiManager)
+        wifiManager = (android.net.wifi.WifiManager)
                 getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-        if (wm != null) {
-            android.net.wifi.WifiManager.MulticastLock lock =
-                    wm.createMulticastLock("audiohub");
-            lock.setReferenceCounted(false);
-            lock.acquire();
+        if (wifiManager != null) {
+            multicastLock = wifiManager.createMulticastLock("audiohub");
+            multicastLock.setReferenceCounted(false);
+            multicastLock.acquire();   // 字段持有，不会被 GC 释放
         }
         discovery = new Discovery();
         discovery.setListener(new Discovery.Listener() {
@@ -123,6 +129,11 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         poller.removeCallbacksAndMessages(null);
         if (discovery != null) discovery.stop();
+        // 退出才释放多播锁
+        if (multicastLock != null && multicastLock.isHeld()) {
+            multicastLock.release();
+            multicastLock = null;
+        }
         super.onDestroy();
     }
 
@@ -583,9 +594,13 @@ public class MainActivity extends Activity {
         peerList.removeAllViews();
         if (peers.isEmpty()) {
             TextView tv = new TextView(this);
-            tv.setText("正在扫描附近设备…");
+            // 把本机 IP 显示出来：扫不到时最常见的原因是两台设备不在同一网段
+            // （比如电脑插网线 10.x，手机连 WiFi 192.168.x）
+            tv.setText("正在扫描附近设备…\n本机 IP " + localIp()
+                    + "，请确认电脑与本机在同一个 WiFi / 网段");
             tv.setTextSize(12.5f);
             tv.setTextColor(COLOR_DIM);
+            tv.setLineSpacing(0, 1.3f);
             tv.setPadding(dp(2), dp(6), 0, dp(6));
             peerList.addView(tv);
             return;

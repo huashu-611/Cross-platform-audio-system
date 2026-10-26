@@ -278,6 +278,10 @@ int main(int argc, char** argv) {
                          if (audiohub::JsonFindBool(body, "on", &b)) hub.SetAutoAccept(b);
                          return "{\"ok\":true}";
                        }
+                       if (method == "POST" && path == "/api/refresh") {
+                         hub.RefreshDiscovery();
+                         return "{\"ok\":true}";
+                       }
                        if (method == "POST" && path == "/api/invite") {
                          std::string sip;
                          double v = 0;

@@ -189,11 +189,15 @@ struct HubCore::Impl {
     }
     // 两端能力完全一致：都能采音也都能放音。"发送/接收"只是指
     // 建立连接时谁发起，不是角色——汇聚端是用户在界面里选的。
-    if (opts.advertise) {
-      discovery->StartAdvertise(display_name, local_ip_for_invite, port,
-                                http_port_for_discovery, true, true);
-    } else {
-      discovery->StartBrowse();
+    const bool discovery_ok =
+        opts.advertise
+            ? discovery->StartAdvertise(display_name, local_ip_for_invite, port,
+                                        http_port_for_discovery, true, true)
+            : discovery->StartBrowse();
+    if (!discovery_ok) {
+      // 不能静默：发现不可用意味着"扫不到设备"，必须让用户知道原因
+      Emit("[!] 自动发现不可用：端口 47300 被占用（可能有另一个 AudioHub 实例在跑）。"
+           "可以手动填写对方 IP 继续使用。");
     }
 
     running.store(true);

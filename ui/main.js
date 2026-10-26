@@ -142,6 +142,10 @@ app.whenReady().then(() => {
   pollTimer = setInterval(fetchState, 200)
   fetchState()
 
+  // 每 5 秒让音频核心广播一轮探测：只靠对端每秒一次的信标，
+  // 丢一两个包设备就会从列表里"闪没"，体感像搜不到。
+  setInterval(() => httpRequest('POST', '/api/refresh', {}), 5000)
+
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })

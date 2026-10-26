@@ -177,13 +177,13 @@ public final class Discovery {
     private void handle(String line, String fromIp) {
         if (!line.startsWith(MAGIC)) return;
         String[] parts = line.split("\\|", -1);
-        if (parts.length < 7) return;
-        // 手机端不广播信标（省电），但收到 WHO 时要立刻回一帧，
-        // 这样 PC 也能发现本机，不必等下个广播周期
-        if ("WHO".equals(parts[2])) {
+        // WHO 帧只有 3 段（AUDIOHUB|1|WHO），必须在长度检查之前判断，
+        // 否则探测帧会被当成残缺信标直接丢掉——PC 就永远发现不了手机。
+        if (parts.length >= 3 && "WHO".equals(parts[2])) {
             respondToWho(fromIp);
             return;
         }
+        if (parts.length < 7) return;
 
         Device d = new Device();
         d.canSend = parts[2].indexOf('S') >= 0;
