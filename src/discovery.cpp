@@ -4,6 +4,7 @@
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 
 #include <algorithm>
 #include <chrono>
@@ -15,6 +16,7 @@
 
 #ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
 #endif
 
 namespace audiohub {
@@ -23,6 +25,41 @@ namespace {
 constexpr uint16_t kDiscoveryPort = 47300;
 constexpr const char* kMagic = "AUDIOHUB";
 constexpr int kPeerTimeoutMs = 5000;
+
+// 枚举所有活动网卡的"定向广播地址"。
+//
+// 为什么不能只发 255.255.255.255：sendto(INADDR_BROADCAST) 只从"默认路由"
+// 那一张网卡出去。装了 VMware / WSL / 虚拟网卡的机器上，默认网卡往往是
+// 那张虚拟网卡（本机就是 192.168.24.1），于是真实 WiFi 网段里的手机
+// 一帧都收不到——表现为"扫描不到任何设备"。
+// 逐网段各发一份才能覆盖所有同网段的设备。
+std::vector<uint32_t> DirectedBroadcasts() {
+  std::vector<uint32_t> out;
+  ULONG size = 16384;
+  std::vector<BYTE> buf(size);
+  PIP_ADAPTER_ADDRESSES addrs = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data());
+  if (GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                                        GAA_FLAG_SKIP_DNS_SERVER, nullptr, addrs, &size) != NO_ERROR) {
+    return out;
+  }
+  for (PIP_ADAPTER_ADDRESSES a = addrs; a != nullptr; a = a->Next) {
+    if (a->OperStatus != IfOperStatusUp) continue;
+    for (PIP_ADAPTER_UNICAST_ADDRESS ua = a->FirstUnicastAddress; ua != nullptr; ua = ua->Next) {
+      if (ua->Address.lpSockaddr == nullptr) continue;
+      if (ua->Address.lpSockaddr->sa_family != AF_INET) continue;
+      const auto* sa = reinterpret_cast<const sockaddr_in*>(ua->Address.lpSockaddr);
+      const uint32_t ip = ntohl(sa->sin_addr.s_addr);
+      if ((ip >> 24) == 127) continue;   // 回环跳过
+      const uint32_t prefix = ua->OnLinkPrefixLength;
+      const uint32_t mask = (prefix == 0 || prefix > 32) ? 0xFFFFFFFFu
+                                                        : (0xFFFFFFFFu << (32 - prefix));
+      out.push_back((ip & mask) | ~mask);
+    }
+  }
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+  return out;
+}
 
 uint64_t NowMs() {
   return static_cast<uint64_t>(
@@ -59,27 +96,57 @@ struct Discovery::Impl {
   std::map<std::string, Peer> peers;  // key = ip:audio_port
 
   void SendBeacon() {
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(kDiscoveryPort);
-    addr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
     const std::string f = BuildBeacon(local_ip, audio_port, http_port, advertise_can_send,
                                       advertise_can_receive, name);
+    // 逐个网段的定向广播 + 兜底的全网广播
+    for (const uint32_t bcast : DirectedBroadcasts()) {
+      sockaddr_in addr{};
+      addr.sin_family = AF_INET;
+      addr.sin_port = htons(kDiscoveryPort);
+      addr.sin_addr.s_addr = htonl(bcast);
+      ::sendto(sock, f.data(), static_cast<int>(f.size()), 0, reinterpret_cast<sockaddr*>(&addr),
+               sizeof(addr));
+    }
+    sockaddr_in all{};
+    all.sin_family = AF_INET;
+    all.sin_port = htons(kDiscoveryPort);
+    all.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    ::sendto(sock, f.data(), static_cast<int>(f.size()), 0, reinterpret_cast<sockaddr*>(&all),
+             sizeof(all));
+  }
+
+  // 直接回给探测方（单播），不等下一个广播周期
+  void SendBeaconTo(const std::string& ip, uint16_t port) {
+    if (ip.empty() || port == 0) return;
+    const std::string f = BuildBeacon(local_ip, audio_port, http_port, advertise_can_send,
+                                      advertise_can_receive, name);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    ::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
     ::sendto(sock, f.data(), static_cast<int>(f.size()), 0, reinterpret_cast<sockaddr*>(&addr),
              sizeof(addr));
   }
 
   void SendProbe() {
     const std::string f = std::string(kMagic) + "|1|WHO\n";
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(kDiscoveryPort);
-    addr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-    ::sendto(sock, f.data(), static_cast<int>(f.size()), 0, reinterpret_cast<sockaddr*>(&addr),
-             sizeof(addr));
+    for (const uint32_t bcast : DirectedBroadcasts()) {
+      sockaddr_in addr{};
+      addr.sin_family = AF_INET;
+      addr.sin_port = htons(kDiscoveryPort);
+      addr.sin_addr.s_addr = htonl(bcast);
+      ::sendto(sock, f.data(), static_cast<int>(f.size()), 0, reinterpret_cast<sockaddr*>(&addr),
+               sizeof(addr));
+    }
+    sockaddr_in all{};
+    all.sin_family = AF_INET;
+    all.sin_port = htons(kDiscoveryPort);
+    all.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    ::sendto(sock, f.data(), static_cast<int>(f.size()), 0, reinterpret_cast<sockaddr*>(&all),
+             sizeof(all));
   }
 
-  void HandleFrame(const std::string& line, const std::string& from_ip) {
+  void HandleFrame(const std::string& line, const std::string& from_ip, uint16_t from_port) {
     // 拆 | 分隔的字段；显示名是最后一段，所以可以含任意字符（含空格和 | 之外的东西）
     std::vector<std::string> parts;
     size_t start = 0;
@@ -92,11 +159,18 @@ struct Discovery::Impl {
       parts.push_back(line.substr(start, pos - start));
       start = pos + 1;
     }
-    if (parts.size() < 7 || parts[0] != kMagic) return;
+    if (parts.size() < 3 || parts[0] != kMagic) return;
+
+    // 探测帧：立刻单播回一帧信标，让点"刷新"或刚打开的应用马上看到本机
+    // （否则要等下一个 1 秒广播周期，体感上像"扫不到"）
+    if (parts[2] == "WHO") {
+      SendBeaconTo(from_ip, from_port);
+      return;
+    }
+    if (parts.size() < 7) return;
 
     // parts[2] 是角色串，形如 "SR" / "S-" / "-R"
     const std::string& r = parts[2];
-    if (r == "WHO") return;
 
     Peer peer;
     peer.can_send = r.find('S') != std::string::npos;
@@ -133,7 +207,7 @@ struct Discovery::Impl {
       while (true) {
         const size_t pos = data.find('\n', start);
         const std::string line = data.substr(start, pos == std::string::npos ? std::string::npos : pos - start);
-        if (!line.empty()) HandleFrame(line, ip_text);
+        if (!line.empty()) HandleFrame(line, ip_text, from.sin_port);
         if (pos == std::string::npos) break;
         start = pos + 1;
       }

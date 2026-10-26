@@ -63,8 +63,10 @@ public final class Discovery {
             socket.setBroadcast(true);
             socket.setSoTimeout(500);
         } catch (Exception e) {
+            lastError = "发现端口 " + DISCOVERY_PORT + " 绑定失败（可能被其它实例占用）";
             return false;
         }
+        lastError = null;
         running = true;
         // 不能用方法引用：android.jar 里没有 java.lang.invoke.LambdaMetafactory，
 // javac 阶段就编不过（android-native-dev/主工程注释里都记过这个坑）
@@ -75,6 +77,26 @@ public final class Discovery {
         thread.start();
         return true;
     }
+
+    /** 主动发一帧 WHO，让所有设备立刻回信标（不用等它下一次广播）。 */
+    public void probe() {
+        if (!running || socket == null) return;
+        try {
+            final byte[] data = (MAGIC + "|1|WHO\n").getBytes(
+                    java.nio.charset.StandardCharsets.UTF_8);
+            socket.send(new DatagramPacket(data, data.length,
+                    java.net.InetAddress.getByName("255.255.255.255"), DISCOVERY_PORT));
+        } catch (Exception ignored) {
+        }
+    }
+
+    /**
+     * 启动失败的原因。为空表示正常。
+     * 常见原因：端口被别的实例占着。
+     */
+    public String lastError() { return lastError; }
+
+    private volatile String lastError;
 
     public void stop() {
         running = false;
@@ -118,11 +140,50 @@ public final class Discovery {
         }
     }
 
+    /** 收到探测帧：直接单播回一帧信标。 */
+    private void respondToWho(String toIp) {
+        try {
+            final String beacon = MAGIC + "|1|SR|47000|0|" + localIp() + "|"
+                    + android.os.Build.MODEL + "\n";
+            final byte[] data = beacon.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            final DatagramPacket pkt = new DatagramPacket(data, data.length,
+                    java.net.InetAddress.getByName(toIp), DISCOVERY_PORT);
+            final DatagramSocket tmp = new DatagramSocket();
+            tmp.send(pkt);
+            tmp.close();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private static String localIp() {
+        try {
+            final java.util.Enumeration<java.net.NetworkInterface> nis =
+                    java.net.NetworkInterface.getNetworkInterfaces();
+            while (nis.hasMoreElements()) {
+                final java.util.Enumeration<java.net.InetAddress> addrs =
+                        nis.nextElement().getInetAddresses();
+                while (addrs.hasMoreElements()) {
+                    final java.net.InetAddress a = addrs.nextElement();
+                    if (!a.isLoopbackAddress() && a instanceof java.net.Inet4Address) {
+                        return a.getHostAddress();
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return "";
+    }
+
     private void handle(String line, String fromIp) {
         if (!line.startsWith(MAGIC)) return;
         String[] parts = line.split("\\|", -1);
         if (parts.length < 7) return;
-        if ("WHO".equals(parts[2])) return;   // 探测帧由广播方处理
+        // 手机端不广播信标（省电），但收到 WHO 时要立刻回一帧，
+        // 这样 PC 也能发现本机，不必等下个广播周期
+        if ("WHO".equals(parts[2])) {
+            respondToWho(fromIp);
+            return;
+        }
 
         Device d = new Device();
         d.canSend = parts[2].indexOf('S') >= 0;

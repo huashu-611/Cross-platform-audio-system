@@ -111,7 +111,12 @@ public class MainActivity extends Activity {
                 });
             }
         });
-        discovery.start();
+        if (!discovery.start()) {
+            Toast.makeText(this, discovery.lastError(), Toast.LENGTH_LONG).show();
+        } else {
+            // 进来就发一帧探测，让对端立刻回信标，不用等它下一次广播
+            discovery.probe();
+        }
     }
 
     @Override

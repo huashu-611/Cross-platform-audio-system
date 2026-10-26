@@ -30,9 +30,10 @@ $CXX $FLAGS \
 if [ "${WIN32:-1}" = "1" ]; then
   echo "==> Windows 应用（WASAPI）"
   for app in hub source; do
+    # -liphlpapi：发现模块要用 GetAdaptersAddresses 枚举各网卡的广播地址
     $CXX $FLAGS -Iplatform/win \
       apps/${app}_main.cpp platform/win/wasapi_audio.cpp platform/win/media_file.cpp \
-      $CORE -lole32 -lws2_32 -lmfplat -lmfreadwrite -lmfuuid \
+      $CORE -lole32 -lws2_32 -liphlpapi -lmfplat -lmfreadwrite -lmfuuid \
       -o "$OUT/audiohub-${app}.exe"
   done
 
