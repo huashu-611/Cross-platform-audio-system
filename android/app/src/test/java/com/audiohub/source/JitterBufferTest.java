@@ -66,14 +66,15 @@ public class JitterBufferTest {
         System.out.printf("[卡顿恢复] 断流期间欠载 +%d，恢复后再 +%d，最终水位 %.0f ms%n",
                 underAfterStall - underBefore, grew, jb.occupancyFrames() / 48.0);
         // 恢复后不应该继续大量欠载（重新对齐应生效）
-        final boolean ok = grew < 4800;   // 少于 100ms 的残余
+        // 恢复后应该只多一次预填（100ms = 4800 帧），不该持续欠载
+        final boolean ok = grew <= 4800 + 240;
         return ok;
     }
 
     private static boolean runCase(String label, long startPos) {
         final int packetFrames = 240;                 // 5 ms
         final int ticks = 48000 / packetFrames;       // 1 秒
-        final int prefill = 60 * 48;                  // 与 PREFILL_MS 一致
+        final int prefill = 100 * 48;                 // 与 JitterBuffer.PREFILL_MS 一致
 
         final JitterBuffer jb = new JitterBuffer(2, 48000 / 4);
         long written = 0;

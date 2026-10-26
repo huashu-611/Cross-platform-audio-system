@@ -18,9 +18,8 @@ package com.audiohub.source;
  */
 final class JitterBuffer {
 
-    private static final int PREFILL_MS = 60;      // 起始预留，抗网络抖动
-    private static final int HIGH_MS = 240;        // 超过它开始抽帧
-    private static final int LOW_MS = 50;          // 低于它开始补帧
+    private static final int PREFILL_MS = 100;     // 起始预留，抗网络抖动（含发包成簇）
+    private static final int MAX_STEP_ADJUST = 4;  // 每块最多多/少消费几帧（4/240 ≈ 1.7%）
     // 连续这么多块（约 200 ms）一帧数据都没有，就认为时间轴已经跑偏，
     // 重新对齐到下一个包的序号上。没有这个机制，一次卡顿之后
     // 读指针会永远跑在写指针前面，欠载数一路涨（实测到 38573 帧）。
@@ -91,7 +90,12 @@ final class JitterBuffer {
                 return;
             }
 
-            // 漂移补偿：按缓冲水位决定这次多消费还是少消费一帧
+            // 漂移补偿：按"实际水位与目标水位的偏差"按比例调整消费速度。
+            //
+            // 之前只是"低于 45ms 少消费一帧 / 高于 180ms 多消费一帧"，
+            // 上限 0.4%，跟不住实际晶振偏差与发包成簇带来的持续供需差，
+            // 于是水位越掉越低、欠载一路上涨。
+            // 现在按偏差大小连续调整，最多 ±4 帧/块（约 ±1.7%）。
             final long occ = highestWritten - readPos;
 
             // 长时间完全没有数据：时间轴已经对不上了，重新对齐。
@@ -107,12 +111,12 @@ final class JitterBuffer {
                 starveTicks = 0;
             }
 
-            int step = frames;
-            if (occ > HIGH_MS * 48L) {
-                step = frames + 1;              // 偏高：多消费一帧（轻微加快）
-            } else if (occ < LOW_MS * 48L) {
-                step = Math.max(1, frames - 1); // 偏低：少消费一帧（轻微放慢）
-            }
+            final long target = (long) PREFILL_MS * 48;
+            final long err = occ - target;                    // >0 偏多，<0 偏少
+            int adjust = (int) (err / 840);                   // 约 17.5ms 偏差 → 1 帧
+            if (adjust > MAX_STEP_ADJUST) adjust = MAX_STEP_ADJUST;
+            if (adjust < -MAX_STEP_ADJUST) adjust = -MAX_STEP_ADJUST;
+            int step = Math.max(1, frames + adjust);
 
             final int cap = scratch.length / channels;
             final int n = Math.min(step, cap);

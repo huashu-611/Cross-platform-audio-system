@@ -268,12 +268,23 @@ public class ReceiverService extends Service {
             }
             sStreamCount = streams.size();
 
-            // 软限幅，防止多路叠加爆音
+            // 软限幅：**与 C++ 端 SoftLimitSample 完全同一个公式**。
+            //   threshold + headroom * tanh((|x| - threshold) / headroom)
+            //
+            // 这里原来写的是 0.85 - 0.15/(1+8x)：代入 x=0 得 0.70，
+            // 也就是"刚过 0.85 就被砸到 0.70"，函数在阈值处既不连续
+            // 也不单调。音乐里大量样本超过 0.85，每个都被这样砍一刀，
+            // 听感就是刺耳的电音 / 破音。
+            // （C++ 端一直是对的，是照着移植到 Java 时写错了。）
+            final float kKnee = 0.85f;
+            final float kHeadroom = 1.0f - kKnee;
             for (int i = 0; i < mix.length; ++i) {
-                float v = mix[i];
-                if (v > 0.85f) v = 0.85f - (1f / (1f + (v - 0.85f) * 8f)) * 0.15f;
-                else if (v < -0.85f) v = -0.85f + (1f / (1f + (-v - 0.85f) * 8f)) * 0.15f;
-                mix[i] = v;
+                final float x = mix[i];
+                final float a = Math.abs(x);
+                if (a <= kKnee) continue;      // 阈值以下原样保留
+                final float shaped = kKnee + kHeadroom
+                        * (float) Math.tanh((a - kKnee) / kHeadroom);
+                mix[i] = x < 0 ? -shaped : shaped;
             }
 
             if (track != null) {
