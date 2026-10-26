@@ -54,6 +54,10 @@ public class MainActivity extends Activity {
     private TextView scanHint;
     // 手动添加 / 上次连接的设备（广播被拦时靠它们）
     private final java.util.List<Discovery.Device> manualPeers = new java.util.ArrayList<>();
+    // 控制界面里的"新设备"区（会话进行中也得能接人）
+    private LinearLayout ctrlReqList;
+    private LinearLayout connectReqList;
+    private LinearLayout ctrlPeerList;
 
     private HubGraphView graph;
     private LinearLayout volPanel;
@@ -239,6 +243,10 @@ public class MainActivity extends Activity {
         screenConnect = new LinearLayout(this);
         screenConnect.setOrientation(LinearLayout.VERTICAL);
 
+        connectReqList = new LinearLayout(this);
+        connectReqList.setOrientation(LinearLayout.VERTICAL);
+        screenConnect.addView(connectReqList);
+
         TextView connectHint = sub("先建立连接，再在控制界面里指定谁当汇聚端");
         connectHint.setPadding(0, 0, 0, dp(10));
         screenConnect.addView(connectHint);
@@ -365,6 +373,34 @@ public class MainActivity extends Activity {
         volRow.addView(mute);
         volPanel.addView(volRow);
         screenControl.addView(volPanel);
+
+        // 会话进行中也可能有新设备接入：待确认请求 + 添加设备入口
+        ctrlReqList = new LinearLayout(this);
+        ctrlReqList.setOrientation(LinearLayout.VERTICAL);
+        screenControl.addView(ctrlReqList);
+
+        LinearLayout ctrlDevRow = new LinearLayout(this);
+        ctrlDevRow.setOrientation(LinearLayout.HORIZONTAL);
+        ctrlDevRow.setGravity(Gravity.CENTER_VERTICAL);
+        TextView ctrlDevLabel = sectLabel("新设备");
+        ctrlDevLabel.setLayoutParams(new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        ctrlDevRow.addView(ctrlDevLabel);
+        Button ctrlAdd = textButton("添加设备", COLOR_ACCENT);
+        ctrlAdd.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                ctrlPeerList.setVisibility(
+                        ctrlPeerList.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE);
+            }
+        });
+        ctrlDevRow.addView(ctrlAdd);
+        screenControl.addView(ctrlDevRow);
+
+        ctrlPeerList = new LinearLayout(this);
+        ctrlPeerList.setOrientation(LinearLayout.VERTICAL);
+        ctrlPeerList.setVisibility(View.GONE);
+        screenControl.addView(ctrlPeerList);
 
         // 汇聚端设定：连接建立之后才出现（方案第 4.2 节）
         LinearLayout hubBar = card();
@@ -657,6 +693,14 @@ public class MainActivity extends Activity {
             graph.setData(hubLabel, hubLevel, names, ids, levels);
         }
 
+        // 待确认的接入请求：两块屏都渲染，会话进行中也能接人
+        final java.util.List<InviteListener.Pending> pending;
+        synchronized (InviteListener.sPending) {
+            pending = new java.util.ArrayList<>(InviteListener.sPending);
+        }
+        if (connectReqList != null) renderPending(connectReqList, pending);
+        if (ctrlReqList != null) renderPending(ctrlReqList, pending);
+
         // 对端发来的邀请：弹窗确认（同意后要真的建立连接）
         if (InviteListener.sInvitePending && !inviteDialogShowing) {
             inviteDialogShowing = true;
@@ -770,8 +814,41 @@ public class MainActivity extends Activity {
         manualPeers.add(d);
     }
 
+    /** 待确认请求：连接界面和控制界面各渲染一份。 */
+    private void renderPending(LinearLayout container, List<InviteListener.Pending> pending) {
+        container.removeAllViews();
+        if (pending.isEmpty()) return;
+        for (final InviteListener.Pending p : pending) {
+            LinearLayout row = card();
+            TextView who = new TextView(this);
+            who.setText(p.name + "  ·  " + p.ip);
+            who.setTextSize(14);
+            who.setTextColor(COLOR_TEXT);
+            row.addView(who);
+            row.addView(sub("请求把声音送到本机"));
+            LinearLayout btns = new LinearLayout(this);
+            btns.setOrientation(LinearLayout.HORIZONTAL);
+            btns.setPadding(0, dp(8), 0, 0);
+            Button ok = textButton("同意", COLOR_ACCENT);
+            ok.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) { InviteListener.accept(p.streamId); }
+            });
+            Button no = textButton("拒绝", COLOR_WARN);
+            no.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) { InviteListener.reject(p.streamId); }
+            });
+            btns.addView(ok);
+            btns.addView(no);
+            row.addView(btns);
+            container.addView(row);
+        }
+    }
+
     private void renderPeers(List<Discovery.Device> autoPeers) {
         peerList.removeAllViews();
+        if (ctrlPeerList != null) ctrlPeerList.removeAllViews();
         // 手动 / 上次连接的设备排在前面（广播被拦时只有它们能用）
         final java.util.List<Discovery.Device> peers =
                 new java.util.ArrayList<>(manualPeers);
@@ -793,6 +870,14 @@ public class MainActivity extends Activity {
             tv.setLineSpacing(0, 1.3f);
             tv.setPadding(dp(2), dp(6), 0, dp(6));
             peerList.addView(tv);
+            if (ctrlPeerList != null) {
+                TextView t2 = new TextView(this);
+                t2.setText(tv.getText());
+                t2.setTextSize(12.5f);
+                t2.setTextColor(COLOR_DIM);
+                t2.setPadding(dp(2), dp(6), 0, dp(6));
+                ctrlPeerList.addView(t2);
+            }
             return;
         }
         for (final Discovery.Device d : peers) {
@@ -836,7 +921,55 @@ public class MainActivity extends Activity {
             });
             row.addView(connect);
             peerList.addView(row);
+            if (ctrlPeerList != null) {
+                LinearLayout copy = buildPeerRow(d, false);
+                ctrlPeerList.addView(copy);
+            }
         }
+    }
+
+    /** 构建一行设备卡片。primary=true 时是所有交互按钮齐全的版本。 */
+    private LinearLayout buildPeerRow(final Discovery.Device d, boolean primary) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(12), dp(10), dp(8), dp(10));
+        LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        rp.setMargins(0, 0, 0, dp(8));
+        row.setLayoutParams(rp);
+        row.setBackgroundColor(COLOR_CARD);
+
+        LinearLayout info = new LinearLayout(this);
+        info.setOrientation(LinearLayout.VERTICAL);
+        info.setLayoutParams(new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        TextView name = new TextView(this);
+        name.setText(d.name + "  ·  " + d.roleText());
+        name.setTextSize(13.5f);
+        name.setTextColor(COLOR_TEXT);
+        info.addView(name);
+        TextView addr = new TextView(this);
+        addr.setText(d.ip + ":" + d.audioPort);
+        addr.setTextSize(11.5f);
+        addr.setTextColor(COLOR_DIM);
+        info.addView(addr);
+        row.addView(info);
+
+        Button invite = textButton("邀请", COLOR_ACCENT);
+        invite.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) { invitePeer(d); }
+        });
+        row.addView(invite);
+
+        Button connect = textButton("连入", COLOR_ACCENT);
+        connect.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) { pickRemoteHub(d); }
+        });
+        row.addView(connect);
+        return row;
     }
 
     private void invitePeer(final Discovery.Device d) {

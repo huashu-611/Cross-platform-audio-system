@@ -21,6 +21,24 @@ public final class InviteListener {
     public static final int PORT_OFFSET = 2;
 
     // 界面轮询的快照
+    /** 一条待确认的接入请求（别人要把声音送到本机）。 */
+    public static final class Pending {
+        public final int streamId;
+        public final String name;
+        public final String ip;
+        public final int port;
+        Pending(int streamId, String name, String ip, int port) {
+            this.streamId = streamId;
+            this.name = name;
+            this.ip = ip;
+            this.port = port;
+        }
+    }
+
+    /** 待确认列表。界面轮询后渲染成"同意/拒绝"。 */
+    public static final java.util.List<Pending> sPending =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<Pending>());
+
     public static volatile boolean sInvitePending = false;
     public static volatile String sInviteName = "";
     public static volatile String sInviteIp = "";
@@ -82,6 +100,43 @@ public final class InviteListener {
         }
     }
 
+    /** 同意某条接入请求：回 CONN-ACK。 */
+    public static void accept(int streamId) {
+        Pending target = null;
+        synchronized (sPending) {
+            for (Pending p : sPending) {
+                if (p.streamId == streamId) { target = p; break; }
+            }
+            if (target != null) sPending.remove(target);
+        }
+        if (target == null) return;
+        send(target, "CONN-ACK|" + selfName + "|" + streamId + "\n");
+    }
+
+    /** 拒绝某条接入请求：回 CONN-NAK。 */
+    public static void reject(int streamId) {
+        Pending target = null;
+        synchronized (sPending) {
+            for (Pending p : sPending) {
+                if (p.streamId == streamId) { target = p; break; }
+            }
+            if (target != null) sPending.remove(target);
+        }
+        if (target == null) return;
+        send(target, "CONN-NAK|" + selfName + "|" + streamId + "\n");
+    }
+
+    private static void send(Pending p, String text) {
+        final InviteListener self = instance;
+        if (self == null || self.socket == null) return;
+        try {
+            final byte[] data = text.getBytes(StandardCharsets.UTF_8);
+            self.socket.send(new DatagramPacket(data, data.length,
+                    InetAddress.getByName(p.ip), p.port));
+        } catch (Exception ignored) {
+        }
+    }
+
     private void loop() {
         final byte[] buf = new byte[1024];
         while (running) {
@@ -122,13 +177,23 @@ public final class InviteListener {
                 sInvitePort = port;
                 sInvitePending = true;
             } else if ("CONN-REQ".equals(parts[0]) && parts.length >= 3) {
-                // 别的设备要把声音送到本机：本机当汇聚端，回 ACK
-                final String ack = "CONN-ACK|" + selfName + "|" + parts[2] + "\n";
+                // 别的设备要把声音送到本机：不能自动同意，
+                // 与学生方案一致——建立连接必须由接收方明确确认。
+                final int streamId;
                 try {
-                    final byte[] data = ack.getBytes(StandardCharsets.UTF_8);
-                    socket.send(new DatagramPacket(data, data.length,
-                            InetAddress.getByName(fromIp), fromPort));
-                } catch (Exception ignored) {
+                    streamId = Integer.parseInt(parts[2]);
+                } catch (NumberFormatException e) {
+                    continue;
+                }
+                synchronized (sPending) {
+                    boolean dup = false;
+                    for (Pending p : sPending) {
+                        if (p.streamId == streamId && p.ip.equals(fromIp)) { dup = true; break; }
+                    }
+                    if (!dup) {
+                        sPending.add(new Pending(streamId, parts.length >= 2 ? parts[1] : fromIp,
+                                fromIp, fromPort));
+                    }
                 }
             }
         }

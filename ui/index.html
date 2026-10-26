@@ -63,6 +63,26 @@
         <button class="mute" id="volMute">静音</button>
       </div>
     </div>
+    <!-- 会话进行中也可能有新设备接入 -->
+    <div id="ctrlReq"></div>
+
+    <div class="sectrow">
+      <div class="sect" style="margin:0">新设备</div>
+      <button class="scanbtn" id="ctrlAddBtn">添加设备</button>
+    </div>
+    <div id="ctrlAddPanel" style="display:none">
+      <div class="hint">扫描附近，或直接填对端地址。会话不会中断。</div>
+      <div class="grid" id="ctrlPeers"></div>
+      <div class="grid">
+        <div class="card" style="max-width:560px">
+          <div class="row">
+            <input class="ipinput" id="ctrlIp" placeholder="例如 10.135.7.56:47000">
+            <button class="btn go" id="ctrlInviteBtn">邀请</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="hubbar">
       <span class="hublabel">汇聚端</span>
       <select id="hubSelect" class="hubselect"></select>
