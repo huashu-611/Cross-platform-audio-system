@@ -19,8 +19,12 @@ package com.audiohub.source;
 final class JitterBuffer {
 
     private static final int PREFILL_MS = 60;      // 起始预留，抗网络抖动
-    private static final int HIGH_MS = 180;        // 超过它开始抽帧
-    private static final int LOW_MS = 45;          // 低于它开始补帧
+    private static final int HIGH_MS = 240;        // 超过它开始抽帧
+    private static final int LOW_MS = 50;          // 低于它开始补帧
+    // 连续这么多块（约 200 ms）一帧数据都没有，就认为时间轴已经跑偏，
+    // 重新对齐到下一个包的序号上。没有这个机制，一次卡顿之后
+    // 读指针会永远跑在写指针前面，欠载数一路涨（实测到 38573 帧）。
+    private static final int REALIGN_TICKS = 40;
 
     private final short[] data;
     private final boolean[] valid;
@@ -32,6 +36,7 @@ final class JitterBuffer {
     private long highestWritten;
     private boolean started;
 
+    private int starveTicks;
     private long underrunFrames;
     private long droppedFrames;
     private long duplicatedFrames;
@@ -88,6 +93,20 @@ final class JitterBuffer {
 
             // 漂移补偿：按缓冲水位决定这次多消费还是少消费一帧
             final long occ = highestWritten - readPos;
+
+            // 长时间完全没有数据：时间轴已经对不上了，重新对齐。
+            // 否则读指针会一直跑在写指针前面，每个块都是欠载。
+            if (occ <= 0) {
+                if (++starveTicks > REALIGN_TICKS) {
+                    started = false;      // 下一个包会重新建立 60ms 预填
+                    starveTicks = 0;
+                    java.util.Arrays.fill(out, (short) 0);
+                    return;
+                }
+            } else {
+                starveTicks = 0;
+            }
+
             int step = frames;
             if (occ > HIGH_MS * 48L) {
                 step = frames + 1;              // 偏高：多消费一帧（轻微加快）
@@ -147,6 +166,7 @@ final class JitterBuffer {
             readPos = 0;
             highestWritten = 0;
             started = false;
+            starveTicks = 0;
         }
     }
 

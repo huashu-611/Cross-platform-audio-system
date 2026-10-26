@@ -419,6 +419,10 @@ function render (state) {
     if (selected) showVolumePanel(state)
   }
 
+  // 回显自动同意状态（用户刚点过就别覆盖，避免和点击打架）
+  const auto = $('autoAccept')
+  if (auto && !autoTouched) auto.checked = !!state.autoAccept
+
   $('stats').innerHTML =
     '<span>设备 <b>' + confirmedCount + '</b> 台</span>' +
     '<span>总线 <b>' + dbText(state.busLevel) + '</b></span>' +
@@ -501,6 +505,13 @@ $('manualInviteBtn').addEventListener('click', async () => {
     hint.className = 'hint warn'
     hint.textContent = '邀请发送失败：地址格式不对或音频核心没响应'
   }
+})
+
+// 自动同意：手机点一下就连上，不必在电脑上再点一次
+let autoTouched = false
+$('autoAccept').addEventListener('change', async (e) => {
+  autoTouched = true
+  await window.hub.setAutoAccept(e.target.checked)
 })
 
 $('ctrlAddBtn').addEventListener('click', () => {
