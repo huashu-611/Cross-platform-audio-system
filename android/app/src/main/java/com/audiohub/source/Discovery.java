@@ -155,23 +155,42 @@ public final class Discovery {
         }
     }
 
-    private static String localIp() {
+    /**
+     * 本机的局域网地址。
+     * 优先 wlan / eth 开头的网卡，跳过回环、链路本地、VPN/TUN 段
+     * （手机上装了代理 App 也会有 198.18.x 的假地址，挑错了就"扫得到连不上"）。
+     */
+    static String localIp() {
+        String fallback = "";
         try {
             final java.util.Enumeration<java.net.NetworkInterface> nis =
                     java.net.NetworkInterface.getNetworkInterfaces();
             while (nis.hasMoreElements()) {
-                final java.util.Enumeration<java.net.InetAddress> addrs =
-                        nis.nextElement().getInetAddresses();
+                final java.net.NetworkInterface ni = nis.nextElement();
+                if (!ni.isUp() || ni.isLoopback()) continue;
+                final String name = ni.getName() == null ? "" : ni.getName().toLowerCase();
+                final boolean preferred = name.startsWith("wlan") || name.startsWith("eth")
+                        || name.startsWith("ap") || name.startsWith("en");
+                final boolean virtual = name.startsWith("tun") || name.startsWith("ppp")
+                        || name.startsWith("rmnet") || name.startsWith("clat");
+
+                final java.util.Enumeration<java.net.InetAddress> addrs = ni.getInetAddresses();
                 while (addrs.hasMoreElements()) {
                     final java.net.InetAddress a = addrs.nextElement();
-                    if (!a.isLoopbackAddress() && a instanceof java.net.Inet4Address) {
-                        return a.getHostAddress();
-                    }
+                    if (!(a instanceof java.net.Inet4Address) || a.isLoopbackAddress()) continue;
+                    final String ip = a.getHostAddress();
+                    if (ip == null) continue;
+                    if (ip.startsWith("169.254.")) continue;    // 链路本地
+                    if (ip.startsWith("198.18.") || ip.startsWith("198.19.")) continue;  // 代理 TUN
+                    if (ip.startsWith("100.64.") || ip.startsWith("100.65.")) continue;  // CGNAT
+                    if (virtual) continue;
+                    if (preferred) return ip;
+                    if (fallback.isEmpty()) fallback = ip;
                 }
             }
         } catch (Exception ignored) {
         }
-        return "";
+        return fallback;
     }
 
     private void handle(String line, String fromIp) {
@@ -196,11 +215,46 @@ public final class Discovery {
         }
         // 信标里的 IP 是发送方自己填的真实地址；
         // 空的话退回来源地址（可能是虚拟网卡，所以 C++ 端总是填上）
-        d.ip = parts[5].isEmpty() ? fromIp : parts[5];
+        d.ip = pickBestIp(parts[5], fromIp);
         d.name = parts[6];
         d.lastSeenMs = System.currentTimeMillis();
 
         peers.put(d.ip + ":" + d.audioPort, d);
+    }
+
+    /**
+     * 信标里可能给了多个候选 IP（一台机器同时有 WiFi 和网线）。
+     * 挑"与本机公共前缀最长"的那个——同网段的地址才连得通。
+     * 全都不匹配时退回第一项（总比没有好）。
+     */
+    private static String pickBestIp(String list, String fallback) {
+        if (list == null || list.trim().isEmpty()) return fallback;
+        final String[] items = list.split(",");
+        final String mine = localIp();
+        String best = null;
+        int bestLen = -1;
+        for (String raw : items) {
+            final String ip = raw.trim();
+            if (ip.isEmpty()) continue;
+            final int common = commonPrefixLen(ip, mine);
+            if (common > bestLen) {
+                bestLen = common;
+                best = ip;
+            }
+        }
+        return best != null ? best : fallback;
+    }
+
+    private static int commonPrefixLen(String a, String b) {
+        if (a == null || b == null || a.isEmpty() || b.isEmpty()) return 0;
+        final String[] sa = a.split("\\.");
+        final String[] sb = b.split("\\.");
+        int n = 0;
+        for (int i = 0; i < Math.min(sa.length, sb.length); ++i) {
+            if (!sa[i].equals(sb[i])) break;
+            n++;
+        }
+        return n;
     }
 
     private void prune(long now) {

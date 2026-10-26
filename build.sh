@@ -20,12 +20,14 @@ FLAGS="-std=c++17 -O2 -Wall -Wextra -Iinclude $STATIC"
 
 echo "==> 单元测试"
 # 测试只编纯核心（不含 hub_core.cpp：它依赖 WASAPI 实现，
-# 而测试用不到 HubCore，也不该为此把平台依赖拖进来）
+# 而测试用不到 HubCore，也不该为此把平台依赖拖进来）。
+# 注意：注释必须写在命令之前。多行命令里 `\` 续行的下一行若以 `#` 开头，
+# 注释会吃掉换行，把一条命令切成两条（踩过两次）。
 $CXX $FLAGS \
   src/packet.cpp src/jitter_buffer.cpp src/clock_sync.cpp src/asrc.cpp src/mixer.cpp src/udp_socket.cpp \
   tests/test_main.cpp tests/test_packet.cpp tests/test_ring.cpp tests/test_jitter.cpp \
   tests/test_clock.cpp tests/test_asrc.cpp tests/test_mixer.cpp tests/test_pipeline.cpp \
-  -lws2_32 -o "$OUT/audiohub_tests.exe"
+  -lws2_32 -liphlpapi -o "$OUT/audiohub_tests.exe"
 
 if [ "${WIN32:-1}" = "1" ]; then
   echo "==> Windows 应用（WASAPI）"

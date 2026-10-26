@@ -183,9 +183,19 @@ struct HubCore::Impl {
     // 只是"自动发现"不可用，还能手填 IP。
     discovery.reset(new Discovery());
     {
-      // 信标里带本机真实 IP：广播可能走虚拟网卡，来址不可信
+      // 信标里带全部候选 IP（逗号分隔，第一个最可能可用）。
+      // 一台机器可能同时有 WiFi 和网线，对端自己挑同网段的那个最稳。
       const std::string all = LocalIPv4List();
-      local_ip_for_invite = all.substr(0, all.find(','));
+      local_ip_for_invite = all;   // 去掉尾部 ", 127.0.0.1"
+      const size_t loop = local_ip_for_invite.find("127.0.0.1");
+      if (loop != std::string::npos) {
+        local_ip_for_invite = local_ip_for_invite.substr(0, loop);
+        while (!local_ip_for_invite.empty() &&
+               (local_ip_for_invite.back() == ' ' || local_ip_for_invite.back() == ',')) {
+          local_ip_for_invite.pop_back();
+        }
+      }
+      if (local_ip_for_invite.empty()) local_ip_for_invite = "127.0.0.1";
     }
     // 两端能力完全一致：都能采音也都能放音。"发送/接收"只是指
     // 建立连接时谁发起，不是角色——汇聚端是用户在界面里选的。

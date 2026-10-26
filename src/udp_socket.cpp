@@ -1,11 +1,15 @@
 #include "audiohub/udp_socket.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <sstream>
+#include <utility>
+#include <vector>
 
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 #ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")  // MSVC 专用；MinGW 靠 CMake 的 -lws2_32
 #endif
@@ -199,36 +203,134 @@ int UdpSocket::ReceiveFrom(void* buffer, size_t capacity, std::string* from_ipv4
   return n;
 }
 
+namespace {
+
+// 网卡名/描述小写化：VMware、vEthernet 这些都是 ASCII，逐字节转小写就够
+std::string NarrowLower(const wchar_t* w) {
+  std::string out;
+  for (; w != nullptr && *w != L'\0'; ++w) {
+    const wchar_t c = *w;
+    out += static_cast<char>(c >= L'A' && c <= L'Z' ? c - L'A' + L'a' : c);
+  }
+  return out;
+}
+
+// 名字里带这些词的网卡基本都不是"能和手机通信的那张"
+bool LooksVirtual(const std::string& name) {
+  static const char* kBad[] = {"vmware", "virtualbox", "hyper-v", "vethernet", "wsl",
+                               "tap-",    "tailscale",  "zerotier", "clash",    "wireguard",
+                               "docker",  "loopback",   "npcap",    "vpn",      "meta"};
+  for (const char* bad : kBad) {
+    if (name.find(bad) != std::string::npos) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
 std::string LocalIPv4List() {
-  // 不依赖 getifaddrs（Windows 上要用 IP Helper API），P0 用"连一个公网地址
-  // 让内核选出口网卡"的经典技巧，再补上回环地址。
-  std::ostringstream oss;
-  bool first = true;
-  const socket_t s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  if (s != kInvalidSocket) {
-    sockaddr_in probe{};
-    probe.sin_family = AF_INET;
-    probe.sin_port = htons(53);
-    ::inet_pton(AF_INET, "223.5.5.5", &probe.sin_addr);
-    if (::connect(s, reinterpret_cast<sockaddr*>(&probe), sizeof(probe)) == 0) {
-      sockaddr_in local{};
+  // 枚举所有网卡，剔除虚拟 / TUN / 回环 / 链路本地，按"像真实局域网"排序，
+  // 返回逗号分隔的候选列表（第一个是最可能可用的）。
+  //
+  // 为什么不能再用"连 223.5.5.5 看来路"的老技巧：开了 Clash 等代理的
+  // TUN 模式后，这条路由被 TUN 网卡接管，getsockname 拿到的是 198.18.0.1
+  // 这种假地址——对端根本连不通，表现为"扫得到但连不上"。
+  std::vector<std::pair<int, std::string>> entries;
+
 #ifdef _WIN32
-      int len = sizeof(local);
-#else
-      socklen_t len = sizeof(local);
-#endif
-      if (::getsockname(s, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
+  ULONG size = 16384;
+  std::vector<BYTE> buf(size);
+  PIP_ADAPTER_ADDRESSES addrs = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data());
+  if (GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                                        GAA_FLAG_SKIP_DNS_SERVER, nullptr, addrs, &size) == NO_ERROR) {
+    for (PIP_ADAPTER_ADDRESSES a = addrs; a != nullptr; a = a->Next) {
+      if (a->OperStatus != IfOperStatusUp) continue;
+      // 隧道 / 回环 / PPP 一律跳过
+      if (a->IfType == IF_TYPE_TUNNEL || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK ||
+          a->IfType == IF_TYPE_PPP) {
+        continue;
+      }
+      // VMware / vEthernet / Clash 这类虚拟网卡也是"以太网"类型，
+      // 光看 IfType 分不出来，必须按名字剔除——否则会挑到 192.168.x 或
+      // 198.18.x 的假地址，对端连不通。
+      const std::string friendly = NarrowLower(a->FriendlyName);
+      const std::string desc = NarrowLower(a->Description);
+      if (LooksVirtual(friendly) || LooksVirtual(desc)) continue;
+
+      const bool has_gateway = a->FirstGatewayAddress != nullptr;
+      // 以太网(6) 和 WiFi(71) 最优先
+      int base = (a->IfType == IF_TYPE_ETHERNET_CSMACD ||
+                  a->IfType == IF_TYPE_IEEE80211)
+                     ? 100
+                     : 0;
+      // 路由度量：越小越"主"，真实默认网卡的度量通常远小于虚拟网卡
+      if (a->Ipv4Metric < 200) base += (200 - static_cast<int>(a->Ipv4Metric)) / 4;
+
+      for (PIP_ADAPTER_UNICAST_ADDRESS ua = a->FirstUnicastAddress; ua != nullptr;
+           ua = ua->Next) {
+        if (ua->Address.lpSockaddr == nullptr) continue;
+        if (ua->Address.lpSockaddr->sa_family != AF_INET) continue;
+        const auto* sa = reinterpret_cast<const sockaddr_in*>(ua->Address.lpSockaddr);
+        const uint32_t ip = ntohl(sa->sin_addr.s_addr);
+
+        if ((ip >> 24) == 127) continue;                        // 回环
+        if ((ip & 0xFFFF0000u) == 0xA9FE0000u) continue;        // 169.254/16 链路本地
+        if ((ip & 0xFFFE0000u) == 0xC6120000u) continue;        // 198.18/15 Clash TUN 假地址
+        if ((ip & 0xFFC00000u) == 0x64400000u) continue;        // 100.64/10 CGNAT / Tailscale
+
         char text[INET_ADDRSTRLEN] = {0};
-        ::inet_ntop(AF_INET, &local.sin_addr, text, sizeof(text));
-        oss << text;
-        first = false;
+        in_addr tmp{};
+        tmp.s_addr = htonl(ip);
+        ::inet_ntop(AF_INET, &tmp, text, sizeof(text));
+
+        int score = base;
+        if (has_gateway) score += 50;                            // 有默认网关说明能出网
+        if (ua->OnLinkPrefixLength == 24) score += 5;            // 家用/办公最常见
+        entries.emplace_back(score, std::string(text));
       }
     }
-#ifdef _WIN32
-    ::closesocket(s);
-#else
-    ::close(s);
+  }
 #endif
+
+  // 兜底：Windows 上枚举失败、或非 Windows 平台，退回"连公网看来路"
+  if (entries.empty()) {
+    const socket_t s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s != kInvalidSocket) {
+      sockaddr_in probe{};
+      probe.sin_family = AF_INET;
+      probe.sin_port = htons(53);
+      ::inet_pton(AF_INET, "223.5.5.5", &probe.sin_addr);
+      if (::connect(s, reinterpret_cast<sockaddr*>(&probe), sizeof(probe)) == 0) {
+        sockaddr_in local{};
+#ifdef _WIN32
+        int len = sizeof(local);
+#else
+        socklen_t len = sizeof(local);
+#endif
+        if (::getsockname(s, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
+          char text[INET_ADDRSTRLEN] = {0};
+          ::inet_ntop(AF_INET, &local.sin_addr, text, sizeof(text));
+          entries.emplace_back(0, std::string(text));
+        }
+      }
+#ifdef _WIN32
+      ::closesocket(s);
+#else
+      ::close(s);
+#endif
+    }
+  }
+
+  std::stable_sort(entries.begin(), entries.end(),
+                   [](const std::pair<int, std::string>& a,
+                      const std::pair<int, std::string>& b) { return a.first > b.first; });
+
+  std::ostringstream oss;
+  bool first = true;
+  for (const auto& e : entries) {
+    if (!first) oss << ", ";
+    oss << e.second;
+    first = false;
   }
   if (!first) oss << ", ";
   oss << "127.0.0.1";
