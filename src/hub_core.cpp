@@ -187,9 +187,11 @@ struct HubCore::Impl {
       const std::string all = LocalIPv4List();
       local_ip_for_invite = all.substr(0, all.find(','));
     }
+    // 两端能力完全一致：都能采音也都能放音。"发送/接收"只是指
+    // 建立连接时谁发起，不是角色——汇聚端是用户在界面里选的。
     if (opts.advertise) {
       discovery->StartAdvertise(display_name, local_ip_for_invite, port,
-                                http_port_for_discovery, true, false);
+                                http_port_for_discovery, true, true);
     } else {
       discovery->StartBrowse();
     }

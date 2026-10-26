@@ -25,41 +25,39 @@
 
   <div id="banner" class="banner hidden"></div>
 
-  <div class="sect" id="sectReq" style="display:none">连接请求</div>
-  <div class="grid" id="reqGrid"></div>
+  <!-- ============ 连接界面 ============ -->
+  <div id="screenConnect">
+    <div class="sect" id="sectReq" style="display:none">连接请求</div>
+    <div class="grid" id="reqGrid"></div>
 
-  <div class="sect" id="sectPeer" style="display:none">发现的设备</div>
-  <div class="grid" id="peerGrid"></div>
+    <div class="sect" id="sectPeer" style="display:none">发现的设备</div>
+    <div class="grid" id="peerGrid"></div>
 
-  <div class="sect">混音台</div>
-  <div class="grid" id="grid"></div>
+  </div>
 
-  <div class="panel">
-    <div class="box">
-      <h3>总音量</h3>
+  <!-- ============ 控制界面：网络图 ============ -->
+  <div id="screenControl" style="display:none">
+    <svg id="graph" viewBox="0 0 920 460" style="width:100%;height:auto;display:block"></svg>
+    <div id="volumePanel" class="volpanel" style="display:none">
+      <div class="volname" id="volName">—</div>
       <div class="row">
-        <input type="range" id="master" min="0" max="150" value="100">
-        <span class="pct" id="masterPct">100%</span>
+        <input type="range" id="volSlider" min="0" max="150" value="100">
+        <span class="pct" id="volPct">100%</span>
+        <button class="mute" id="volMute">静音</button>
       </div>
     </div>
-    <div class="box">
-      <h3>目标延迟</h3>
-      <div class="seg" id="lat">
-        <button data-v="40">40 ms</button>
-        <button data-v="60" class="on">60 ms</button>
-        <button data-v="120">120 ms</button>
-      </div>
-    </div>
-    <div class="box">
-      <h3>连接策略</h3>
-      <div class="seg" id="accept">
-        <button data-v="off" class="on">需要确认</button>
-        <button data-v="on">自动接受</button>
+    <div class="sect">会话</div>
+    <div class="grid">
+      <div class="card" style="max-width:460px">
+        <div class="row">
+          <span class="ask" style="flex:1">断开所有连接，回到连接界面</span>
+          <button class="btn no" id="leaveBtn">全部断开</button>
+        </div>
       </div>
     </div>
   </div>
 
-  <div class="stats" id="stats"></div>
+  <div id="stats" class="stats"></div>
 </div>
 
 <script src="renderer.js"></script>

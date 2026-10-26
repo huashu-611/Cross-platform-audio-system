@@ -56,11 +56,19 @@ public class ReceiverService extends Service {
     public static volatile String sStatus = "未启动";
     public static volatile double sBusLevel = -120.0;
     public static volatile int sOccupancyMs = 0;
+    public static volatile int sStreamCount = 0;
+
+    // 收到的连接邀请（界面轮询后弹窗）
+    public static volatile boolean sInvitePending = false;
+    public static volatile String sInviteName = "";
+    public static volatile String sInviteIp = "";
+    public static volatile int sInvitePort = 0;
 
     private DatagramSocket dataSocket;
     private DatagramSocket handshakeSocket;
     private AudioTrack track;
-    private JitterBuffer jitter;
+    private final Map<Integer, JitterBuffer> streams = new ConcurrentHashMap<>();
+    private final Map<Integer, Float> gains = new ConcurrentHashMap<>();
     private Thread recvThread;
     private Thread playThread;
     private Thread handshakeThread;
@@ -105,7 +113,9 @@ public class ReceiverService extends Service {
             return START_NOT_STICKY;
         }
 
-        jitter = new JitterBuffer(2, 48000 / 4);   // 250ms 容量
+        // 每路一条抖动缓冲：要做"点某个球调它的音量"，
+        // 就必须知道每路各自的声音，混在一起之后再想分开是不可能的。
+        streams.clear();
 
         if (!startPlayback()) return START_NOT_STICKY;
 
@@ -200,40 +210,74 @@ public class ReceiverService extends Service {
                 final int off = PacketProtocol.HEADER_BYTES + i * 2;
                 scratch[i] = (short) ((buf[off] & 0xFF) | ((buf[off + 1] & 0xFF) << 8));
             }
-            jitter.push(samplePos, scratch, frames);
+            JitterBuffer jb = streams.get(streamId);
+            if (jb == null) {
+                jb = new JitterBuffer(2, 48000 / 4);   // 250ms 容量
+                streams.put(streamId, jb);
+                gains.putIfAbsent(streamId, 1.0f);
+                sStreamCount = streams.size();
+            }
+            jb.push(samplePos, scratch, frames);
         }
     }
 
-    /** 播放线程：按硬件节拍从抖动缓冲取数喂 AudioTrack。 */
+    /** 播放线程：把每路按各自增益混音后喂 AudioTrack。 */
     private void playLoop() {
         final int frames = PacketProtocol.FRAMES_PER_PACKET;   // 240 帧 = 5ms
         final short[] block = new short[frames * PacketProtocol.CHANNELS];
+        final float[] mix = new float[frames * PacketProtocol.CHANNELS];
 
         // 先缓冲一小段再开播，避免一上来就欠载
-        while (running && jitter.occupancyFrames() < 60 * 48) {
+        long waitStart = SystemClock.elapsedRealtime();
+        while (running && streams.isEmpty()
+                && SystemClock.elapsedRealtime() - waitStart < 3000) {
             SystemClock.sleep(5);
         }
 
-        // 混音电平
+
         double levelSum = 0;
         long levelFrames = 0;
         long levelStart = SystemClock.elapsedRealtime();
 
         while (running) {
-            jitter.pull(block, frames);
-            if (track != null) track.write(block, 0, block.length);
-
-            for (int i = 0; i < block.length; ++i) {
-                final double v = block[i] / 32768.0;
-                levelSum += v * v;
+            java.util.Arrays.fill(mix, 0f);
+            int active = 0;
+            for (Map.Entry<Integer, JitterBuffer> e : streams.entrySet()) {
+                final JitterBuffer jb = e.getValue();
+                if (jb.occupancyFrames() < frames) continue;   // 这路还没攒够，跳过
+                jb.pull(block, frames);
+                final float g = gains.getOrDefault(e.getKey(), 1.0f);
+                for (int i = 0; i < block.length; ++i) mix[i] += block[i] * g;
+                active++;
             }
+            sStreamCount = streams.size();
+
+            // 软限幅，防止多路叠加爆音
+            for (int i = 0; i < mix.length; ++i) {
+                float v = mix[i];
+                if (v > 0.85f) v = 0.85f - (1f / (1f + (v - 0.85f) * 8f)) * 0.15f;
+                else if (v < -0.85f) v = -0.85f + (1f / (1f + (-v - 0.85f) * 8f)) * 0.15f;
+                mix[i] = v;
+            }
+
+            if (track != null) {
+                final short[] out = new short[mix.length];
+                for (int i = 0; i < mix.length; ++i) {
+                    out[i] = (short) Math.max(-32768, Math.min(32767, mix[i] * 32767f));
+                }
+                track.write(out, 0, out.length);
+            }
+
+            for (int i = 0; i < mix.length; ++i) levelSum += mix[i] * mix[i];
             levelFrames += frames;
 
             final long now = SystemClock.elapsedRealtime();
             if (now - levelStart >= 500) {
                 final double mean = levelFrames > 0 ? levelSum / levelFrames : 0;
                 sBusLevel = mean > 0 ? 10 * Math.log10(mean) : -120.0;
-                sOccupancyMs = jitter.occupancyFrames() / 48;
+                int occ = 0;
+                for (JitterBuffer jb : streams.values()) occ += jb.occupancyFrames();
+                sOccupancyMs = streams.isEmpty() ? 0 : occ / streams.size() / 48;
                 levelSum = 0;
                 levelFrames = 0;
                 levelStart = now;
@@ -265,7 +309,10 @@ public class ReceiverService extends Service {
                 // PC 邀请我们把声音送过去：入队等界面确认
                 pendingInvites.put(fromIp + ":" + fromPort, pkt.getData().clone());
                 sStatus = "收到 " + parts[1] + " 的连接邀请，请在界面确认";
-                notifyInvite(parts[1], fromIp, fromPort);
+                sInviteName = parts[1];
+                sInviteIp = fromIp;
+                sInvitePort = fromPort;
+                sInvitePending = true;
             } else if ("CONN-REQ".equals(parts[0]) && parts.length >= 3) {
                 // 另一台设备请求把声音送到这里（手机当汇聚端时）
                 final String ack = "CONN-ACK|" + "AudioHub 手机" + "|" + parts[2] + "\n";
@@ -287,6 +334,13 @@ public class ReceiverService extends Service {
      * 接受邀请：向 PC 发 CONN-REQ，等 CONN-ACK。
      * @return true = 对方已确认
      */
+    /** 供界面实时调某一路的音量（streamId 来自网络图上的球）。 */
+    public static void setStreamGain(int streamId, float gain) {
+        sGains.put(streamId, Math.max(0f, Math.min(4f, gain)));
+    }
+
+    private static final Map<Integer, Float> sGains = new ConcurrentHashMap<>();
+
     public static boolean respondToInvite(String pcIp, int pcAudioPort, String deviceName) {
         DatagramSocket s = null;
         try {
@@ -321,6 +375,8 @@ public class ReceiverService extends Service {
     private void stopAll() {
         running = false;
         sRunning = false;
+        streams.clear();
+        sStreamCount = 0;
         if (recvThread != null) { try { recvThread.join(400); } catch (Exception ignored) {} }
         if (playThread != null) { try { playThread.join(400); } catch (Exception ignored) {} }
         if (handshakeThread != null) {

@@ -235,3 +235,18 @@ input[type=range]::-moz-range-thumb { width: 12px; height: 12px; border-radius: 
   font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums;
 }
 .stats b { color: var(--dim); font-weight: 600; }
+
+/* ---------- 控制界面：网络图与音量面板 ---------- */
+#graph { margin-top: 4px; }
+#graph .node:hover circle { filter: brightness(1.18); }
+
+.volpanel {
+  background: var(--card);
+  border: 1px solid oklch(0.62 0.17 255 / .35);
+  border-radius: var(--radius);
+  padding: 14px 16px; margin: 6px 0 4px;
+  max-width: 620px;
+}
+.volname { font-size: 14px; font-weight: 600; margin-bottom: 10px; }
+.volpanel .row { gap: 14px; }
+.volpanel .mute { flex: 0 0 auto; }
