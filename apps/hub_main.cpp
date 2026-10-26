@@ -212,6 +212,16 @@ int main(int argc, char** argv) {
                                << "\"ip\":\"" << p.peer_ip << "\"}";
                            }
                          }
+                         o << "],\"sessionPeers\":[";
+                         {
+                           const auto sp = hub.SessionPeers();
+                           for (size_t i = 0; i < sp.size(); ++i) {
+                             if (i) o << ",";
+                             o << "{\"name\":\"" << audiohub::JsonEscape(sp[i].name) << "\","
+                               << "\"ip\":\"" << sp[i].ip << "\","
+                               << "\"audioPort\":" << sp[i].audio_port << "}";
+                           }
+                         }
                          o << "],\"invites\":[";
                          {
                            const auto invites = hub.Invites();
@@ -281,6 +291,10 @@ int main(int argc, char** argv) {
                          if (audiohub::JsonFindNumber(body, "streamId", &v)) {
                            hub.Disconnect(static_cast<uint16_t>(v));
                          }
+                         return "{\"ok\":true}";
+                       }
+                       if (method == "POST" && path == "/api/clear-session") {
+                         hub.ClearSession();
                          return "{\"ok\":true}";
                        }
                        if (method == "POST" && path == "/api/auto-accept") {

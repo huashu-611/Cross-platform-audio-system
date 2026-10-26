@@ -93,6 +93,16 @@ class HubCore {
   // 别人发来的邀请（对方希望把声音送到它那里）。
   // 收到 CONN-INVITE 时入队，界面确认后再由界面侧启动音源进程。
   std::vector<Peer> Invites() const;
+
+  // 会话关系表：本次会话里"连过"的设备，跨角色切换保留。
+  //
+  // 为什么必须单独存一份：切换汇聚端之后本机不再收流，sources 会清空；
+  // 手机端又不广播信标，peers 里也没有它 —— 于是下拉里只剩"本机"，
+  // 用户切一次就再也切不回来了。
+  std::vector<Peer> SessionPeers() const;
+
+  // 主动断开所有：清空关系表（用户点"断开"时才调）
+  void ClearSession();
   void AcceptInvite(const std::string& ip);
   void RejectInvite(const std::string& ip);
   void RefreshDiscovery();  // 立即发一轮探测，不用等下一个广播周期

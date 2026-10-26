@@ -509,6 +509,8 @@ public class MainActivity extends Activity {
                 stopSource();
                 sessionActive = false;
                 userLeft = true;      // 立刻回连接界面，且不被服务状态拉回
+                manualPeers.clear();  // 主动断开：关系表一起清掉
+                manualPeers.clear();  // 主动断开：关系表一起清掉
                 idleTicks = 0;
                 refresh();
                 Toast.makeText(MainActivity.this, "已断开", Toast.LENGTH_SHORT).show();
@@ -634,6 +636,9 @@ public class MainActivity extends Activity {
         hubPort = d.audioPort;
         hubName = d.name;
         saveHub();
+        // 记住这台设备：切换之后本机不再收流，discovery 里也未必有它，
+        // 不记下来的话下次想切回去就"没有数据可选"了。
+        addManualPeer(d.ip, d.name, d.audioPort);
         sessionActive = true;
         idleTicks = 0;
         startService(new Intent(this, ReceiverService.class)

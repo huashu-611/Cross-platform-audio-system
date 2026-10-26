@@ -213,6 +213,18 @@ function renderHubSelect (state) {
   // 已连接设备从 sources 取，一定在。
   const candidates = []
   const seen = new Set()
+
+  // ① 会话关系表：连过的设备，跨角色切换保留。
+  //    没有这一份，电脑切到手机之后 sources 清空、peers 里也没有手机
+  //    （手机不广播信标），下拉就只剩"本机"，切一次就回不去了。
+  for (const k of (state.sessionPeers || [])) {
+    const key = k.ip + ':' + k.audioPort
+    if (seen.has(key)) continue
+    seen.add(key)
+    candidates.push({ name: k.name, ip: k.ip, port: k.audioPort })
+  }
+
+  // ② 当前已连接的流（带最新名字）
   for (const s of (state.sources || [])) {
     if (!s.peerIp) continue
     const key = s.peerIp + ':' + state.audioPort
@@ -547,6 +559,8 @@ $('leaveBtn').addEventListener('click', async () => {
   for (const src of s.sources || []) {
     if (src.confirmed) window.hub.disconnect(src.id)
   }
+  // 用户主动"断开所有"：连关系表一起清掉，下拉回到只有本机
+  await window.hub.clearSession()
 })
 
 // ============================================================ 订阅

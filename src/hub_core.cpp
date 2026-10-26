@@ -338,6 +338,18 @@ struct HubCore::Impl {
       const std::string& cmd = parts[0];
 
       if (cmd == "CONN-REQ" && parts.size() >= 3) {
+        // CONN-REQ|<名字>|<streamId>[|<对端音频口>]
+        // 第 4 段是后来加的：电脑要能切回手机当汇聚端，
+        // 就必须知道手机的音频口。老版本不带，回落到 47000。
+        {
+          uint16_t peer_audio = 47000;
+          if (parts.size() >= 4) {
+            const int v = std::atoi(parts[3].c_str());
+            if (v > 0 && v < 65536) peer_audio = static_cast<uint16_t>(v);
+          }
+          std::lock_guard<std::mutex> lock(mutex);
+          RememberPeer(from_ip, parts[1], peer_audio);
+        }
         const std::string peer_name = parts[1];
         const uint16_t stream_id = static_cast<uint16_t>(std::stoi(parts[2]));
         // 无论自动接受还是等确认，都先把对端地址记下来，
@@ -792,6 +804,10 @@ struct HubCore::Impl {
     const bool ok = handshake_socket.SendToAddr(peer_ip, hs_port, invite.data(), invite.size());
     if (ok) {
       AllowPeer(peer_ip);
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        RememberPeer(peer_ip, "", peer_audio_port);
+      }
       Emit("[>] 已发出邀请: " + peer_ip + ":" + std::to_string(hs_port));
     }
     return ok;
@@ -799,6 +815,27 @@ struct HubCore::Impl {
 
   // 待确认的邀请：ip -> 对端名
   std::map<std::string, std::string> invite_list;
+
+  // 会话关系表：连过的设备（跨角色切换保留）
+  struct KnownPeer {
+    std::string name;
+    uint16_t audio_port = 47000;
+  };
+  std::map<std::string, KnownPeer> session_peers;
+
+  void RememberPeer(const std::string& ip, const std::string& name, uint16_t audio_port) {
+    if (ip.empty()) return;
+    auto it = session_peers.find(ip);
+    if (it == session_peers.end()) {
+      KnownPeer kp;
+      kp.name = name.empty() ? ip : name;
+      kp.audio_port = audio_port ? audio_port : 47000;
+      session_peers.emplace(ip, kp);
+    } else {
+      if (!name.empty()) it->second.name = name;
+      if (audio_port) it->second.audio_port = audio_port;
+    }
+  }
 
   // 本机主动邀请/任命过的对端：它随后的 CONN-REQ 直接放行。
   //
@@ -862,8 +899,30 @@ bool HubCore::SendRoleCommand(const std::string& peer_ip, uint16_t peer_audio_po
   const uint16_t hs_port = static_cast<uint16_t>(peer_audio_port + kControlPortOffset);
   const bool ok = impl_->handshake_socket.SendToAddr(peer_ip, hs_port, frame.data(), frame.size());
   impl_->AllowPeer(peer_ip);
+  {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->RememberPeer(peer_ip, "", peer_audio_port);
+  }
   impl_->Emit("[>] 角色指令 -> " + peer_ip + ":" + std::to_string(hs_port) + "  " + frame);
   return ok;
+}
+
+std::vector<Peer> HubCore::SessionPeers() const {
+  std::vector<Peer> out;
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  for (const auto& kv : impl_->session_peers) {
+    Peer p;
+    p.ip = kv.first;
+    p.name = kv.second.name;
+    p.audio_port = kv.second.audio_port;
+    out.push_back(p);
+  }
+  return out;
+}
+
+void HubCore::ClearSession() {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  impl_->session_peers.clear();
 }
 
 std::vector<Peer> HubCore::Invites() const {

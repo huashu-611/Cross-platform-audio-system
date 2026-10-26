@@ -332,6 +332,11 @@ ipcMain.handle('hub:reject-invite', async (_e, arg) => {
   return { ok: true }
 })
 
+ipcMain.handle('hub:clearSession', async () => {
+  await httpRequest('POST', '/api/clear-session', {})
+  return { ok: true }
+})
+
 ipcMain.handle('hub:scan', async () => {
   await httpRequest('POST', '/api/refresh', {})
   await new Promise((resolve) => setTimeout(resolve, 800))

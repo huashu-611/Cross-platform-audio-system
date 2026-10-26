@@ -337,7 +337,9 @@ public class ReceiverService extends Service {
         try {
             s = new DatagramSocket();
             s.setSoTimeout(1000);
-            final String req = "CONN-REQ|" + deviceName + "|1\n";
+            // 带上自己的音频口：电脑要能反过来把汇聚端切到本机，
+            // 就必须知道本机在哪个端口收流（老版本不带，对端回落到 47000）。
+            final String req = "CONN-REQ|" + deviceName + "|1|" + 47000 + "\n";
             final byte[] data = req.getBytes(java.nio.charset.StandardCharsets.UTF_8);
             // 等 30 秒：对方要在界面上点"同意"，10 秒往往不够
             for (int i = 0; i < 30; ++i) {
