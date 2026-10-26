@@ -370,6 +370,18 @@ function render (state) {
 
   if (screen === 'connect') {
     renderConnect(state)
+    // 本机不是汇聚端：说明本机的声音正被送到对端
+    // 汇聚端说明文案：本机是汇聚端时谈收流，不是时谈发送
+    const note = $('hubNote')
+    if (note) {
+      if (hubSelf) {
+        note.textContent = '承担收流 / 混音 / 播放'
+      } else {
+        note.textContent = state.pcSource
+            ? '本机声音已送往远端（本机输出已静音）'
+            : '本机声音未发送（音源进程未启动）'
+      }
+    }
   } else {
     renderControlDevices(state)
     renderHubSelect(state)

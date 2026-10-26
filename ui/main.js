@@ -56,9 +56,7 @@ let pcSourceProcess = null
 
 function startPcSource (ip, port) {
   stopPcSource()
-  const exe = process.resourcesPath
-    ? path.join(process.resourcesPath, 'app.asar.unpacked', 'bin', 'audiohub-source.exe')
-    : path.join(__dirname, 'bin', 'audiohub-source.exe')
+  const exe = sourceExePath()
   pcSourceProcess = spawn(exe, [
     '--hub', ip + ':' + port,
     '--handshake',
@@ -68,10 +66,29 @@ function startPcSource (ip, port) {
   pcSourceProcess.on('exit', () => { pcSourceProcess = null })
 }
 
+function sourceExePath () {
+  return process.resourcesPath
+    ? path.join(process.resourcesPath, 'app.asar.unpacked', 'bin', 'audiohub-source.exe')
+    : path.join(__dirname, 'bin', 'audiohub-source.exe')
+}
+
+// 取消静音。必须单独调：Electron 用 kill() 终止音源时，
+// 音源进程走不到自己的退出路径，静音不会自动恢复 —— 电脑会一直哑着。
+function restoreMute () {
+  try {
+    spawn(sourceExePath(), ['--restore-mute'], {
+      windowsHide: true, stdio: 'ignore'
+    }).on('error', () => {})
+  } catch (err) {
+    /* 尽力而为 */
+  }
+}
+
 function stopPcSource () {
   if (pcSourceProcess) {
     pcSourceProcess.kill()
     pcSourceProcess = null
+    restoreMute()
   }
 }
 
@@ -178,6 +195,8 @@ function httpRequest (method, urlPath, body) {
 async function fetchState () {
   const state = await httpRequest('GET', '/api/state')
   if (state && mainWindow && !mainWindow.isDestroyed()) {
+    // 本机作为音源时的状态：核心只管收流，不知道我们另起了一个发送进程
+    state.pcSource = pcSourceProcess !== null
     mainWindow.webContents.send('hub:push', state)
   }
 }
@@ -259,6 +278,7 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   if (pollTimer) clearInterval(pollTimer)
+  stopPcSource()
   stopHub()
 })
 

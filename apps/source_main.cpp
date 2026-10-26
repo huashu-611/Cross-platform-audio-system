@@ -57,6 +57,12 @@ struct Options {
   std::string exclude_name;  // 进程回环：排除这个进程树
   std::string log_path;   // 非空时把输出重定向到文件
   bool handshake = false;  // 先发 CONN-REQ，等对方确认后再发音频
+  // 作为音源时把本机输出静音：采集走的是回环，回环不会自动静音，
+  // 不静音的话声音会同时留在本机耳机里和远端（重复 + 回声）。
+  bool mute_local = false;
+  // 单独的"取消静音"入口：Electron 用 kill() 终止音源时走不到退出路径，
+  // 静音不会自动恢复 —— 电脑就哑了。所以必须有一个能被单独调用的还原入口。
+  bool restore_mute = false;
   std::string device_name = "PC 音源";
   bool verbose = false;
 };
@@ -116,6 +122,10 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
       opt->exclude_name = next("--exclude");
     } else if (a == "--log") {
       opt->log_path = next("--log");
+    } else if (a == "--mute-local") {
+      opt->mute_local = true;
+    } else if (a == "--restore-mute") {
+      opt->restore_mute = true;
     } else if (a == "--handshake") {
       opt->handshake = true;
     } else if (a == "--device-name") {
@@ -293,6 +303,20 @@ int main(int argc, char** argv) {
   std::printf("  本机地址   : %s\n", audiohub::LocalIPv4List().c_str());
   std::printf("  Ctrl+C 停止\n\n");
 
+  // SetDefaultRenderMute 走 COM，必须先初始化。
+  // RPC_E_CHANGED_MODE 说明别的线程已用另一种模式初始化过，可以忽略。
+  const HRESULT co_hr = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  const bool co_ok = SUCCEEDED(co_hr) || co_hr == RPC_E_CHANGED_MODE;
+
+  // 独立的取消静音入口：不需要采集，做完就走
+  if (opt.restore_mute) {
+    const bool ok = co_ok && audiohub::SetDefaultRenderMute(false, nullptr);
+    std::printf(ok ? "本机输出已取消静音\n" : "取消静音失败\n");
+    std::fflush(stdout);
+    if (co_ok) ::CoUninitialize();
+    return ok ? 0 : 1;
+  }
+
   // ---- 发送线程 ----
   const size_t packet_samples =
       static_cast<size_t>(audiohub::kFramesPerPacket) * audiohub::kChannels;
@@ -450,6 +474,18 @@ int main(int argc, char** argv) {
     }
   });
 
+  // 静音本机输出（--mute-local）。退出时必须还原，
+  // 否则用户会以为声卡坏了。
+  bool was_muted = false;
+  bool mute_applied = false;
+  if (opt.mute_local) {
+    was_muted = false;
+    mute_applied = co_ok && audiohub::SetDefaultRenderMute(true, &was_muted);
+    std::printf(mute_applied ? "本机输出已静音（退出时恢复）\n"
+                             : "静音本机输出失败（继续发送）\n");
+    std::fflush(stdout);
+  }
+
   // ---- 统计 ----
   uint64_t last_frames = 0;
   uint64_t last_packets = 0;
@@ -483,5 +519,13 @@ int main(int argc, char** argv) {
   capture.Stop();
   if (sender.joinable()) sender.join();
   if (clock_thread.joinable()) clock_thread.join();
+
+  // 还原本机静音状态
+  if (mute_applied) {
+    audiohub::SetDefaultRenderMute(was_muted, nullptr);
+    std::printf("本机输出已恢复\n");
+    std::fflush(stdout);
+  }
+  if (co_ok) ::CoUninitialize();
   return 0;
 }

@@ -6,6 +6,7 @@
 
 #include <audioclient.h>
 #include <mmdeviceapi.h>
+#include <endpointvolume.h>
 #include <tlhelp32.h>
 
 #include <algorithm>
@@ -440,6 +441,34 @@ void WasapiCapture::RunCapture(void* audio_client, void* event_handle, bool even
   client->Stop();
   if (event != nullptr) CloseHandle(event);
   capture->Release();
+}
+
+bool SetDefaultRenderMute(bool mute, bool* previous) {
+  IMMDeviceEnumerator* enumerator = nullptr;
+  if (FAILED(::CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                __uuidof(IMMDeviceEnumerator),
+                                reinterpret_cast<void**>(&enumerator)))) {
+    return false;
+  }
+  bool ok = false;
+  IMMDevice* device = nullptr;
+  if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device)) &&
+      device != nullptr) {
+    IAudioEndpointVolume* volume = nullptr;
+    if (SUCCEEDED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
+                                   reinterpret_cast<void**>(&volume))) &&
+        volume != nullptr) {
+      if (previous != nullptr) {
+        BOOL was_muted = FALSE;
+        if (SUCCEEDED(volume->GetMute(&was_muted))) *previous = was_muted != FALSE;
+      }
+      ok = SUCCEEDED(volume->SetMute(mute ? TRUE : FALSE, nullptr));
+      volume->Release();
+    }
+    device->Release();
+  }
+  enumerator->Release();
+  return ok;
 }
 
 uint32_t FindProcessIdByName(const std::string& exe_name) {

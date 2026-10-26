@@ -69,6 +69,15 @@ class WasapiCapture {
 // 按可执行文件名找 PID（不区分大小写），找不到返回 0。
 uint32_t FindProcessIdByName(const std::string& exe_name);
 
+// 静音/取消静音"默认播放设备"。
+//
+// 为什么需要：作为音源时我们采集的是回环（loopback），回环**不会**
+// 把本机输出静音——声音会同时留在电脑耳机里和远端，既重复又有回声。
+// 真正"把声音搬走"就必须显式把本机输出静音，退出时再恢复。
+//
+// previous 非空时回填调用前的静音状态，供退出时还原。
+bool SetDefaultRenderMute(bool mute, bool* previous);
+
 // 渲染回调运行在 WASAPI 的实时线程上，只允许从无锁环 memcpy。
 using RenderCallback = std::function<void(float* interleaved, int frames)>;
 
