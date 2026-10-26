@@ -63,7 +63,8 @@ public class HubGraphView extends View {
         nodes.clear();
         Node hub = new Node();
         hub.key = "hub";
-        hub.name = hubName;
+        // drawText(null) 会抛 NPE，而这里是 UI 线程 —— 直接闪退
+        hub.name = hubName != null ? hubName : "汇聚端";
         hub.level = hubLevel;
         hub.hub = true;
         nodes.add(hub);
@@ -72,7 +73,7 @@ public class HubGraphView extends View {
         for (int i = 0; i < names.size(); ++i) {
             Node nd = new Node();
             nd.key = String.valueOf(ids.get(i));
-            nd.name = names.get(i);
+            nd.name = names.get(i) != null ? names.get(i) : ("设备 " + ids.get(i));
             nd.level = levels.get(i);
             nd.hub = false;
             nodes.add(nd);

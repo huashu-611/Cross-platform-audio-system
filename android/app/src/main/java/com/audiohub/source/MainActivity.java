@@ -124,6 +124,12 @@ public class MainActivity extends Activity {
         hubPort = prefs.getInt("hub_port", 47000);
         hubName = prefs.getString("hub_name", null);
 
+        // 上次如果崩过，把堆栈直接摆到眼前——用户不用连电脑也能发给我们
+        showLastCrashIfAny();
+
+        // 上次如果崩过，把堆栈直接摆到眼前——用户不用连电脑也能发给我们
+        showLastCrashIfAny();
+
         poller.post(new Runnable() {
             @Override
             public void run() {
@@ -197,6 +203,38 @@ public class MainActivity extends Activity {
             multicastLock = null;
         }
         super.onDestroy();
+    }
+
+    /** 上次运行留下的崩溃日志：有就弹出来，并告诉用户文件在哪。 */
+    private void showLastCrashIfAny() {
+        final java.io.File f = new java.io.File(getFilesDir(), "crash.txt");
+        if (!f.exists()) return;
+        final String text;
+        try {
+            final byte[] buf = new byte[(int) Math.min(f.length(), 8192)];
+            final java.io.FileInputStream in = new java.io.FileInputStream(f);
+            final int n = in.read(buf);
+            in.close();
+            text = new String(buf, 0, Math.max(n, 0), "UTF-8");
+        } catch (Exception e) {
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("上次运行时崩溃了")
+                .setMessage(text.length() > 1200 ? text.substring(0, 1200) + "…" : text)
+                .setPositiveButton("复制并清除", new android.content.DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(android.content.DialogInterface dialog, int which) {
+                        final android.content.ClipboardManager cm =
+                                (android.content.ClipboardManager) getSystemService(
+                                        Context.CLIPBOARD_SERVICE);
+                        cm.setPrimaryClip(android.content.ClipData.newPlainText("crash", text));
+                        f.delete();
+                        Toast.makeText(MainActivity.this, "已复制到剪贴板", Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNegativeButton("关闭", null)
+                .show();
     }
 
     // ------------------------------------------------------------ 控件
@@ -744,8 +782,12 @@ public class MainActivity extends Activity {
                     levels.add(ReceiverService.sBusLevel);
                 }
             } else {
-                // 本机是音源：大球是对面的汇聚端，小球是本机
-                hubLabel = hubName != null ? hubName : hubIp;
+                // 本机是音源：大球是对面的汇聚端，小球是本机。
+                // 注意：切换角色的瞬间 hubIp/hubName 可能都还是 null，
+                // 而这个值会一路传到 Canvas.drawText() —— drawText(null) 是
+                // 直接抛 NPE 的（UI 线程 = 闪退）。所以必须有兜底。
+                hubLabel = hubName != null ? hubName
+                        : (hubIp != null ? hubIp : "汇聚端");
                 hubLevel = -120;
                 ids.add(0);
                 names.add("本机");
