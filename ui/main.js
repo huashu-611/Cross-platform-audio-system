@@ -78,12 +78,20 @@ function stopPcSource () {
 // 汇聚端设定：连接之后才调用（方案 7.3 节）
 ipcMain.handle('hub:setRole', async (_e, arg) => {
   const self = arg && arg.self !== undefined ? arg.self : true
+
+  // 切换角色时绝不能停掉核心进程。
+  // 核心不只是收流，它还承载着 /api/state —— 界面的全部状态都从它来。
+  // 之前这里调了 stopHub()，结果一切换界面就报"音频核心已退出"，
+  // 整个控制界面变成死的。
+  //
+  // 正确做法：核心一直活着；本机不是汇聚端时，只是额外起一个音源进程
+  // 把电脑的声音送到远端，核心那头自然收不到流（也没人往它发）。
+  if (!hubProcess) startHub()
+
   if (self) {
     stopPcSource()
-    startHub()
     return { ok: true }
   }
-  stopHub()
   startPcSource(arg.ip, arg.audioPort)
   return { ok: true }
 })

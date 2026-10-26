@@ -57,6 +57,12 @@ public class MainActivity extends Activity {
     // 控制界面里的"新设备"区（会话进行中也得能接人）
     private LinearLayout ctrlReqList;
     private LinearLayout connectReqList;
+
+    // 会话是否成立。不能只看"服务是否在跑"：切换角色时旧服务先停、
+    // 新服务几百毫秒后才起，这个间隙会让界面误判成"会话结束"而弹回连接页。
+    private boolean sessionActive = false;
+    private int idleTicks = 0;
+
     private LinearLayout ctrlPeerList;
 
     private HubGraphView graph;
@@ -459,6 +465,9 @@ public class MainActivity extends Activity {
                 startService(new Intent(MainActivity.this, ReceiverService.class)
                         .setAction(ReceiverService.ACTION_STOP));
                 stopSource();
+                sessionActive = false;
+                idleTicks = 0;
+                refresh();
                 Toast.makeText(MainActivity.this, "已断开", Toast.LENGTH_SHORT).show();
             }
         });
@@ -580,6 +589,10 @@ public class MainActivity extends Activity {
                         saveHub();
                         startService(new Intent(MainActivity.this, ReceiverService.class)
                                 .setAction(ReceiverService.ACTION_STOP));
+                        sessionActive = true;
+                        idleTicks = 0;
+                        sessionActive = true;
+                        idleTicks = 0;
                         refresh();
                         Toast.makeText(MainActivity.this,
                                 d.name + " 现在是汇聚端", Toast.LENGTH_SHORT).show();
@@ -697,9 +710,21 @@ public class MainActivity extends Activity {
         // 两端看到的是同一张网络图，只是谁是中间那个大球不同。
         final boolean hubRunning = ReceiverService.sRunning;
         final boolean receiving = hubRunning && ReceiverService.sStreamCount > 0;
-        // 只要承担任一角色的服务在跑，就算会话中。
-        // 切走汇聚端之后本机不再收流，但会话并没有结束。
-        final boolean inSession = receiving || srcRunning || hubRunning || !isLocalHub();
+
+        // 会话成立与否用粘滞标志判断，并给切换留出宽限：
+        // 服务停了不代表会话结束（可能正在切换），连续 15 个 tick
+        // （约 6 秒）都没有任何服务在跑，才认为会话真的结束了。
+        if (hubRunning || srcRunning) {
+            sessionActive = true;
+            idleTicks = 0;
+        } else if (sessionActive) {
+            idleTicks++;
+            if (idleTicks > 15) {
+                sessionActive = false;
+                idleTicks = 0;
+            }
+        }
+        final boolean inSession = sessionActive;
         showScreen(inSession ? "control" : "connect");
 
         if (inSession) {
