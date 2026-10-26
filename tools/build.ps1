@@ -58,7 +58,8 @@ function Build-Apps {
   $Bin = Join-Path $Root 'ui\bin'
   New-Item -ItemType Directory -Force -Path $Bin | Out-Null
   Copy-Item 'build\audiohub-hub.exe' (Join-Path $Bin 'audiohub-hub.exe') -Force
-  Write-Host '==> ui/bin/audiohub-hub.exe updated'
+  Copy-Item 'build\audiohub-source.exe' (Join-Path $Bin 'audiohub-source.exe') -Force
+  Write-Host '==> ui/bin/audiohub-hub.exe + audiohub-source.exe updated'
 }
 
 if ($Target -in @('all', 'tests')) {

@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include <windows.h>
+#include <io.h>
 #include <shellapi.h>
 #include <thread>
 
@@ -19,6 +20,24 @@
 #include "audiohub/udp_socket.hpp"
 
 namespace {
+
+// --log 的路径可能是 UTF-8 中文。Windows 的 CRT 会用 ANSI 代码页解释窄路径，
+// 中文路径直接打不开；这里统一按 UTF-8 解码成宽字符再 _wfopen，然后 _dup2
+// 到 stdout / stderr，行为与 freopen 等价。
+bool RedirectStdioToFile(const std::string& utf8_path) {
+  const int wide_len =
+      MultiByteToWideChar(CP_UTF8, 0, utf8_path.c_str(), -1, nullptr, 0);
+  if (wide_len <= 0) return false;
+  std::wstring wide_path(static_cast<size_t>(wide_len), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, utf8_path.c_str(), -1, wide_path.data(), wide_len);
+  FILE* file = _wfopen(wide_path.c_str(), L"w");
+  if (file == nullptr) return false;
+  const int fd = _fileno(file);
+  const bool ok = _dup2(fd, _fileno(stdout)) == 0;
+  if (ok) _dup2(fd, _fileno(stderr));
+  std::fclose(file);  // dup 出来的描述符不受影响，stdout / stderr 继续有效
+  return ok;
+}
 
 struct Options {
   uint16_t port = 47000;
@@ -210,7 +229,7 @@ int main(int argc, char** argv) {
   if (!ParseArgs(argc, argv, &opt)) return 1;
 
   if (!opt.log_path.empty()) {
-    if (std::freopen(opt.log_path.c_str(), "w", stdout) == nullptr) {
+    if (!RedirectStdioToFile(opt.log_path)) {
       std::printf("无法打开日志文件: %s\n", opt.log_path.c_str());
       return 1;
     }

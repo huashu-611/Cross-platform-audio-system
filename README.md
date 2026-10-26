@@ -115,11 +115,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\build.ps1        # 编
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\graph-smoke.ps1  # 图谱冒烟：起两个 hub 进程互发 GRAPH，结束自动清理
 node tools\ui-e2e.js                                                       # Electron 界面端到端（开发态；打包态设 AUDIOHUB_UI_EXE=ui\dist\AudioHub-便携版.exe）
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\build-apk.ps1    # 重新打包 Android APK
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\probe-rx.ps1 -Secs 12  # 直连源端 UDP 量时间轴空洞/丢包（排查音频卡顿、电流音）
+javac -d build\mixcheck-out tools\mixcheck\MixCheck.java; java -cp build\mixcheck-out MixCheck  # 混音标度数值对照（不需要 Android SDK）
 ```
 
 > 脚本内部会先把 MSYS2 的 `bin` 加进 `PATH`、并统一用相对路径编译——
 > MinGW 的 `ld` 处理带中文的绝对路径会直接失败（而且报错信息帮不上忙）。
 > `build-apk.ps1` 走 aapt2 + javac(JDK17) + d8 + apksigner，不依赖 Gradle。
+> `probe-rx.ps1` 不启动汇聚端，直接收 `audiohub-source` 的包：它区分"源端时间轴空洞
+> （seq 连号但 sample_pos 跳 480）"和"网络丢包（两者一起跳）"，是排查噪声/卡顿的第一站。
 
 ### Visual Studio
 

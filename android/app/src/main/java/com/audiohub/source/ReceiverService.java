@@ -281,7 +281,17 @@ public class ReceiverService extends Service {
                 if (jb.occupancyFrames() < frames) continue;   // 这路还没攒够，跳过
                 jb.pull(block, frames);
                 final float g = gains.getOrDefault(e.getKey(), 1.0f);
-                for (int i = 0; i < block.length; ++i) mix[i] += block[i] * g;
+                // ⚠ 标度：pull() 写出的是 int16 样本（-32768..32767），必须先归一化到
+                // [-1,1] 再混音。后面的软限幅（0.85 阈值）、dBFS 统计、输出换算全部
+                // 按归一化域设计，与 C++ 端一致（src/hub_core.cpp 里
+                // scratch[i] = src[i] * (1/32768) 之后才进 MixBlock）。
+                //
+                // 716c4b4 重构两屏流程时把这里的 /32768 弄丢了，
+                // 导致 mix 一直是 int16 量级：软限幅会把每个 |x|>0.85 的样本都
+                // 压成 ±1，输出就变成跟随音乐零交叉的满幅方波 —— 听感就是
+                // 很重的电流音/爆音。3ba77d9 与 40491ec 修的都是它的表面症状。
+                final float scale = g * (1.0f / 32768.0f);
+                for (int i = 0; i < block.length; ++i) mix[i] += block[i] * scale;
                 active++;
             }
             sStreamCount = streams.size();
