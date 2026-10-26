@@ -279,6 +279,24 @@ int main(int argc, char** argv) {
                          if (audiohub::JsonFindBool(body, "on", &b)) hub.SetAutoAccept(b);
                          return "{\"ok\":true}";
                        }
+                       if (method == "POST" && path == "/api/role") {
+                         std::string ip;
+                         std::string hub_ip;
+                         double audio_port = 0;
+                         double hub_port = 0;
+                         double is_hub = 1;
+                         if (!audiohub::JsonGetString(body, "ip", &ip) ||
+                             !audiohub::JsonFindNumber(body, "audioPort", &audio_port)) {
+                           return "{\"ok\":false,\"error\":\"ip/audioPort missing\"}";
+                         }
+                         audiohub::JsonGetString(body, "hubIp", &hub_ip);
+                         audiohub::JsonFindNumber(body, "hubPort", &hub_port);
+                         if (!audiohub::JsonFindNumber(body, "hub", &is_hub)) is_hub = 1;
+                         const bool ok = hub.SendRoleCommand(
+                             ip, static_cast<uint16_t>(audio_port), is_hub != 0, hub_ip,
+                             static_cast<uint16_t>(hub_port));
+                         return ok ? "{\"ok\":true}" : "{\"ok\":false}";
+                       }
                        if (method == "POST" && path == "/api/refresh") {
                          hub.RefreshDiscovery();
                          return "{\"ok\":true}";

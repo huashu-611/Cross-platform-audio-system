@@ -39,6 +39,18 @@ public final class InviteListener {
     public static final java.util.List<Pending> sPending =
             java.util.Collections.synchronizedList(new java.util.ArrayList<Pending>());
 
+    /**
+     * 对端下发的角色指令。界面轮询后执行一次然后清空。
+     *   "hub"                 → 本机当汇聚端，开始接收
+     *   "source|<ip>|<port>"  → 本机当音源，把声音送到 ip:port
+     *
+     * 注意：这是局域网内的明文控制帧，没有鉴权。
+     * 同一局域网内任何设备都能发；作为内网工具可以接受，
+     * 但要清楚这一点。
+     */
+    public static volatile String sRoleCommand = null;
+
+
     public static volatile boolean sInvitePending = false;
     public static volatile String sInviteName = "";
     public static volatile String sInviteIp = "";
@@ -176,6 +188,16 @@ public final class InviteListener {
                 sInviteIp = ip;
                 sInvitePort = port;
                 sInvitePending = true;
+            } else if ("ROLE".equals(parts[0])) {
+                // ROLE|hub   或   ROLE|source|ip:port
+                if (parts.length >= 2 && "hub".equals(parts[1])) {
+                    sRoleCommand = "hub";
+                } else if (parts.length >= 3 && "source".equals(parts[1])
+                        && parts[2].contains(":")) {
+                    final int c = parts[2].lastIndexOf(':');
+                    sRoleCommand = "source|" + parts[2].substring(0, c) + "|"
+                            + parts[2].substring(c + 1);
+                }
             } else if ("CONN-REQ".equals(parts[0]) && parts.length >= 3) {
                 // 别的设备要把声音送到本机：不能自动同意，
                 // 与学生方案一致——建立连接必须由接收方明确确认。

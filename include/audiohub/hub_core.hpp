@@ -102,6 +102,12 @@ class HubCore {
   // 邀请一台已发现的设备把声音送过来（发起方是 PC，但音频流向不变）
   bool InvitePeer(const Peer& peer);
 
+  // 远程指挥对端切换角色（控制通道）
+  //   make_hub=true  → 告诉对端"你来当汇聚端"
+  //   make_hub=false → 告诉对端"把声音送到 hub_ip:hub_port"
+  bool SendRoleCommand(const std::string& peer_ip, uint16_t peer_audio_port,
+                       bool make_hub, const std::string& hub_ip, uint16_t hub_port);
+
   std::string local_ip() const;
   void SetEventCallback(std::function<void(const std::string&)> cb);
 

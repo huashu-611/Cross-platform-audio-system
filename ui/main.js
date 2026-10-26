@@ -90,8 +90,26 @@ ipcMain.handle('hub:setRole', async (_e, arg) => {
 
   if (self) {
     stopPcSource()
+    // 把对端变回"音源"：告诉它往本机送
+    if (arg && arg.prevIp) {
+      const st = await httpRequest('GET', '/api/state')
+      const colon = st && st.ip ? st.ip.lastIndexOf(':') : -1
+      const hubIp = colon > 0 ? st.ip.slice(0, colon) : ''
+      const hubPort = colon > 0 ? parseInt(st.ip.slice(colon + 1), 10) : DATA_PORT
+      await httpRequest('POST', '/api/role', {
+        ip: arg.prevIp, audioPort: arg.prevPort, hub: 0,
+        hubIp, hubPort
+      })
+    }
     return { ok: true }
   }
+
+  // 把对端变成"汇聚端"：让它自己开始接收
+  // 先发邀请（对方界面会出现请求），再发角色指令（对方自动切过去）
+  await httpRequest('POST', '/api/invite', { ip: arg.ip, audioPort: arg.audioPort })
+  await httpRequest('POST', '/api/role', { ip: arg.ip, audioPort: arg.audioPort, hub: 1 })
+
+  // 本机转为音源：把电脑的声音送到对端
   startPcSource(arg.ip, arg.audioPort)
   return { ok: true }
 })

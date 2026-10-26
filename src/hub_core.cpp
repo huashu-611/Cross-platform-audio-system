@@ -774,6 +774,22 @@ void HubCore::RejectConnection(uint16_t stream_id) { impl_->RejectConnection(str
 void HubCore::Disconnect(uint16_t stream_id) { impl_->Disconnect(stream_id); }
 void HubCore::SetAutoAccept(bool on) { impl_->SetAutoAccept(on); }
 bool HubCore::auto_accept() const { return impl_->auto_accept(); }
+bool HubCore::SendRoleCommand(const std::string& peer_ip, uint16_t peer_audio_port,
+                              bool make_hub, const std::string& hub_ip,
+                              uint16_t hub_port) {
+  if (peer_ip.empty() || peer_audio_port == 0) return false;
+  std::string frame;
+  if (make_hub) {
+    frame = "ROLE|hub\n";
+  } else {
+    frame = "ROLE|source|" + hub_ip + ":" + std::to_string(hub_port) + "\n";
+  }
+  const uint16_t hs_port = static_cast<uint16_t>(peer_audio_port + kControlPortOffset);
+  const bool ok = impl_->handshake_socket.SendToAddr(peer_ip, hs_port, frame.data(), frame.size());
+  impl_->Emit("[>] 角色指令 -> " + peer_ip + ":" + std::to_string(hs_port) + "  " + frame);
+  return ok;
+}
+
 bool HubCore::InvitePeer(const Peer& peer) { return impl_->InvitePeer(peer.ip, peer.audio_port); }
 
 std::string HubCore::local_ip() const { return LocalIPv4List(); }

@@ -754,6 +754,28 @@ public class MainActivity extends Activity {
             graph.setData(hubLabel, hubLevel, names, ids, levels);
         }
 
+        // 对端下发的角色指令：自动同步角色（方案 7.3 的远程分支）
+        final String roleCmd = InviteListener.sRoleCommand;
+        if (roleCmd != null) {
+            InviteListener.sRoleCommand = null;
+            if ("hub".equals(roleCmd)) {
+                Toast.makeText(this, "对端已把本机设为汇聚端", Toast.LENGTH_SHORT).show();
+                setLocalHub();
+            } else if (roleCmd.startsWith("source|")) {
+                final String[] p3 = roleCmd.split("\\|");
+                if (p3.length >= 3) {
+                    Discovery.Device d = new Discovery.Device();
+                    d.ip = p3[1];
+                    d.audioPort = parseInt(p3[2], 47000);
+                    d.name = p3[1];
+                    d.canSend = true;
+                    d.canReceive = true;
+                    Toast.makeText(this, "对端已把本机设为音源", Toast.LENGTH_SHORT).show();
+                    pickRemoteHub(d);
+                }
+            }
+        }
+
         // 待确认的接入请求：两块屏都渲染，会话进行中也能接人
         final java.util.List<InviteListener.Pending> pending;
         synchronized (InviteListener.sPending) {

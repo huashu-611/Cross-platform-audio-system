@@ -13,6 +13,8 @@ let selected = null             // 被点选的球 {kind:'hub'|'source', id}
 // 角色：连接之后才确定。默认 PC 为汇聚端（本机）。
 let hubSelf = true
 let hubLabel = '本机'
+let lastRemote = null          // 上一次选中的远端，切回本机时要用它通知对方
+
 let hubSelectSig = ''           // 选择器选项的签名，避免每 tick 重建
 
 const $ = (id) => document.getElementById(id)
@@ -250,11 +252,17 @@ $('hubSelect').addEventListener('change', async (e) => {
   if (v === 'self') {
     hubSelf = true
     hubLabel = '本机'
-    await window.hub.setRole({ self: true })
+    await window.hub.setRole({
+      self: true,
+      prevIp: lastRemote ? lastRemote.ip : null,
+      prevPort: lastRemote ? lastRemote.port : 0
+    })
+    lastRemote = null
   } else {
     const [ip, portStr] = v.split(':')
     hubSelf = false
     hubLabel = ip
+    lastRemote = { ip, port: Number(portStr) }
     await window.hub.setRole({ self: false, ip, audioPort: Number(portStr) })
   }
   hubSelectSig = ''
