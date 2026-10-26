@@ -57,6 +57,8 @@ public class ReceiverService extends Service {
     public static volatile double sBusLevel = -120.0;
     public static volatile int sOccupancyMs = 0;
     public static volatile int sStreamCount = 0;
+    // 累计欠载帧数：持续增长说明缓冲在饿（时钟偏差或丢包）
+    public static volatile long sUnderrun = 0;
 
     // 收到的连接邀请（界面轮询后弹窗）
     public static volatile boolean sInvitePending = false;
@@ -290,7 +292,12 @@ public class ReceiverService extends Service {
                 final double mean = levelFrames > 0 ? levelSum / levelFrames : 0;
                 sBusLevel = mean > 0 ? 10 * Math.log10(mean) : -120.0;
                 int occ = 0;
-                for (JitterBuffer jb : streams.values()) occ += jb.occupancyFrames();
+                long under = 0;
+                for (JitterBuffer jb : streams.values()) {
+                    occ += jb.occupancyFrames();
+                    under += jb.underrunFrames();
+                }
+                sUnderrun = under;
                 sOccupancyMs = streams.isEmpty() ? 0 : occ / streams.size() / 48;
                 levelSum = 0;
                 levelFrames = 0;

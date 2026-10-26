@@ -744,7 +744,9 @@ public class MainActivity extends Activity {
             if (isLocalHub()) {
                 hubSub.setText(ReceiverService.sRunning
                         ? ("已接收 " + ReceiverService.sStreamCount + " 路 · 总线 "
-                           + String.format("%.1f", ReceiverService.sBusLevel) + " dBFS")
+                           + String.format("%.1f", ReceiverService.sBusLevel)
+                           + (ReceiverService.sUnderrun > 0
+                               ? " · 欠载 " + ReceiverService.sUnderrun : ""))
                         : "接收服务未启动");
             } else {
                 hubSub.setText(CaptureService.sRunning
@@ -756,7 +758,9 @@ public class MainActivity extends Activity {
             if (isLocalHub()) {
                 hubSub.setText(ReceiverService.sRunning
                         ? ("已接收 " + ReceiverService.sStreamCount + " 路 · 总线 "
-                           + String.format("%.1f", ReceiverService.sBusLevel) + " dBFS")
+                           + String.format("%.1f", ReceiverService.sBusLevel)
+                           + (ReceiverService.sUnderrun > 0
+                               ? " · 欠载 " + ReceiverService.sUnderrun : ""))
                         : "接收服务未启动");
             } else {
                 hubSub.setText(CaptureService.sRunning

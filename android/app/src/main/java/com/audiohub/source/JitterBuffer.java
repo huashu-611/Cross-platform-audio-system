@@ -1,15 +1,26 @@
 package com.audiohub.source;
 
 /**
- * 音频抖动缓冲：按绝对采样序号索引，与 C++ 端（src/jitter_buffer.cpp）同思路。
+ * 音频抖动缓冲：按**绝对采样序号**索引。
  *
- * 为什么不能用队列：队列分不清"包还没到"和"包丢了"，也用不了迟到包的后半段。
- * 按绝对序号索引之后，乱序包能落回正确位置，缺口自动补零。
+ * 这里曾经有一个致命 bug，值得写清楚：
+ *   槽位原来是 (abs - readPos) % 容量 —— 写入用的是当时的 readPos，
+ *   读取用的是已经推进过的 readPos。读指针一动，写进去的数据就错位了，
+ *   读指针翻到的槽位不是当初写的那个，于是绝大多数帧被判为无效输出静音，
+ *   只偶尔凑巧对上一点 → 听感上就是"没有声音，偶尔有点电流杂音"。
  *
- * 存 short（交织双声道）而不是 float：AudioTrack 原生吃 short[]，
- * 少一次转换就少一次拷贝。
+ * 正确做法：槽位 = abs % 容量。与读指针无关，写入与读取永远指向同一格。
+ * 有效性用 valid[] 位图标记，读走一格就失效，避免读到上一圈的旧数据。
+ *
+ * 另外 Android 端没有 ASRC，收发两端晶振必然有偏差，缓冲会缓慢涨/降。
+ * 这里做最轻量的速率微调：缓冲偏高就多消费一帧（丢弃），偏低就少消费一帧
+ * （重复），每 5 ms 一个块最多差 1 帧 ≈ 0.4%，足以跟上常见晶振偏差（±0.1%）。
  */
 final class JitterBuffer {
+
+    private static final int PREFILL_MS = 60;      // 起始预留，抗网络抖动
+    private static final int HIGH_MS = 180;        // 超过它开始抽帧
+    private static final int LOW_MS = 45;          // 低于它开始补帧
 
     private final short[] data;
     private final boolean[] valid;
@@ -20,40 +31,41 @@ final class JitterBuffer {
     private long readPos;          // 下一个要读的绝对帧序号
     private long highestWritten;
     private boolean started;
-    private long framesUnderrun;
-    private long packetsOverflow;
+
+    private long underrunFrames;
+    private long droppedFrames;
+    private long duplicatedFrames;
+
+    // drop/duplicate 用的临时缓冲
+    private final short[] scratch;
 
     JitterBuffer(int channels, int capacityFrames) {
         this.channels = channels;
         this.capacityFrames = capacityFrames;
         this.data = new short[capacityFrames * channels];
         this.valid = new boolean[capacityFrames];
+        this.scratch = new short[1024 * channels];
     }
 
     /**
      * 写入一包。
-     * @return true = 收下；false = 迟到（readPos 已越过）或溢出（超出容量）
+     * @return true = 收下；false = 迟到（已被读过）或超出容量
      */
     boolean push(long pos, short[] samples, int frames) {
         synchronized (lock) {
             if (!started) {
-                // 目标延迟 60ms：把读指针设在首包前 60ms，给网络抖动留余量
-                readPos = pos - 60 * 48;
+                // 首包之前预留 60 ms，给网络抖动留余量
+                readPos = pos - PREFILL_MS * 48L;
                 started = true;
             }
             final long end = pos + frames;
-            if (end <= readPos) {
-                packetsOverflow++;   // 实为迟到，归到同一计数
-                return false;
-            }
-            if (end > readPos + capacityFrames) {
-                packetsOverflow++;
-                return false;
-            }
+            if (end <= readPos) return false;                    // 已经全部过期
+            if (pos >= readPos + capacityFrames) return false;   // 超出容量窗口
+
             for (int i = 0; i < frames; ++i) {
                 final long abs = pos + i;
-                if (abs < readPos) continue;    // 部分迟到：跳过已读部分
-                final int idx = (int) ((abs - readPos) % capacityFrames);
+                if (abs < readPos || abs >= readPos + capacityFrames) continue;
+                final int idx = (int) (abs % capacityFrames);
                 data[idx * channels] = samples[i * channels];
                 if (channels > 1) data[idx * channels + 1] = samples[i * channels + 1];
                 valid[idx] = true;
@@ -63,27 +75,54 @@ final class JitterBuffer {
         }
     }
 
-    /** 取 frames 帧；无效位置补零。读指针始终推进。 */
+    /** 取 frames 帧；无效位置补零。读指针按漂移补偿后的步长推进。 */
     void pull(short[] out, int frames) {
         synchronized (lock) {
             if (!started) {
                 java.util.Arrays.fill(out, (short) 0);
                 return;
             }
-            for (int i = 0; i < frames; ++i) {
-                final long abs = readPos + i;
-                final int idx = (int) ((abs - readPos) % capacityFrames);
-                if (valid[idx]) {
-                    out[i * channels] = data[idx * channels];
-                    if (channels > 1) out[i * channels + 1] = data[idx * channels + 1];
-                } else {
-                    framesUnderrun++;
-                    out[i * channels] = 0;
-                    if (channels > 1) out[i * channels + 1] = 0;
-                }
-                valid[idx] = false;
+
+            // 漂移补偿：按缓冲水位决定这次多消费还是少消费一帧
+            final long occ = highestWritten - readPos;
+            int step = frames;
+            if (occ > HIGH_MS * 48L) {
+                step = frames + 1;              // 偏高：多消费一帧（轻微加快）
+            } else if (occ < LOW_MS * 48L) {
+                step = Math.max(1, frames - 1); // 偏低：少消费一帧（轻微放慢）
             }
-            readPos += frames;
+
+            final int cap = scratch.length / channels;
+            final int n = Math.min(step, cap);
+            for (int i = 0; i < n; ++i) {
+                final long abs = readPos + i;
+                final int idx = (int) (abs % capacityFrames);
+                if (valid[idx]) {
+                    scratch[i * channels] = data[idx * channels];
+                    if (channels > 1) scratch[i * channels + 1] = data[idx * channels + 1];
+                    valid[idx] = false;
+                } else {
+                    underrunFrames++;
+                    scratch[i * channels] = 0;
+                    if (channels > 1) scratch[i * channels + 1] = 0;
+                }
+            }
+
+            // 输出恒为 frames 帧：多读了丢掉尾部，少读了重复最后一帧
+            final int copy = Math.min(frames, n);
+            System.arraycopy(scratch, 0, out, 0, copy * channels);
+            if (copy < frames) {
+                duplicatedFrames += (frames - copy);
+                final int last = (copy > 0 ? copy - 1 : 0) * channels;
+                for (int i = copy; i < frames; ++i) {
+                    out[i * channels] = scratch[last];
+                    if (channels > 1) out[i * channels + 1] = scratch[last + 1];
+                }
+            } else if (n > frames) {
+                droppedFrames += (n - frames);
+            }
+
+            readPos += n;
         }
     }
 
@@ -95,19 +134,17 @@ final class JitterBuffer {
         }
     }
 
-    /** 清空回到"从未收到过任何包"的状态。连接确认后调用。 */
+    /** 清空回到"从未收到过任何包"的状态。 */
     void reset() {
         synchronized (lock) {
             java.util.Arrays.fill(valid, false);
             readPos = 0;
             highestWritten = 0;
             started = false;
-            pendingSilence = 0;
         }
     }
 
-    private int pendingSilence;
-
-    long underrunFrames() { synchronized (lock) { return framesUnderrun; } }
-    long overflowPackets() { synchronized (lock) { return packetsOverflow; } }
+    long underrunFrames() { synchronized (lock) { return underrunFrames; } }
+    long droppedFrames() { synchronized (lock) { return droppedFrames; } }
+    long duplicatedFrames() { synchronized (lock) { return duplicatedFrames; } }
 }
