@@ -168,7 +168,10 @@ public class ReceiverService extends Service {
             fail("设备不支持 48kHz 双声道播放");
             return false;
         }
-        final int bufBytes = Math.max(minBuf * 2, PacketProtocol.PAYLOAD_BYTES * 6);
+        // 缓冲越小延迟越低，但低于设备最小值会频繁欠载。
+        // 原来取 minBuf*2（相当于白送一整个最小缓冲的延迟），
+        // 现在取"设备最小值"与"4 个包"的较大者，延迟能降一半。
+        final int bufBytes = Math.max(minBuf, PacketProtocol.PAYLOAD_BYTES * 4);
 
         AudioTrack t;
         try {

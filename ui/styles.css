@@ -314,3 +314,10 @@ input[type=range]::-moz-range-thumb { width: 12px; height: 12px; border-radius: 
   width: 14px; height: 14px; accent-color: var(--accent); cursor: pointer;
 }
 .autochk:hover { color: var(--text); }
+
+/* ---------- 瞬时通知（新设备接入） ---------- */
+.banner.ok {
+  background: oklch(0.42 0.12 155 / .18);
+  border-color: oklch(0.62 0.14 155 / .45);
+  color: oklch(0.88 0.08 155);
+}

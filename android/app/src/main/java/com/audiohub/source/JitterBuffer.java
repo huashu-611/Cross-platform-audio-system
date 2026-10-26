@@ -18,8 +18,17 @@ package com.audiohub.source;
  */
 final class JitterBuffer {
 
-    private static final int PREFILL_MS = 100;     // 起始预留，抗网络抖动（含发包成簇）
-    private static final int MAX_STEP_ADJUST = 4;  // 每块最多多/少消费几帧（4/240 ≈ 1.7%）
+    // 包内可见：测试直接引用，避免"改了实现忘了改测试常量"
+    static final int PREFILL_MS = 60;      // 起始预留（延迟优先，抖动靠下面的修正吸收）
+    // 死区：水位在 [目标-40ms, 目标+40ms] 之内完全不动（step 恒等于 frames）。
+    //
+    // 这里踩过一个坑：为了让水位"精确"跟随目标，曾经允许每块 ±4 帧的调整。
+    // 但 step>frames 的实现是"读 244 帧、只输出前 240 帧"——等于每 5ms
+    // 硬切掉 4 帧，一秒切 200 次，听感就是持续的电流爆音。
+    // 正确做法是让修正在时间上稀疏：只有偏差持续超出死区才动，且每次只动 1 帧。
+    private static final int DEADBAND_MS = 40;
+    private static final int MAX_STEP_ADJUST = 1;
+    private static final int ADJUST_COOLDOWN = 12;  // 每次修正后至少间隔 12 块（约 60ms）
     // 连续这么多块（约 200 ms）一帧数据都没有，就认为时间轴已经跑偏，
     // 重新对齐到下一个包的序号上。没有这个机制，一次卡顿之后
     // 读指针会永远跑在写指针前面，欠载数一路涨（实测到 38573 帧）。
@@ -36,6 +45,7 @@ final class JitterBuffer {
     private boolean started;
 
     private int starveTicks;
+    private int cooldown;          // 修正冷却，避免每块都切
     private long underrunFrames;
     private long droppedFrames;
     private long duplicatedFrames;
@@ -113,9 +123,18 @@ final class JitterBuffer {
 
             final long target = (long) PREFILL_MS * 48;
             final long err = occ - target;                    // >0 偏多，<0 偏少
-            int adjust = (int) (err / 840);                   // 约 17.5ms 偏差 → 1 帧
-            if (adjust > MAX_STEP_ADJUST) adjust = MAX_STEP_ADJUST;
-            if (adjust < -MAX_STEP_ADJUST) adjust = -MAX_STEP_ADJUST;
+            final long band = (long) DEADBAND_MS * 48;
+
+            int adjust = 0;
+            if (cooldown > 0) {
+                cooldown--;
+            } else if (err > band) {
+                adjust = MAX_STEP_ADJUST;        // 偏高：多消费 1 帧
+                cooldown = ADJUST_COOLDOWN;
+            } else if (err < -band) {
+                adjust = -MAX_STEP_ADJUST;       // 偏低：少消费 1 帧
+                cooldown = ADJUST_COOLDOWN;
+            }
             int step = Math.max(1, frames + adjust);
 
             final int cap = scratch.length / channels;

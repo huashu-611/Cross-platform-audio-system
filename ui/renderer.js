@@ -381,6 +381,31 @@ function renderControlDevices (state) {
   renderPeers($('ctrlPeers'), state)
 }
 
+// ============================================================ 瞬时会话通知
+//
+// 之前"新设备接入"只是默默多一个球，用户根本感知不到，
+// 于是经常以为"手机切换了但电脑没反应"。这里给它一条明确的提示。
+let knownSourceIds = new Set()
+let noticeText = ''
+let noticeUntil = 0
+
+function showNotice (text) {
+  noticeText = text
+  noticeUntil = Date.now() + 4000
+}
+
+function checkNewSources (state) {
+  const ids = new Set()
+  for (const s of (state.sources || [])) {
+    if (!s.confirmed) continue
+    ids.add(s.id)
+    if (!knownSourceIds.has(s.id)) {
+      showNotice((s.peerName || ('设备 ' + s.id)) + ' 已接入')
+    }
+  }
+  knownSourceIds = ids
+}
+
 // ============================================================ 主刷新
 
 let lastState = null
@@ -388,12 +413,19 @@ let lastState = null
 function render (state) {
   if (!state) return
   lastState = state
+  checkNewSources(state)
+
+  const b = $('banner')
   if (state.error) {
-    const b = $('banner')
     b.textContent = state.error
+    b.classList.remove('hidden', 'ok')
+  } else if (noticeText && Date.now() < noticeUntil) {
+    b.textContent = noticeText
     b.classList.remove('hidden')
+    b.classList.add('ok')
   } else {
-    $('banner').classList.add('hidden')
+    b.classList.add('hidden')
+    b.classList.remove('ok')
   }
   $('addr').textContent = state.ip || '—'
 
