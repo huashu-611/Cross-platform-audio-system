@@ -42,6 +42,51 @@ function hubExePath () {
   return path.join(__dirname, '..', 'build', 'audiohub-hub.exe')
 }
 
+function stopHub () {
+  if (hubProcess) {
+    hubProcess.kill()
+    hubProcess = null
+  }
+}
+
+// 本机作为音源：把电脑的声音送到远端汇聚端。
+// 用现成的 audiohub-source，避免在 Electron 里重写采集。
+let pcSourceProcess = null
+
+function startPcSource (ip, port) {
+  stopPcSource()
+  const exe = process.resourcesPath
+    ? path.join(process.resourcesPath, 'app.asar.unpacked', 'bin', 'audiohub-source.exe')
+    : path.join(__dirname, 'bin', 'audiohub-source.exe')
+  pcSourceProcess = spawn(exe, [
+    '--hub', ip + ':' + port,
+    '--handshake',
+    '--device-name', 'PC 音源',
+    '--stream-id', '1'
+  ], { windowsHide: true, stdio: 'ignore' })
+  pcSourceProcess.on('exit', () => { pcSourceProcess = null })
+}
+
+function stopPcSource () {
+  if (pcSourceProcess) {
+    pcSourceProcess.kill()
+    pcSourceProcess = null
+  }
+}
+
+// 汇聚端设定：连接之后才调用（方案 7.3 节）
+ipcMain.handle('hub:setRole', async (_e, arg) => {
+  const self = arg && arg.self !== undefined ? arg.self : true
+  if (self) {
+    stopPcSource()
+    startHub()
+    return { ok: true }
+  }
+  stopHub()
+  startPcSource(arg.ip, arg.audioPort)
+  return { ok: true }
+})
+
 function startHub () {
   const exe = hubExePath()
   hubProcess = spawn(exe, [

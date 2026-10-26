@@ -28,6 +28,9 @@ contextBridge.exposeInMainWorld('hub', {
   // 主动扫描一轮，返回本次扫到的设备
   scan: () => ipcRenderer.invoke('hub:scan'),
 
+  // 设定汇聚端：self=true 本机；false 时给 ip/audioPort
+  setRole: (arg) => ipcRenderer.invoke('hub:setRole', arg),
+
   // 连接握手
   invitePeer: (peer) => ipcRenderer.invoke('hub:invite', peer),
   accept: (streamId) => ipcRenderer.invoke('hub:accept', { streamId }),

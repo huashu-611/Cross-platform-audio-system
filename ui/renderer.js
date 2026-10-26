@@ -10,6 +10,11 @@
 let screen = 'connect'          // 'connect' | 'control'
 let selected = null             // 被点选的球 {kind:'hub'|'source', id}
 
+// 角色：连接之后才确定。默认 PC 为汇聚端（本机）。
+let hubSelf = true
+let hubLabel = '本机'
+let hubSelectSig = ''           // 选择器选项的签名，避免每 tick 重建
+
 const $ = (id) => document.getElementById(id)
 
 // ============================================================ 工具
@@ -59,7 +64,8 @@ function renderGraph (state) {
   const sources = state.sources || []
   // 只把"节点集合"纳入签名。电平每秒都在变，绝不能因此重建 SVG——
   // 一重建，用户刚按下的球就被换掉，点击直接丢失（表现为"点不到"）。
-  const sig = sources.map((x) => x.id + ':' + (x.peerName || '')).join('|')
+  const sig = sources.map((x) => x.id + ':' + (x.peerName || '')).join('|') +
+              '|hub=' + hubSelf + ':' + hubLabel
   if (sig !== graphSig) {
     graphSig = sig
     buildGraphSvg(state)
@@ -70,7 +76,11 @@ function renderGraph (state) {
 function buildGraphSvg (state) {
   const svg = $('graph')
   const sources = state.sources || []
-  const nodes = layoutGraph(sources, '本机 · 汇聚')
+  // 本机不是汇聚端时，大球是对面的汇聚端，小球是本机（方案 4.2）
+  const nodes = hubSelf
+      ? layoutGraph(sources, hubLabel + ' · 汇聚')
+      : layoutGraph([{ id: 0, peerName: '本机', level: state.busLevel }],
+                    hubLabel + ' · 汇聚')
   const hub = nodes[0]
 
   const parts = []
@@ -146,6 +156,16 @@ function showVolumePanel (state) {
   const panel = $('volumePanel')
   const slider = $('volSlider')
   const nameEl = $('volName')
+  if (!hubSelf) {
+    // 本机只是音源，音量由对面的汇聚端调
+    nameEl.textContent = '本机是音源 · 音量由 ' + hubLabel + ' 调节'
+    slider.value = 100
+    slider.disabled = true
+    $('volPct').textContent = '—'
+    panel.style.display = ''
+    return
+  }
+  slider.disabled = false
 
   if (selected.kind === 'hub') {
     nameEl.textContent = '汇聚端总音量'
@@ -181,6 +201,47 @@ window.addEventListener('pointerup', () => { volDragging = false })
 // ============================================================ 连接界面
 
 let connectSig = ''
+
+// 汇聚端选择器：连接建立后才显示（方案 7.3）
+function renderHubSelect (state) {
+  const sel = $('hubSelect')
+  const peers = state.peers || []
+  const sig = JSON.stringify(peers.map((p) => p.name + '@' + p.ip + ':' + p.audioPort)) +
+              '|' + hubSelf + '|' + hubLabel
+  if (sig === hubSelectSig) return
+  hubSelectSig = sig
+
+  const prev = hubSelf ? 'self' : 'remote'
+  sel.innerHTML = ''
+  const optSelf = document.createElement('option')
+  optSelf.value = 'self'
+  optSelf.textContent = '本机（电脑）'
+  sel.appendChild(optSelf)
+  for (const p of peers) {
+    const o = document.createElement('option')
+    o.value = p.ip + ':' + p.audioPort
+    o.textContent = p.name + '（' + p.ip + '）'
+    sel.appendChild(o)
+  }
+  sel.value = prev
+}
+
+$('hubSelect').addEventListener('change', async (e) => {
+  const v = e.target.value
+  if (v === 'self') {
+    hubSelf = true
+    hubLabel = '本机'
+    await window.hub.setRole({ self: true })
+  } else {
+    const [ip, portStr] = v.split(':')
+    hubSelf = false
+    hubLabel = ip
+    await window.hub.setRole({ self: false, ip, audioPort: Number(portStr) })
+  }
+  hubSelectSig = ''
+  graphSig = ''
+  render(lastState)
+})
 
 function renderConnect (state) {
   // 200ms 轮询会把整片 DOM 重建一次，用户正在点的那个按钮就被换掉了。
@@ -247,7 +308,9 @@ function render (state) {
 
   const sources = state.sources || []
   const confirmedCount = sources.filter((s) => s.confirmed).length
-  const anyConnection = confirmedCount > 0
+  // 本机切走汇聚端后会变成"纯音源"：本地没有 sources，
+  // 但会话明明还在。只看 sources 会把界面误跳回连接界面。
+  const anyConnection = confirmedCount > 0 || !hubSelf
 
   // 自动切换屏幕：有连接 → 控制；没有 → 连接
   const next = anyConnection ? 'control' : 'connect'
@@ -259,6 +322,7 @@ function render (state) {
   if (screen === 'connect') {
     renderConnect(state)
   } else {
+    renderHubSelect(state)
     renderGraph(state)
     if (selected) showVolumePanel(state)
   }

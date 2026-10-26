@@ -231,29 +231,9 @@ public class MainActivity extends Activity {
         screenConnect = new LinearLayout(this);
         screenConnect.setOrientation(LinearLayout.VERTICAL);
 
-        screenConnect.addView(sectLabel("汇聚端"));
-        LinearLayout hubCard = card();
-        LinearLayout hubRow = new LinearLayout(this);
-        hubRow.setOrientation(LinearLayout.HORIZONTAL);
-        hubRow.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout hubInfo = new LinearLayout(this);
-        hubInfo.setOrientation(LinearLayout.VERTICAL);
-        hubInfo.setLayoutParams(new LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        hubValue = new TextView(this);
-        hubValue.setTextSize(15);
-        hubValue.setTextColor(COLOR_TEXT);
-        hubInfo.addView(hubValue);
-        hubInfo.addView(sub("收到的声音从这里播出"));
-        hubRow.addView(hubInfo);
-        Button change = textButton("更改", COLOR_ACCENT);
-        change.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) { showHubPicker(); }
-        });
-        hubRow.addView(change);
-        hubCard.addView(hubRow);
-        screenConnect.addView(hubCard);
+        TextView connectHint = sub("先建立连接，再在控制界面里指定谁当汇聚端");
+        connectHint.setPadding(0, 0, 0, dp(10));
+        screenConnect.addView(connectHint);
 
         screenConnect.addView(sectLabel("本机声音"));
         LinearLayout srcCard = card();
@@ -377,6 +357,30 @@ public class MainActivity extends Activity {
         volRow.addView(mute);
         volPanel.addView(volRow);
         screenControl.addView(volPanel);
+
+        // 汇聚端设定：连接建立之后才出现（方案第 4.2 节）
+        LinearLayout hubBar = card();
+        LinearLayout hubRowC = new LinearLayout(this);
+        hubRowC.setOrientation(LinearLayout.HORIZONTAL);
+        hubRowC.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout hubInfoC = new LinearLayout(this);
+        hubInfoC.setOrientation(LinearLayout.VERTICAL);
+        hubInfoC.setLayoutParams(new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        hubValue = new TextView(this);
+        hubValue.setTextSize(15);
+        hubValue.setTextColor(COLOR_TEXT);
+        hubInfoC.addView(hubValue);
+        hubInfoC.addView(sub("当前承担收流 / 混音 / 播放的一端"));
+        hubRowC.addView(hubInfoC);
+        Button switchHub = textButton("切换", COLOR_ACCENT);
+        switchHub.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) { showHubPicker(); }
+        });
+        hubRowC.addView(switchHub);
+        hubBar.addView(hubRowC);
+        screenControl.addView(hubBar);
 
         Button leave = textButton("断开所有连接", COLOR_WARN);
         leave.setOnClickListener(new View.OnClickListener() {
@@ -609,7 +613,9 @@ public class MainActivity extends Activity {
         // 两端看到的是同一张网络图，只是谁是中间那个大球不同。
         final boolean hubRunning = ReceiverService.sRunning;
         final boolean receiving = hubRunning && ReceiverService.sStreamCount > 0;
-        final boolean inSession = receiving || srcRunning;
+        // 只要承担任一角色的服务在跑，就算会话中。
+        // 切走汇聚端之后本机不再收流，但会话并没有结束。
+        final boolean inSession = receiving || srcRunning || hubRunning || !isLocalHub();
         showScreen(inSession ? "control" : "connect");
 
         if (inSession) {

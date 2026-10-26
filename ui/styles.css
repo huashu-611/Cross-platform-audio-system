@@ -287,3 +287,19 @@ input[type=range]::-moz-range-thumb { width: 12px; height: 12px; border-radius: 
 }
 .ipinput::placeholder { color: var(--faint); }
 .ipinput:focus { border-color: oklch(0.62 0.17 255 / .6); }
+
+/* ---------- 汇聚端选择条（连接后才出现） ---------- */
+.hubbar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: var(--card); border: 1px solid var(--line);
+  border-radius: var(--radius-s); padding: 9px 12px; margin-top: 6px;
+}
+.hublabel { font-size: 11px; color: var(--faint); letter-spacing: .14em; }
+.hubselect {
+  background: oklch(0.2 0.03 255); color: var(--text);
+  border: 1px solid var(--line); border-radius: 7px;
+  padding: 6px 10px; font-size: 13px; font-family: inherit;
+  min-width: 180px; outline: none; cursor: pointer;
+}
+.hubselect:focus { border-color: oklch(0.62 0.17 255 / .6); }
+.hubnote { font-size: 11.5px; color: var(--faint); }
