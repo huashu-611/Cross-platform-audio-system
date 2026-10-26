@@ -352,11 +352,25 @@ struct HubCore::Impl {
           }
         }
 
-        if (auto_accept_.load() || !require_handshake) {
+        if (auto_accept_.load() || !require_handshake ||
+            PeerAllowedNow(from_ip)) {
           // 自动同意：直接放行
           std::lock_guard<std::mutex> lock(mutex);
           auto it = streams.find(stream_id);
-          if (it != streams.end()) {
+          if (it == streams.end()) {
+            // 先建占位：连接已经成立了，即使对方还没开始发音频，
+            // 控制界面的网络图上也应该立刻出现这台设备。
+            // 否则会出现"连上了但界面上什么都没有"的诡异状态。
+            auto created = std::make_unique<Stream>(stream_id, latency_ms);
+            created->confirmed = true;
+            created->peer_name = peer_name;
+            created->peer_ip_for_bye = from_ip;
+            created->peer_port_for_bye = from_port;
+            // 必须记下时间：默认 last_packet 是 epoch，
+            // 会被下面的"掉线清理"当成超时立刻删掉 —— 占位就白建了。
+            created->last_packet = Clock::now();
+            it = streams.emplace(stream_id, std::move(created)).first;
+          } else {
             it->second->confirmed = true;
             it->second->peer_name = peer_name;
             it->second->peer_ip_for_bye = from_ip;
@@ -476,7 +490,10 @@ struct HubCore::Impl {
           const auto idle =
               std::chrono::duration_cast<std::chrono::seconds>(now - it->second->last_packet)
                   .count();
-          if (idle > kSourceTimeoutSec) {
+          // 已确认但一包没来的流（刚同意、对方还在授权采集）给 60 秒宽限，
+          // 否则节点会在界面上闪一下就没。真正在发流的仍然按短超时清理。
+          const int limit = (it->second->packets == 0) ? 60 : kSourceTimeoutSec;
+          if (idle > limit) {
             Emit("[-] 流掉线: id=" + std::to_string(it->first));
             it = streams.erase(it);
           } else {
@@ -692,7 +709,15 @@ struct HubCore::Impl {
       ack_port = pit->second.peer_port;
       accepted_ids.insert(stream_id);
       auto sit = streams.find(stream_id);
-      if (sit != streams.end()) {
+      if (sit == streams.end()) {
+        auto created = std::make_unique<Stream>(stream_id, latency_ms);
+        created->confirmed = true;
+        created->peer_name = pit->second.peer_name;
+        created->peer_ip_for_bye = pit->second.peer_ip;
+        created->peer_port_for_bye = pit->second.peer_port;
+        created->last_packet = Clock::now();   // 理由同上
+        sit = streams.emplace(stream_id, std::move(created)).first;
+      } else {
         sit->second->confirmed = true;
         sit->second->peer_name = pit->second.peer_name;
         // 未确认期间缓冲里攒的是旧数据，sample_pos 早就落在 read_pos_ 前面，
@@ -756,6 +781,7 @@ struct HubCore::Impl {
     const uint16_t hs_port = static_cast<uint16_t>(peer_audio_port + kControlPortOffset);
     const bool ok = handshake_socket.SendToAddr(peer_ip, hs_port, invite.data(), invite.size());
     if (ok) {
+      AllowPeer(peer_ip);
       Emit("[>] 已发出邀请: " + peer_ip + ":" + std::to_string(hs_port));
     }
     return ok;
@@ -763,6 +789,23 @@ struct HubCore::Impl {
 
   // 待确认的邀请：ip -> 对端名
   std::map<std::string, std::string> invite_list;
+
+  // 本机主动邀请/任命过的对端：它随后的 CONN-REQ 直接放行。
+  //
+  // 为什么需要：PC 把汇聚端切到手机后，手机会立刻发 CONN-REQ 开始推流。
+  // 如果这一刻还要用户在 PC 上再点一次"同意"，就变成"两头都要点"，
+  // 而且 PC 端此时往往已经切到音源模式，待确认列表还被界面忽略了。
+  // 对端既然是被本机点名的，放行它的连接是合理的。
+  std::string auto_accept_ip;
+  uint64_t auto_accept_until_ms = 0;
+
+  void AllowPeer(const std::string& ip) {
+    auto_accept_ip = ip;
+    auto_accept_until_ms = NowMs() + 60'000;
+  }
+  bool PeerAllowedNow(const std::string& ip) {
+    return !ip.empty() && ip == auto_accept_ip && NowMs() < auto_accept_until_ms;
+  }
   std::string local_ip_for_invite;
   uint32_t invite_seq_ = 1;
 };
@@ -808,6 +851,7 @@ bool HubCore::SendRoleCommand(const std::string& peer_ip, uint16_t peer_audio_po
   }
   const uint16_t hs_port = static_cast<uint16_t>(peer_audio_port + kControlPortOffset);
   const bool ok = impl_->handshake_socket.SendToAddr(peer_ip, hs_port, frame.data(), frame.size());
+  impl_->AllowPeer(peer_ip);
   impl_->Emit("[>] 角色指令 -> " + peer_ip + ":" + std::to_string(hs_port) + "  " + frame);
   return ok;
 }
