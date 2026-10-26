@@ -348,7 +348,9 @@ public class ReceiverService extends Service {
             s.setSoTimeout(1000);
             final String req = "CONN-REQ|" + deviceName + "|1\n";
             final byte[] data = req.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            for (int i = 0; i < 10; ++i) {
+            // 等 30 秒：对方需要在界面上点"同意"，10 秒往往不够。
+            // 窗口太短会让"我点了同意但手机已经放弃了"成为常见故障。
+            for (int i = 0; i < 30; ++i) {
                 s.send(new DatagramPacket(data, data.length,
                         InetAddress.getByName(pcIp), pcAudioPort + 2));
                 byte[] rbuf = new byte[256];

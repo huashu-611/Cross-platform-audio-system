@@ -215,6 +215,10 @@ struct Discovery::Impl {
     peer.name = parts[6];
     peer.last_seen_ms = NowMs();
 
+    // 跳过自己发出的信标：否则自己的设备会出现在列表里，
+    // 用户很可能点到自己，然后疑惑"为什么连自己连不上"。
+    if (peer.audio_port == audio_port && peer.ip == local_ip) return;
+
     const std::string key = peer.ip + ":" + std::to_string(peer.audio_port);
     std::lock_guard<std::mutex> lock(mutex);
     peers[key] = peer;

@@ -420,6 +420,18 @@ $('leaveBtn').addEventListener('click', async () => {
 
 // ============================================================ 订阅
 
+// 调试快照：排查"界面没切换"时直接读它，比看日志快
+window.__hubDebug = () => ({
+  screen,
+  hubSelf,
+  hubLabel,
+  sources: (lastState && lastState.sources ? lastState.sources : []).length,
+  confirmed: (lastState && lastState.sources ? lastState.sources : [])
+      .filter((x) => x.confirmed).length,
+  peers: (lastState && lastState.peers ? lastState.peers : []).length,
+  controlShown: !!$('screenControl') && $('screenControl').style.display !== 'none'
+})
+
 const unsubscribe = window.hub.onState(render)
 window.addEventListener('beforeunload', unsubscribe)
 window.hub.getState().then(render)

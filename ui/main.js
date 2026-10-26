@@ -93,7 +93,12 @@ function startHub () {
     '--port', String(DATA_PORT),
     '--http-port', String(HTTP_PORT),
     '--latency', String(LATENCY_MS)
-  ], { stdio: 'ignore' })
+  ], { stdio: ['ignore', 'pipe', 'pipe'] })
+
+  // 音频核心的输出必须能看到：端口被占、设备打不开、握手异常
+  // 都只在这里体现。之前用 stdio:'ignore' 等于把唯一的线索丢了。
+  hubProcess.stdout.on('data', (d) => process.stdout.write('[hub] ' + d))
+  hubProcess.stderr.on('data', (d) => process.stderr.write('[hub] ' + d))
 
   hubProcess.on('exit', (code) => {
     hubProcess = null
@@ -168,7 +173,31 @@ function createWindow () {
     }
   })
 
+  // 渲染进程的 console 默认不会进主进程 stdout，
+  // 排查"界面没反应"时看不到任何线索。转发出来。
+  mainWindow.webContents.on('console-message', (_e, level, message, line, source) => {
+    if (level >= 2) {
+      console.error('[renderer] ' + message + ' (' + source + ':' + line + ')')
+    }
+  })
+  mainWindow.webContents.on('render-process-gone', (_e, details) => {
+    console.error('[renderer] 进程异常退出: ' + JSON.stringify(details))
+  })
+
   mainWindow.loadFile('index.html')
+
+  // HUB_DEBUG=1 时定时打印渲染层状态（排查界面不切换用）
+  if (process.env.HUB_DEBUG === '1') {
+    setInterval(async () => {
+      try {
+        const info = await mainWindow.webContents.executeJavaScript(
+          'window.__hubDebug ? JSON.stringify(window.__hubDebug()) : "no-hook"')
+        console.log('[ui] ' + info)
+      } catch (err) {
+        console.log('[ui] 读取失败: ' + err.message)
+      }
+    }, 2000)
+  }
 
   // 开发态自动开 DevTools，排障省一步
   if (!app.isPackaged) {

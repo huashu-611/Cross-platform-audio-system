@@ -503,6 +503,10 @@ public class MainActivity extends Activity {
                         refresh();
                         Toast.makeText(MainActivity.this,
                                 d.name + " 现在是汇聚端", Toast.LENGTH_SHORT).show();
+                        // 握手通过还不够——必须真的开始采集发送，
+                        // 否则对端永远收不到流，桌面端也就不会出现"已连接"，
+                        // 界面会一直停在连接界面（这个 bug 真出现过）。
+                        ensurePermissionsThenStart();
                     }
                 });
             }
