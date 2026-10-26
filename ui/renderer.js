@@ -437,6 +437,25 @@ function render (state) {
   // 否则用户断开后界面会一直卡在控制页，永远回不到连接页。
   const anyConnection = confirmedCount > 0 || (!hubSelf && !!state.pcSource)
 
+  // 角色跟随事实：只要有设备把声音送到我这里，我就必然是汇聚端。
+  //
+  // 场景：上一次本机切到了手机当汇聚端（hubSelf=false），这次手机主动
+  // 把汇聚端切回本机并发来 CONN-REQ。本机的核心照常接受、sources 里也有
+  // 设备了，但界面还停在"本机声音送往远端"——看起来就是"电脑没反应"。
+  // 所以这里主动把角色切回自己：
+  if (confirmedCount > 0 && !hubSelf) {
+    hubSelf = true
+    hubLabel = '本机'
+    graphSig = ''
+    hubSelectSig = ''
+    window.hub.setRole({
+      self: true,
+      prevIp: lastRemote ? lastRemote.ip : null,
+      prevPort: lastRemote ? lastRemote.port : 0
+    }).catch(() => {})
+    lastRemote = null
+  }
+
   // 自动切换屏幕：有连接 → 控制；没有 → 连接
   const next = anyConnection ? 'control' : 'connect'
   if (next !== screen) {
