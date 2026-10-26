@@ -18,6 +18,7 @@
 
 #include "audiohub/discovery.hpp"
 #include "audiohub/graph.hpp"
+#include "audiohub/spatial.hpp"
 
 namespace audiohub {
 
@@ -88,6 +89,19 @@ class HubCore {
 
   void SetLatency(int ms);
   int latency() const;
+
+  // ---- 3D 空间化（P0：Windows 汇聚端；坐标不进图谱协议）----
+  // listener_valid=false 时所有源都走旧路径（2D 行为逐样本不变），因此
+  // "UI 停止上报"就是整功能的回滚开关。
+  void SetListenerPose(const ListenerPose& pose, bool valid);
+
+  // node_id = "<ip>:<audioPort>"，与图谱节点 id 一致；位置按"设备 IP"归并，
+  // 所以流重连/stream_id 变化不会丢位置。坐标单位米，|x|,|y|,|z| <= 20。
+  // 返回 false = 未知设备（不在图谱也没有流）或坐标非法，此时不保存。
+  bool SetSourceSpatial(const std::string& node_id, float x, float y, float z, bool enabled);
+
+  // 节点离开图谱/取消摆放：删掉位置后该源自动回到旧路径。返回是否确实删掉了。
+  bool ClearSourceSpatial(const std::string& node_id);
 
   // ---- 发现 ----
   std::vector<Peer> DiscoveredPeers() const;

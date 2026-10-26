@@ -21,6 +21,7 @@ add_library(audiohub_core STATIC
   src/mixer.cpp
   src/udp_socket.cpp
   src/graph.cpp
+  src/spatial.cpp
 )
 target_include_directories(audiohub_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(audiohub_core PRIVATE
@@ -78,6 +79,7 @@ add_executable(audiohub_tests
   tests/test_mixer.cpp
   tests/test_pipeline.cpp
   tests/test_graph.cpp
+  tests/test_spatial.cpp
 )
 target_link_libraries(audiohub_tests PRIVATE audiohub_core)
 target_include_directories(audiohub_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)

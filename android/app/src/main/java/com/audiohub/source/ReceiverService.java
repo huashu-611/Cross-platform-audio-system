@@ -70,6 +70,8 @@ public class ReceiverService extends Service {
     private AudioTrack track;
     private final Map<Integer, JitterBuffer> streams = new ConcurrentHashMap<>();
     private final Map<Integer, Float> gains = new ConcurrentHashMap<>();
+    // 每路一个空间化状态机（只由播放线程读写；streams 清空时一起清，见 stopAll）
+    private final Map<Integer, Spatial.SpatialState> spatialStates = new ConcurrentHashMap<>();
     private Thread recvThread;
     private Thread playThread;
     private volatile boolean running;
@@ -144,6 +146,7 @@ public class ReceiverService extends Service {
         // 每路一条抖动缓冲：要做"点某个球调它的音量"，
         // 就必须知道每路各自的声音，混在一起之后再想分开是不可能的。
         streams.clear();
+        spatialStates.clear();   // 状态机属于流，流没了就一起清（位置表在 stopAll 里清）
         sStreamPeerIp.clear();
 
         if (!startPlayback()) return START_NOT_STICKY;
@@ -255,11 +258,33 @@ public class ReceiverService extends Service {
         }
     }
 
+    /**
+     * 某一路当前的混音增益。
+     *
+     * 注意这里有两张表：{@link #sGains}（UI 通过 {@link #setStreamGain} 写的静态表）和
+     * {@code gains}（recvLoop 建流时 putIfAbsent 的每路默认值 1.0）。716c4b4 重构两屏流程时
+     * playLoop 读的是实例表、而 setStreamGain 写的是静态表，两张表断开 → 界面上拖音量对
+     * 实际播放无效。这里以 UI 表优先，恢复"点球调音量"的既有语义；实例表只做默认值。
+     */
+    private float streamGain(int streamId) {
+        final Float ui = sGains.get(streamId);
+        if (ui != null) return ui.floatValue();
+        return gains.getOrDefault(streamId, 1.0f);
+    }
+
     /** 播放线程：把每路按各自增益混音后喂 AudioTrack。 */
     private void playLoop() {
         final int frames = PacketProtocol.FRAMES_PER_PACKET;   // 240 帧 = 5ms
         final short[] block = new short[frames * PacketProtocol.CHANNELS];
         final float[] mix = new float[frames * PacketProtocol.CHANNELS];
+        // 3D 空间化用的复用缓冲（每块原地改写，避免 200 Hz 热路径上分配临时数组）
+        final float[] spatialBuf = new float[frames * PacketProtocol.CHANNELS];
+        // 听者固定在场景原点、yaw=0、pitch=0（v1.3 物理房间模型，与 PC 端 SoundStage 一致）：
+        // Android 汇聚端的"听者"就是拿着手机的人，房间中心 = 场景原点，UI 只报节点世界坐标。
+        final Spatial.ListenerPose listener = Spatial.defaultListener();
+        final Spatial.SpatialParams spatialParams = new Spatial.SpatialParams();
+        // int16 -> [-1,1]。2^-15 在 float 里是精确值，所以旧路径的标度与改动前逐位相同。
+        final float norm = 1.0f / 32768.0f;
 
         // 先缓冲一小段再开播，避免一上来就欠载
         long waitStart = SystemClock.elapsedRealtime();
@@ -280,18 +305,39 @@ public class ReceiverService extends Service {
                 final JitterBuffer jb = e.getValue();
                 if (jb.occupancyFrames() < frames) continue;   // 这路还没攒够，跳过
                 jb.pull(block, frames);
-                final float g = gains.getOrDefault(e.getKey(), 1.0f);
-                // ⚠ 标度：pull() 写出的是 int16 样本（-32768..32767），必须先归一化到
-                // [-1,1] 再混音。后面的软限幅（0.85 阈值）、dBFS 统计、输出换算全部
-                // 按归一化域设计，与 C++ 端一致（src/hub_core.cpp 里
-                // scratch[i] = src[i] * (1/32768) 之后才进 MixBlock）。
-                //
-                // 716c4b4 重构两屏流程时把这里的 /32768 弄丢了，
-                // 导致 mix 一直是 int16 量级：软限幅会把每个 |x|>0.85 的样本都
-                // 压成 ±1，输出就变成跟随音乐零交叉的满幅方波 —— 听感就是
-                // 很重的电流音/爆音。3ba77d9 与 40491ec 修的都是它的表面症状。
-                final float scale = g * (1.0f / 32768.0f);
-                for (int i = 0; i < block.length; ++i) mix[i] += block[i] * scale;
+                final int streamId = e.getKey().intValue();
+                final float g = streamGain(streamId);
+                // 3D 空间化（v1.3）：这一路有位置且总开关打开时，先归一化到 [-1,1]
+                // 再交给每源的 SpatialState 原地渲染。每耳增益里已经折进了用户音量 g，
+                // 所以这里以 gain=1 直接相加（与 C++ MixInput.gain=1 同一约定）。
+                // 没有位置 / 旁路 / 关闭时走下面的旧路径，逐样本与改动前完全一致。
+                final float[] pos = sSpatialEnabled ? sStreamPositions.get(streamId) : null;
+                if (pos != null) {
+                    Spatial.SpatialState st = spatialStates.get(streamId);
+                    if (st == null) {
+                        st = new Spatial.SpatialState();
+                        st.reset(Spatial.kSampleRate);
+                        spatialStates.put(streamId, st);
+                    }
+                    // pos 是每次上报新分配的 float[3]，ConcurrentHashMap.put 发布后
+                    // 播放线程读到的是一份完整快照（不会出现"x 新 z 旧"）。
+                    st.setTargetPosition(pos[0], pos[1], pos[2]);
+                    for (int i = 0; i < block.length; ++i) spatialBuf[i] = block[i] * norm;
+                    st.process(spatialBuf, frames, listener, spatialParams, g);
+                    for (int i = 0; i < block.length; ++i) mix[i] += spatialBuf[i];
+                } else {
+                    // ⚠ 标度：pull() 写出的是 int16 样本（-32768..32767），必须先归一化到
+                    // [-1,1] 再混音。后面的软限幅（0.85 阈值）、dBFS 统计、输出换算全部
+                    // 按归一化域设计，与 C++ 端一致（src/hub_core.cpp 里
+                    // scratch[i] = src[i] * (1/32768) 之后才进 MixBlock）。
+                    //
+                    // 716c4b4 重构两屏流程时把这里的 /32768 弄丢了，
+                    // 导致 mix 一直是 int16 量级：软限幅会把每个 |x|>0.85 的样本都
+                    // 压成 ±1，输出就变成跟随音乐零交叉的满幅方波 —— 听感就是
+                    // 很重的电流音/爆音。3ba77d9 与 40491ec 修的都是它的表面症状。
+                    final float scale = g * norm;
+                    for (int i = 0; i < block.length; ++i) mix[i] += block[i] * scale;
+                }
                 active++;
             }
             sStreamCount = streams.size();
@@ -354,6 +400,60 @@ public class ReceiverService extends Service {
 
     private static final Map<Integer, Float> sGains = new ConcurrentHashMap<>();
 
+    // ------------------------------------------------------------ 3D 空间化（UI → 播放线程）
+    //
+    // 位置按 streamId 存：UI（MainActivity/Scene3D）用
+    // ReceiverService.setStreamPosition(ReceiverService.streamIdForIp(node.ip), x, y, z)
+    // 上报节点在房间里的世界坐标（米，y=0）。播放线程每块取一次快照，与 C++ 端 HubCore
+    // 按设备 IP 存 spatial_placements（src/hub_core.cpp SpatialPlacement）是同一套语义：
+    // 有位置 -> 空间化后按 gain=1 混入；没位置 -> 旧路径 g/32768。
+    //
+    // 每次 set 都换一个新的 float[3] 数组：ConcurrentHashMap.put 负责安全发布，播放线程
+    // 读到的要么是旧三元组、要么是新三元组，不会出现"x 新 z 旧"的半更新快照。
+    private static final ConcurrentHashMap<Integer, float[]> sStreamPositions =
+            new ConcurrentHashMap<>();
+
+    /** 空间化总开关（默认开）。关闭后所有路都走旧混音路径，2D 行为逐样本不变。 */
+    private static volatile boolean sSpatialEnabled = true;
+
+    /**
+     * UI 上报某一路声源的世界坐标（米）。
+     *
+     * @param streamId 音频流 id（用 {@link #streamIdForIp} 由节点 ip 取）；<=0 表示该设备
+     *                 还没有音频流，本次上报被忽略
+     * @param x        世界坐标 x（米，+X = 听者右侧）
+     * @param y        世界坐标 y（米；v1.3 房间模型里恒为 0，保留是为和 C++ 三元组对齐）
+     * @param z        世界坐标 z（米，+Z = 听者身后；听者面朝 -Z）
+     */
+    public static void setStreamPosition(int streamId, float x, float y, float z) {
+        if (streamId <= 0) return;   // 还没有流的节点：等有流了再报，别留无主条目
+        if (!isFinite(x) || !isFinite(y) || !isFinite(z)) return;   // NaN/Inf 直接拒绝
+        // 与内核/协议同一上限（kSpatialCoordLimit=20 m）：越界截断而不是丢弃，
+        // 免得 UI 一时算出的离群值把这一路永久变成"无位置"。
+        final float lim = Spatial.kSpatialCoordLimit;
+        sStreamPositions.put(streamId, new float[]{
+                clampCoord(x, lim), clampCoord(y, lim), clampCoord(z, lim)});
+    }
+
+    /** 清掉某一路的位置（节点移出房间 / 断开 / 停止空间化）。之后该路回到旧混音路径。 */
+    public static void clearStreamPosition(int streamId) {
+        if (streamId <= 0) return;
+        sStreamPositions.remove(streamId);
+    }
+
+    /** 空间化总开关（默认 true）。false 时所有流都走旧路径。 */
+    public static void setSpatialEnabled(boolean enabled) {
+        sSpatialEnabled = enabled;
+    }
+
+    private static boolean isFinite(float v) {
+        return !Float.isNaN(v) && !Float.isInfinite(v);
+    }
+
+    private static float clampCoord(float v, float lim) {
+        return v < -lim ? -lim : (v > lim ? lim : v);
+    }
+
     // streamId → 来源 IP。图谱界面用它把"有音频流的节点"和 streamId 对上：
     // 点某个球调音量时，必须知道这个球对应哪一路流（协议 §7.2 的 Android 版）。
     private static final Map<Integer, String> sStreamPeerIp = new ConcurrentHashMap<>();
@@ -410,6 +510,10 @@ public class ReceiverService extends Service {
         running = false;
         sRunning = false;
         streams.clear();
+        // 流没了，对应的空间化状态机与上报位置也一起清：别让重连后的新流
+        // 沿用上一次会话的旧位置（Lead 要求：移除流时同步清理状态与位置）。
+        spatialStates.clear();
+        sStreamPositions.clear();
         sStreamPeerIp.clear();
         sStreamCount = 0;
         if (recvThread != null) { try { recvThread.join(400); } catch (Exception ignored) {} }

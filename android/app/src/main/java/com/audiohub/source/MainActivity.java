@@ -26,6 +26,9 @@ import android.widget.Toast;
 
 import android.util.TypedValue;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import java.util.List;
 
 /**
@@ -81,6 +84,19 @@ public class MainActivity extends Activity {
     private LinearLayout ctrlPeerList;
 
     private HubGraphView graph;
+
+    // ---- 3D 房间场景（PC 端 v1.3 ui/scene3d.js 的持久化约定：SharedPreferences "audiohub" / key "scene3d"）----
+    private static final String PREF_SCENE3D = "scene3d";
+    private static final int SCENE_STORE_VERSION = 2;
+    /** 用户拖动 pin 住的节点：id → [x, 0, z]（米，与 PC 端 store.pins 同构）。 */
+    private final java.util.Map<String, double[]> scenePins = new java.util.LinkedHashMap<>();
+    /** 自动槽位分配：id → 0..31（与 PC 端 store.slots 同构）。 */
+    private final java.util.Map<String, Integer> sceneSlots = new java.util.LinkedHashMap<>();
+    /** 相机（绕原点 orbit）：yaw/pitch 度、dist 米；与 PC 端 store.cam 同构。 */
+    private double sceneYawDeg = 0;
+    private double scenePitchDeg = Scene3D.CFG.PITCH_DEFAULT;
+    private double sceneDist = Scene3D.CFG.CAM_DIST;
+    private long sceneSavedAtMs = 0;
     private LinearLayout volPanel;
     private TextView volName;
     private SeekBar volSlider;
@@ -110,6 +126,9 @@ public class MainActivity extends Activity {
     private static final int COLOR_ACCENT = 0xFF3B82F6;
     private static final int COLOR_WARN = 0xFFFBBF24;
 
+    /** 构建标记：与 APK versionName 保持一致，用于在手机上确认装的是哪一版。 */
+    private static final String BUILD_TAG = "1.4-3d-2";
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -138,6 +157,9 @@ public class MainActivity extends Activity {
         hubIp = prefs.getString("hub_ip", null);
         hubPort = prefs.getInt("hub_port", 47000);
         hubName = prefs.getString("hub_name", null);
+        // 3D 场景：相机/pin/槽位从 PC 端同一份 JSON 恢复；没有就用默认视角（φ=0、pitch 40°、dist 3.4 m）。
+        loadSceneStore(prefs);
+        if (graph != null) graph.setCamera(sceneYawDeg, scenePitchDeg, sceneDist);
 
         // 图谱：本机节点尽早就位；上次连过的设备先登记成占位节点
         // （kind 先 other，对端发来 GRAPH 后会被校正成它自己的名字/类型）
@@ -218,6 +240,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        saveSceneStore();   // 相机/pin/槽位最后落盘一次
         poller.removeCallbacksAndMessages(null);
         if (discovery != null) discovery.stop();
         InviteListener.get().stop();
@@ -227,6 +250,12 @@ public class MainActivity extends Activity {
             multicastLock = null;
         }
         super.onDestroy();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        saveSceneStore();
     }
 
     /** 上次运行留下的崩溃日志：有就弹出来，并告诉用户文件在哪。 */
@@ -332,6 +361,14 @@ public class MainActivity extends Activity {
         subT.setPadding(0, dp(4), 0, dp(14));
         root.addView(subT);
 
+        // 版本/特性标记：手机上装的是哪一版一眼可辨（排查“装了新版还是旧界面”类问题）
+        TextView buildTag = new TextView(this);
+        buildTag.setText("3D 房间视图 · v" + BUILD_TAG);
+        buildTag.setTextSize(11f);
+        buildTag.setTextColor(COLOR_DIM);
+        buildTag.setPadding(0, 0, 0, dp(10));
+        root.addView(buildTag);
+
         // ================= 连接界面 =================
         screenConnect = new LinearLayout(this);
         screenConnect.setOrientation(LinearLayout.VERTICAL);
@@ -411,6 +448,28 @@ public class MainActivity extends Activity {
             @Override
             public void onTap(HubGraphView.Node node) {
                 onGraphNodeTap(node);
+            }
+        });
+        graph.setOnNodeDoubleTap(new HubGraphView.OnNodeDoubleTap() {
+            @Override
+            public void onDoubleTap(HubGraphView.Node node) {
+                onSceneDoubleTap(node);
+            }
+        });
+        graph.setOnSceneChanged(new HubGraphView.OnSceneChanged() {
+            @Override
+            public void onCameraChanged(double yawDeg, double pitchDeg, double dist) {
+                onSceneCamera(yawDeg, pitchDeg, dist);
+            }
+
+            @Override
+            public void onPinChanged(String nodeId, double wx, double wz) {
+                onScenePin(nodeId, wx, wz);
+            }
+
+            @Override
+            public void onPinCleared(String nodeId) {
+                onSceneUnpin(nodeId);
             }
         });
         screenControl.addView(graph, new LinearLayout.LayoutParams(
@@ -838,6 +897,19 @@ public class MainActivity extends Activity {
         showScreen(showControl ? "control" : "connect");
 
         // 画全网图谱：每个节点一个球，汇聚端在中间（协议 §9.3）
+        // 3D 房间布局：非 hub 节点按 id 升序取最小空闲槽位（0..31），pin 过的用固定位置。
+        // roomLayout/allocateSlots 就是 PC 端 ui/scene3d.js 的同名函数；hub 固定在原点、听者固定在原点朝 -Z。
+        final java.util.List<String> sceneIds = new java.util.ArrayList<>();
+        for (GraphStore.Node n : g.nodes) {
+            if (n.id.equals(g.hubId)) continue;
+            sceneIds.add(n.id);
+        }
+        java.util.Collections.sort(sceneIds);
+        final boolean sceneDirty = Scene3D.allocateSlots(sceneIds, sceneIds, sceneSlots);
+        final java.util.Map<String, Scene3D.Placement> sceneLayout =
+                Scene3D.roomLayout(sceneIds, scenePins, sceneSlots);
+        if (sceneDirty) saveSceneStore();
+
         final java.util.List<HubGraphView.Node> viewNodes = new java.util.ArrayList<>();
         for (GraphStore.Node n : g.nodes) {
             final HubGraphView.Node v = new HubGraphView.Node();
@@ -847,6 +919,20 @@ public class MainActivity extends Activity {
             v.hub = n.id.equals(g.hubId);
             v.self = n.id.equals(g.selfId);
             v.online = g.isOnline(n);
+            if (v.hub) {
+                v.wx = 0;
+                v.wz = 0;
+                v.slot = -1;
+            } else {
+                final Scene3D.Placement placement = sceneLayout.get(n.id);
+                if (placement != null) {
+                    v.wx = placement.pos.x;
+                    v.wz = placement.pos.z;
+                    v.slot = placement.slot;
+                    v.pinned = placement.pinned;
+                    v.azDeg = placement.azDeg;
+                }
+            }
             if (v.self) {
                 v.streamId = srcRunning ? CaptureService.sStreamId : 0;
                 v.level = srcRunning ? CaptureService.sLevelDbfs
@@ -859,6 +945,18 @@ public class MainActivity extends Activity {
             viewNodes.add(v);
         }
         graph.setData(viewNodes);
+
+        // 空间音频：把每个节点在地面上的世界坐标报给汇聚端（ReceiverService 内部按 streamId 映射）。
+        // 对应 PC 端 spatialFrame() 的 world 坐标；hub 在原点不用报。
+        for (int i = 0; i < g.nodes.size() && i < viewNodes.size(); ++i) {
+            final GraphStore.Node sn = g.nodes.get(i);
+            final HubGraphView.Node vn = viewNodes.get(i);
+            if (vn.hub) continue;
+            final int sid = ReceiverService.streamIdForIp(sn.ip);
+            if (sid > 0) {
+                ReceiverService.setStreamPosition(sid, (float) vn.wx, 0f, (float) vn.wz);
+            }
+        }
 
         // 切换汇聚端后的"正在同步 / 已同步"提示
         if (!pendingSwitchTarget.isEmpty()) {
@@ -1051,6 +1149,129 @@ public class MainActivity extends Activity {
     }
 
     /** 点图谱里的球：有流的节点展开音量面板；非汇聚端节点弹确认切换。 */
+    /** 双击节点 = PC 端 dblclick → onActivate：直接把汇聚端切过去（单击仍是音量面板+确认框，旧语义不变）。 */
+    private void onSceneDoubleTap(final HubGraphView.Node viewNode) {
+        if (viewNode == null || viewNode.id == null) return;
+        final GraphStore.Snapshot g = GraphStore.snapshot();
+        final GraphStore.Node target = g.find(viewNode.id);
+        if (target == null || target.id.equals(g.hubId)) return;
+        if (!GraphStore.switchHub(target.id)) return;
+        pendingSwitchTarget = target.id;
+        switchSyncedAt = 0;
+        InviteListener.broadcastGraph();   // 本地变化：2 次 / 60ms（协议 §4.5）
+        refresh();
+        Toast.makeText(this, "已切换汇聚端", Toast.LENGTH_SHORT).show();
+    }
+
+    /** 相机变化：拖动时高频回调，落盘节流 500ms（app 退到后台/退出时还会强制存一次）。 */
+    private void onSceneCamera(double yawDeg, double pitchDeg, double dist) {
+        sceneYawDeg = yawDeg;
+        scenePitchDeg = pitchDeg;
+        sceneDist = dist;
+        final long now = System.currentTimeMillis();
+        if (now - sceneSavedAtMs >= 500) saveSceneStore();
+    }
+
+    /** 拖动节点结束：pin 到新位置、落盘、立刻上报空间位置（不等 400ms 轮询）。 */
+    private void onScenePin(String nodeId, double wx, double wz) {
+        if (nodeId == null || nodeId.isEmpty()) return;
+        scenePins.put(nodeId, new double[]{wx, 0, wz});
+        saveSceneStore();
+        final GraphStore.Snapshot g = GraphStore.snapshot();
+        final GraphStore.Node n = g.find(nodeId);
+        if (n != null) {
+            final int sid = ReceiverService.streamIdForIp(n.ip);
+            if (sid > 0) ReceiverService.setStreamPosition(sid, (float) wx, 0f, (float) wz);
+        }
+        refresh();
+    }
+
+    /** 长按取消 pin：节点回到自动槽位。 */
+    private void onSceneUnpin(String nodeId) {
+        if (nodeId == null || nodeId.isEmpty()) return;
+        scenePins.remove(nodeId);
+        saveSceneStore();
+        refresh();
+    }
+
+    /** 读 PC 端同一份场景 JSON（v2 优先；v1 只有 cam/pins 也能读）。坏 JSON 不能拦住启动。 */
+    private void loadSceneStore(SharedPreferences prefs) {
+        if (prefs == null) return;
+        final String raw = prefs.getString(PREF_SCENE3D, "");
+        if (raw == null || raw.trim().isEmpty()) return;
+        try {
+            final JSONObject root = new JSONObject(raw);
+            final JSONObject cam = root.optJSONObject("cam");
+            if (cam != null) {
+                sceneYawDeg = cam.optDouble("yawDeg", 0);
+                scenePitchDeg = cam.optDouble("pitchDeg", Scene3D.CFG.PITCH_DEFAULT);
+                sceneDist = cam.optDouble("dist", Scene3D.CFG.CAM_DIST);
+            }
+            final JSONObject pins = root.optJSONObject("pins");
+            if (pins != null) {
+                final java.util.Iterator<String> it = pins.keys();
+                while (it.hasNext()) {
+                    final String id = it.next();
+                    final JSONArray arr = pins.optJSONArray(id);
+                    if (arr == null || arr.length() < 3) continue;
+                    final double x = arr.optDouble(0, 0);
+                    final double z = arr.optDouble(2, 0);
+                    if (!Scene3D.isFinite(x) || !Scene3D.isFinite(z)) continue;
+                    scenePins.put(id, new double[]{x, 0, z});
+                }
+            }
+            final JSONObject slots = root.optJSONObject("slots");
+            if (slots != null) {
+                final java.util.Iterator<String> it = slots.keys();
+                while (it.hasNext()) {
+                    final String id = it.next();
+                    final int idx = slots.optInt(id, -1);
+                    if (idx >= 0 && idx < Scene3D.SLOT_COUNT) sceneSlots.put(id, Integer.valueOf(idx));
+                }
+            }
+        } catch (Throwable t) {
+            android.util.Log.w("AudioHub", "scene3d 读失败，回默认视角: " + t);
+            scenePins.clear();
+            sceneSlots.clear();
+            sceneYawDeg = 0;
+            scenePitchDeg = Scene3D.CFG.PITCH_DEFAULT;
+            sceneDist = Scene3D.CFG.CAM_DIST;
+        }
+    }
+
+    /** 把相机/pin/槽位写回 PC 端同一份 JSON（v2，org.json；键名与 ui/scene3d.js store 逐字一致）。 */
+    private void saveSceneStore() {
+        sceneSavedAtMs = System.currentTimeMillis();
+        try {
+            final JSONObject root = new JSONObject();
+            root.put("v", SCENE_STORE_VERSION);
+            final JSONObject cam = new JSONObject();
+            cam.put("yawDeg", Scene3D.round3(sceneYawDeg));
+            cam.put("pitchDeg", Scene3D.round3(scenePitchDeg));
+            cam.put("dist", Scene3D.round3(sceneDist));
+            root.put("cam", cam);
+            final JSONObject pins = new JSONObject();
+            for (java.util.Map.Entry<String, double[]> e : scenePins.entrySet()) {
+                final double[] p = e.getValue();
+                final JSONArray arr = new JSONArray();
+                arr.put(Scene3D.round3(p[0]));
+                arr.put(0);
+                arr.put(Scene3D.round3(p[2]));
+                pins.put(e.getKey(), arr);
+            }
+            root.put("pins", pins);
+            final JSONObject slots = new JSONObject();
+            for (java.util.Map.Entry<String, Integer> e : sceneSlots.entrySet()) {
+                slots.put(e.getKey(), e.getValue().intValue());
+            }
+            root.put("slots", slots);
+            getSharedPreferences("audiohub", MODE_PRIVATE).edit()
+                    .putString(PREF_SCENE3D, root.toString()).apply();
+        } catch (Throwable t) {
+            android.util.Log.w("AudioHub", "scene3d 写失败: " + t);
+        }
+    }
+
     private void onGraphNodeTap(final HubGraphView.Node viewNode) {
         if (viewNode == null || viewNode.id == null) return;
         final GraphStore.Snapshot g = GraphStore.snapshot();

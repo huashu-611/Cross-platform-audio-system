@@ -27,18 +27,23 @@ BUILD_TOOLS="$(dirname "$(find "$SDK" -maxdepth 3 -name aapt2.exe | head -1)")"
 [ -n "$BUILD_TOOLS" ] || { echo "找不到 build-tools（aapt2）" >&2; exit 1; }
 
 PKG="com.audiohub.source"
+# 版本号可由环境变量覆盖，便于在手机上区分“装的是哪一版”（默认保持 0.1/1）
+VERSION_CODE="${VERSION_CODE:-1}"
+VERSION_NAME="${VERSION_NAME:-0.1}"
 OUT=build
 rm -rf "$OUT"
 mkdir -p "$OUT/classes" "$OUT/dex"
 
 echo "==> 1/6 生成临时 manifest（aapt2 命令行要求 package 属性，AGP 8 又不允许，只能构建时注入）"
-python - "$PKG" <<'PY'
+python - "$PKG" "$VERSION_CODE" "$VERSION_NAME" <<'PY'
 import io, sys
 pkg = sys.argv[1]
+code = sys.argv[2]
+name = sys.argv[3]
 s = io.open('app/src/main/AndroidManifest.xml', encoding='utf-8').read()
 s = s.replace('<manifest xmlns:android="http://schemas.android.com/apk/res/android">',
               '<manifest xmlns:android="http://schemas.android.com/apk/res/android"\n'
-              '    package="%s"\n    android:versionCode="1"\n    android:versionName="0.1">' % pkg)
+              '    package="%s"\n    android:versionCode="%s"\n    android:versionName="%s">' % (pkg, code, name))
 io.open('build/AndroidManifest.xml', 'w', encoding='utf-8').write(s)
 PY
 

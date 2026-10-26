@@ -3,6 +3,7 @@
 // 真正的逻辑都在 src/hub_core.cpp 里，这里只是薄壳——
 // 命令行版和图形界面版必须共用同一套实现，否则"UI 上调了音量但
 // 脚本测试时行为不一样"这类问题会反复出现。
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -498,6 +499,53 @@ int main(int argc, char** argv) {
                         if (method == "POST" && path == "/api/session/clear") {
                           // 与旧 /api/clear-session 同义；ClearSession 里额外重置图谱（§4.6）
                           hub.ClearSession();
+                          return "{\"ok\":true}";
+                        }
+                        if (method == "POST" && path == "/api/listener") {
+                          double x = 0, y = 0, z = 0, yaw = 0, pitch = 0;
+                          bool has_pos = audiohub::JsonFindNumber(body, "x", &x);
+                          has_pos = audiohub::JsonFindNumber(body, "y", &y) || has_pos;
+                          has_pos = audiohub::JsonFindNumber(body, "z", &z) || has_pos;
+                          audiohub::JsonFindNumber(body, "yaw", &yaw);
+                          audiohub::JsonFindNumber(body, "pitch", &pitch);
+                          if (!has_pos) return "{\"ok\":false,\"error\":\"need x/y/z\"}";
+                          audiohub::ListenerPose pose;
+                          pose.position = audiohub::Vec3{
+                              static_cast<float>(std::clamp(x, -20.0, 20.0)),
+                              static_cast<float>(std::clamp(y, -20.0, 20.0)),
+                              static_cast<float>(std::clamp(z, -20.0, 20.0))};
+                          pose.yaw_deg = static_cast<float>(std::clamp(yaw, -180.0, 180.0));
+                          pose.pitch_deg = static_cast<float>(std::clamp(pitch, -90.0, 90.0));
+                          hub.SetListenerPose(pose, true);
+                          return "{\"ok\":true}";
+                        }
+                        if (method == "POST" && path == "/api/source/spatial") {
+                          std::string node_id;
+                          if (!audiohub::JsonGetString(body, "nodeId", &node_id) ||
+                              node_id.empty()) {
+                            return "{\"ok\":false,\"error\":\"nodeId missing\"}";
+                          }
+                          double x = 0, y = 0, z = 0;
+                          if (!audiohub::JsonFindNumber(body, "x", &x) ||
+                              !audiohub::JsonFindNumber(body, "y", &y) ||
+                              !audiohub::JsonFindNumber(body, "z", &z)) {
+                            return "{\"ok\":false,\"error\":\"need x/y/z\"}";
+                          }
+                          bool enabled = true;
+                          audiohub::JsonFindBool(body, "enabled", &enabled);
+                          // 范围按报告 §2.4.1：每个分量 ∈[-20,20]（单位≈米）。
+                          // 用 !(x>=lo && x<=hi) 让 NaN 也走拒绝分支。
+                          const double lim = audiohub::kSpatialCoordLimit;
+                          if (!(x >= -lim && x <= lim) || !(y >= -lim && y <= lim) ||
+                              !(z >= -lim && z <= lim)) {
+                            return "{\"ok\":false,\"error\":\"coord out of range\"}";
+                          }
+                          // 未知设备：内核拒绝且不保存（界面静默降级）。
+                          if (!hub.SetSourceSpatial(node_id, static_cast<float>(x),
+                                                    static_cast<float>(y),
+                                                    static_cast<float>(z), enabled)) {
+                            return "{\"ok\":false,\"error\":\"unknown node\"}";
+                          }
                           return "{\"ok\":true}";
                         }
                         return "{\"ok\":false}";

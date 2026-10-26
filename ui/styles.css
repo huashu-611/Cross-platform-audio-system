@@ -237,14 +237,16 @@ input[type=range]::-moz-range-thumb { width: 12px; height: 12px; border-radius: 
 .stats b { color: var(--dim); font-weight: 600; }
 
 /* ---------- 控制界面：全网图谱与音量面板 ---------- */
-#graph { margin-top: 4px; }
-#graph .node { cursor: pointer; }
-#graph .node text { user-select: none; pointer-events: none; }
-#graph .node .ball { transition: filter var(--fast) var(--ease); }
-#graph .node:hover .ball { filter: brightness(1.18); }
-#graph .line { transition: stroke var(--fast) var(--ease); }
-#graph .node.offline { opacity: .55; }
-#graph .node.ghost { cursor: default; }
+/* 图谱绘制层是 Canvas（ui/scene3d.js）：逻辑视口仍是 920x460，宽高比靠 width/height 属性维持，
+   这里只负责"占满可用宽度、可交互、不选中文字"；节点/连线/文字的样式全部在 canvas 内绘制。 */
+#graph {
+  margin-top: 4px;
+  display: block; width: 100%; height: auto;
+  cursor: grab; touch-action: none;
+  user-select: none; -webkit-user-select: none;
+  border-radius: var(--radius-s);
+}
+#graph:active { cursor: grabbing; }
 
 .volpanel {
   background: var(--card);

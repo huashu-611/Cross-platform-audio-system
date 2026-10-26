@@ -475,6 +475,41 @@ ipcMain.handle('hub:setMaster', async (_e, arg) => {
   return httpRequest('POST', '/api/master', { gain })
 })
 
+// 3D 场景 → 空间音频（docs/3D-界面与空间音频-可行性与实现方案.md §2.4/§3.3）。
+// 旧内核没有这些端点时，httpRequest 拿到 404 的 JSON 或 null，这里统一回 unsupported，
+// 渲染进程静默停发 —— 界面不能因为"内核是旧版"而弹错、卡顿。
+ipcMain.handle('hub:setListener', async (_e, arg) => {
+  if (!arg || typeof arg !== 'object') return { ok: false }
+  const clampNum = (v, lo, hi) => Math.min(Math.max(Number(v) || 0, lo), hi)
+  const round2 = (v) => Math.round(v * 100) / 100
+  const body = {
+    x: clampNum(arg.x, -10, 10),
+    y: clampNum(arg.y, -10, 10),
+    z: clampNum(arg.z, -10, 10),
+    yaw: round2(clampNum(arg.yaw, -180, 180)),
+    pitch: round2(clampNum(arg.pitch, -90, 90))
+  }
+  const res = await httpRequest('POST', '/api/listener', body)
+  if (!res) return { ok: false, unsupported: true }
+  return res
+})
+
+ipcMain.handle('hub:setSourceSpatial', async (_e, arg) => {
+  const a = arg || {}
+  if (typeof a.nodeId !== 'string' || !a.nodeId) return { ok: false }
+  const clampNum = (v, lo, hi) => Math.min(Math.max(Number(v) || 0, lo), hi)
+  const body = {
+    nodeId: a.nodeId.slice(0, 128),
+    x: clampNum(a.x, -20, 20),
+    y: clampNum(a.y, -20, 20),
+    z: clampNum(a.z, -20, 20),
+    enabled: a.enabled !== false
+  }
+  const res = await httpRequest('POST', '/api/source/spatial', body)
+  if (!res) return { ok: false, unsupported: true }
+  return res
+})
+
 // 主动扫描：让音频核心发一轮 WHO 探测，等对端回信标后再回读状态。
 // 只调 refresh 不等待的话，界面拿到的还是探测前那份 peers。
 // 接受对端邀请：把本机的声音送过去，并告诉它"你来当汇聚端"

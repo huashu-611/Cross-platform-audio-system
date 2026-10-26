@@ -48,5 +48,15 @@ contextBridge.exposeInMainWorld('hub', {
   accept: (streamId) => ipcRenderer.invoke('hub:accept', { streamId }),
   reject: (streamId) => ipcRenderer.invoke('hub:reject', { streamId }),
   disconnect: (streamId) => ipcRenderer.invoke('hub:disconnect', { streamId }),
-  setAutoAccept: (on) => ipcRenderer.invoke('hub:setAutoAccept', { on })
+  setAutoAccept: (on) => ipcRenderer.invoke('hub:setAutoAccept', { on }),
+
+  // 3D 场景 → 空间音频：听者位姿（位置恒为原点，yaw/pitch 由相机推导）。
+  // 渲染进程按 20 Hz 上限节流；旧内核没有 /api/listener 时主进程回 { ok:false, unsupported:true }，
+  // 渲染进程据此静默停发，不影响其他交互。
+  setListener: (pose) => ipcRenderer.invoke('hub:setListener', pose),
+
+  // 单个节点的世界位置（nodeId = 图谱节点 id "ip:audioPort"；enabled=false = 旁路空间化）。
+  // y 固定为 0：所有节点都在听者所在的水平面上，与 2D 图谱"同一平面"语义对应。
+  setSourceSpatial: (nodeId, x, z, enabled) =>
+    ipcRenderer.invoke('hub:setSourceSpatial', { nodeId, x, y: 0, z, enabled })
 })

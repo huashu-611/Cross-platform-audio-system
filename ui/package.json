@@ -25,6 +25,7 @@
       "main.js",
       "preload.js",
       "renderer.js",
+      "scene3d.js",
       "index.html",
       "styles.css",
       "bin/**/*"

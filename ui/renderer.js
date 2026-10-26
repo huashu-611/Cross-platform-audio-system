@@ -226,59 +226,159 @@ function hasFlow (state, node) {
   return streamIdForNode(node, state) > 0
 }
 
-// ============================================================ 网络图布局与绘制
+// ============================================================ 网络图（3D 场景）
+//
+// 绘制层从 SVG 换成 <canvas id="graph"> + ui/scene3d.js（纯 Canvas 2D 手写透视投影，
+// 不引依赖；为什么不用 WebGL 见 docs/3D-...方案.md §2.1.1 与 ui/scene3d.js 头注释）。
+//   - v1.3 物理房间模型：听者固定在原点朝 -Z，声源在地面自由摆位（默认落在预计算散点槽位，
+//     距离 0.85–2.2 m，按设备 id 持久化）；球的屏幕大小随距离缩放（近大远小），
+//     与音量衰减同向；名称行同时显示 "x.xx m"，双击切换汇聚端、拖动自由摆位；
+//   - hub 永远在原点 → 投影恒为屏幕 (460,208)，与旧中心完全一致；
+//   - 交互（点选 / 切换 / 音量面板 / 操作条 / 同步状态）全部留在本文件，
+//     scene 只负责绘制与"拾取后回调"，回调仍走 onNodeClick 旧路径。
+// scene3d.js 缺失（旧包 / 加载失败）时静默降级：图谱区空白，其他界面照常可用。
 
-const GRAPH_CX = 460
-const GRAPH_CY = 208
-const HUB_R = 46          // 汇聚端大球 = 其它球的 1.5 倍左右
-const NODE_R = 29
+let scene = null
+let sceneBroken = false
 
-function layoutGraph (graph) {
-  const hub = graph.hubNode || null
-  const placed = []
-  const hubNode = hub
-    ? Object.assign({}, hub, { x: GRAPH_CX, y: GRAPH_CY, r: HUB_R })
-    : {
-        id: '__hub_unknown__',
-        ghost: true,
-        name: '汇聚端未知',
-        ip: '',
-        audioPort: 0,
-        online: false,
-        isHub: true,
-        isSelf: false,
-        streamId: 0,
-        level: null,
-        gain: 1,
-        muted: false,
-        x: GRAPH_CX,
-        y: GRAPH_CY,
-        r: HUB_R
-      }
-  placed.push(hubNode)
-
-  const others = graph.nodes.filter((n) => n.id !== hubNode.id)
-  const count = Math.max(others.length, 1)
-  const ringRadius = 188
-  const ballR = others.length > 9 ? 23 : NODE_R
-  others.forEach((n, i) => {
-    const angle = -Math.PI / 2 + (i * 2 * Math.PI) / count
-    placed.push(Object.assign({}, n, {
-      x: GRAPH_CX + ringRadius * Math.cos(angle),
-      y: GRAPH_CY + ringRadius * Math.sin(angle) * 0.78,   // 稍扁，适合宽屏
-      r: ballR
-    }))
-  })
-  return placed
+function ensureScene () {
+  if (scene || sceneBroken) return scene
+  const canvas = $('graph')
+  const api = window.Scene3D
+  if (!canvas || !api || typeof api.create !== 'function') { sceneBroken = true; return null }
+  try {
+    scene = api.create({
+      canvas: canvas,
+      onSelect: (nodeId) => onNodeClick(nodeId),
+      onActivate: (nodeId) => onNodeActivate(nodeId),
+      onDragEnd: () => { pumpSpatial() }     // 拖完立即推一次位置，不等 50 ms tick
+    })
+  } catch (err) {
+    sceneBroken = true
+    scene = null
+    console.error('[scene] 3D 场景初始化失败，图谱区降级为空: ' + (err && err.message))
+  }
+  return scene
 }
 
-function nodeBadge (n) {
-  if (!n || n.ghost) return ''
-  const parts = []
-  if (n.isSelf) parts.push('本机')
-  if (n.isHub) parts.push('汇聚端')
-  if (!n.online) parts.push('离线')
-  return parts.join(' · ')
+// 场景只吃动态字段（电平/流强/选中/PC 音源旁路）；结构变化走 setGraph。
+function sceneDynamic (state, graph) {
+  const levels = {}
+  const flows = {}
+  for (const n of graph.nodes) {
+    levels[n.id] = displayLevel(state, n)
+    flows[n.id] = hasFlow(state, n)
+  }
+  return {
+    levels: levels,
+    flows: flows,
+    selectedId: selected ? selected.nodeId : null,
+    pcSource: !!(state && state.pcSource)
+  }
+}
+
+// 点选/切换后的即时反馈：不走签名判断，只刷新动态字段
+function refreshScene (state, graph) {
+  const s = ensureScene()
+  if (!s) return
+  s.setDynamic(sceneDynamic(state, graph))
+}
+
+// ============================================================ 3D 位置 → 空间音频（20 Hz 上报）
+//
+// docs/3D-...方案.md §2.4/§3.2：listener 变化才发、静止 2 s 心跳；source 位置变化才发
+// （拖拽结束 / 首次布局 / 结构变化 / hub 切换都体现为"变了"）；失败 3 次后静默退避 5 s 再试。
+// 旧内核没有 /api/listener、/api/source/spatial 时主进程回 unsupported：停发，不弹错。
+const SP = { dt: 50, epsPos: 1e-3, epsAng: 0.5, epsSrc: 0.01, heartbeat: 2000, maxFails: 3 }
+
+let spatialTimer = 0
+let spatialInflight = false
+let spatialFails = 0
+let spatialDisabled = false
+let spatialRetryAt = 0
+let spatialLastSentAt = 0
+let spatialLastL = null
+const spatialLastSrc = new Map()
+
+function spatialSupported () {
+  return !!(window.hub && typeof window.hub.setListener === 'function' &&
+    typeof window.hub.setSourceSpatial === 'function')
+}
+
+function startSpatialPump () {
+  if (spatialTimer || !spatialSupported()) return
+  spatialTimer = setInterval(pumpSpatial, SP.dt)
+}
+
+function listenerChanged (l) {
+  const p = spatialLastL
+  if (!p) return true
+  return Math.abs(l.x - p.x) > SP.epsPos || Math.abs(l.y - p.y) > SP.epsPos ||
+    Math.abs(l.z - p.z) > SP.epsPos || Math.abs(l.yaw - p.yaw) > SP.epsAng ||
+    Math.abs(l.pitch - p.pitch) > SP.epsAng
+}
+
+function pumpSpatial () {
+  const s = scene
+  if (!s || !lastState || screen !== 'control' || !spatialSupported()) return
+  if (spatialDisabled) {
+    if (Date.now() < spatialRetryAt) return
+    spatialDisabled = false
+    spatialFails = 0
+  }
+  if (spatialInflight) return                 // 背压：上一发没回就跳过本拍
+
+  const frame = s.spatialFrame()
+  if (!frame || !Array.isArray(frame.sources)) return
+  const now = Date.now()
+  const jobs = []
+
+  const heartbeatDue = !!spatialLastL && now - spatialLastSentAt >= SP.heartbeat
+  if ((listenerChanged(frame.listener) || heartbeatDue) && now - spatialLastSentAt >= SP.dt) {
+    spatialLastSentAt = now
+    spatialLastL = frame.listener
+    jobs.push(window.hub.setListener(frame.listener))
+  }
+
+  const alive = new Set()
+  for (const src of frame.sources) {
+    alive.add(src.id)
+    const prev = spatialLastSrc.get(src.id)
+    if (prev && Math.abs(prev[0] - src.x) <= SP.epsSrc &&
+        Math.abs(prev[1] - src.z) <= SP.epsSrc && prev[2] === src.enabled) continue
+    spatialLastSrc.set(src.id, [src.x, src.z, src.enabled])
+    jobs.push(window.hub.setSourceSpatial(src.id, src.x, src.z, src.enabled))
+  }
+  // 节点从图谱里消失（含"它被切成新 hub"）：撤掉它的摆放，避免内核里留幽灵位置
+  for (const id of Array.from(spatialLastSrc.keys())) {
+    if (alive.has(id)) continue
+    const prev = spatialLastSrc.get(id)
+    spatialLastSrc.delete(id)
+    if (prev) jobs.push(window.hub.setSourceSpatial(id, 0, 0, false))
+  }
+  if (!jobs.length) return
+
+  spatialInflight = true
+  const safe = jobs.map((p) => Promise.resolve(p).catch(() => ({ ok: false, unsupported: true })))
+  Promise.all(safe).then((results) => {
+    spatialInflight = false
+    let unsupported = false
+    for (const r of results) if (r && r.unsupported) unsupported = true
+    if (unsupported) {
+      if (++spatialFails >= SP.maxFails) {
+        spatialDisabled = true
+        spatialRetryAt = Date.now() + 5000
+      }
+    } else {
+      spatialFails = 0
+    }
+  }, () => {
+    spatialInflight = false
+    if (++spatialFails >= SP.maxFails) {
+      spatialDisabled = true
+      spatialRetryAt = Date.now() + 5000
+    }
+  })
 }
 
 function graphSignature (state, graph) {
@@ -294,113 +394,20 @@ function graphSignature (state, graph) {
 let graphBuiltSig = ''
 
 function renderGraph (state, graph) {
+  const s = ensureScene()
+  if (!s) return
   const sig = graphSignature(state, graph)
-  // 只把"结构"纳入签名。电平每 200ms 都在变，绝不能因此重建 SVG ——
-  // 一重建，用户刚按下的球就被换掉，点击直接丢失（表现为"点不到"）。
+  // 只把"结构"纳入签名。电平每 200ms 都在变，绝不能因此重排布局 ——
+  // 一重排，用户刚按下的球就被换位置，点击直接丢失（表现为"点不到"）。
   if (sig !== graphBuiltSig) {
     graphBuiltSig = sig
-    buildGraphSvg(state, graph)
+    s.setGraph(graph)
   }
-  paintGraphDynamic(state, graph)
+  s.setActive(true)
+  s.setDynamic(sceneDynamic(state, graph))
 }
 
-function buildGraphSvg (state, graph) {
-  const svg = $('graph')
-  if (!svg) return
-  const placed = layoutGraph(graph)
-  const hub = placed[0]
-  const parts = []
 
-  // 连线：汇聚端 → 其余每个节点（有音频流的线在 paint 里按电平加粗）
-  for (const n of placed) {
-    if (n.ghost || n.id === hub.id) continue
-    if (!hub.ghost && !hub.online) continue
-    parts.push('<line class="line" data-line="' + esc(n.id) + '" x1="' + hub.x +
-      '" y1="' + hub.y + '" x2="' + n.x + '" y2="' + n.y +
-      '" stroke="var(--line)" stroke-width="2" opacity="0.7"/>')
-  }
-
-  for (const n of placed) {
-    const classes = ['node']
-    if (!n.online) classes.push('offline')
-    if (n.ghost) classes.push('ghost')
-    const fill = n.ghost
-      ? 'oklch(0.26 0.02 255)'
-      : (n.isHub ? 'var(--accent)' : (n.online ? 'oklch(0.4 0.06 255)' : 'oklch(0.3 0.03 255)'))
-    const stroke = n.online ? 'oklch(0.55 0.1 255)' : 'oklch(0.42 0.02 255)'
-    const dash = n.online ? '' : ' stroke-dasharray="5 5"'
-    const inside = n.ghost ? '?' : (n.isSelf ? '本机' : shortName(n.name, n.isHub ? 6 : 4))
-    const badge = nodeBadge(n)
-    parts.push('<g class="' + classes.join(' ') + '" data-id="' + esc(n.id) + '">' +
-      (n.isHub && !n.ghost
-        ? '<circle cx="' + n.x + '" cy="' + n.y + '" r="' + (n.r + 15) +
-          '" fill="var(--accent)" opacity="0.10"/>' +
-          '<circle cx="' + n.x + '" cy="' + n.y + '" r="' + (n.r + 7) +
-          '" fill="var(--accent)" opacity="0.14"/>'
-        : '') +
-      '<circle class="ball" data-ball="' + esc(n.id) + '" cx="' + n.x + '" cy="' + n.y +
-      '" r="' + n.r + '" fill="' + fill + '" stroke="' + stroke + '" stroke-width="2"' + dash + '/>' +
-      '<text x="' + n.x + '" y="' + (n.y + 5) + '" text-anchor="middle" fill="var(--text)"' +
-      ' font-size="' + (n.isHub ? 15 : 12.5) + '" font-weight="600">' + esc(inside) + '</text>' +
-      (badge
-        ? '<text x="' + n.x + '" y="' + (n.y - n.r - 11) + '" text-anchor="middle"' +
-          ' fill="var(--accent-hi)" font-size="10.5" letter-spacing="1">' + esc(badge) + '</text>'
-        : '') +
-      '<text x="' + n.x + '" y="' + (n.y + n.r + 20) + '" text-anchor="middle"' +
-      ' fill="var(--dim)" font-size="12.5">' + esc(n.ghost ? '等待图谱…' : n.name) + '</text>' +
-      '<text data-lvl="' + esc(n.id) + '" x="' + n.x + '" y="' + (n.y + n.r + 37) +
-      '" text-anchor="middle" fill="var(--faint)" font-size="11.5">—</text>' +
-      '</g>')
-  }
-  svg.innerHTML = parts.join('')
-
-  svg.querySelectorAll('.node').forEach((g) => {
-    g.addEventListener('click', () => onNodeClick(g.dataset.id))
-  })
-}
-
-// 只改文本/描边/线宽，不重建节点 —— 这样点击永远不会被打断
-function paintGraphDynamic (state, graph) {
-  const svg = $('graph')
-  if (!svg || !state) return
-  const nodeMap = new Map(graph.nodes.map((n) => [n.id, n]))
-  const levels = new Map()
-  for (const n of graph.nodes) levels.set(n.id, displayLevel(state, n))
-
-  const levelEls = svg.querySelectorAll('[data-lvl]')
-  for (let i = 0; i < levelEls.length; ++i) {
-    const id = levelEls[i].getAttribute('data-lvl')
-    levelEls[i].textContent = levels.has(id) ? dbText(levels.get(id)) : '—'
-  }
-
-  // 选中态：描边加粗
-  const balls = svg.querySelectorAll('[data-ball]')
-  for (let i = 0; i < balls.length; ++i) {
-    const id = balls[i].getAttribute('data-ball')
-    const node = nodeMap.get(id)
-    const on = !!selected && selected.nodeId === id
-    const online = node ? node.online : true
-    balls[i].setAttribute('stroke',
-      on ? 'var(--text)' : (online ? 'oklch(0.55 0.1 255)' : 'oklch(0.42 0.02 255)'))
-    balls[i].setAttribute('stroke-width', on ? '3' : '2')
-  }
-
-  // 连线：有音频流时随电平加粗/变亮
-  const lines = svg.querySelectorAll('[data-line]')
-  for (let i = 0; i < lines.length; ++i) {
-    const id = lines[i].getAttribute('data-line')
-    const node = nodeMap.get(id)
-    const on = !!selected && selected.nodeId === id
-    const flow = hasFlow(state, node)
-    const lv = levels.has(id) ? levels.get(id) : null
-    const boost = flow && typeof lv === 'number' ? levelPct(lv) / 26 : 0
-    const width = on ? Math.max(3, 2 + boost) : (flow ? 2 + boost : 2)
-    lines[i].setAttribute('stroke',
-      on ? 'var(--accent-hi)' : (flow ? 'oklch(0.72 0.15 255 / .9)' : 'var(--line)'))
-    lines[i].setAttribute('stroke-width', String(Math.round(width * 10) / 10))
-    lines[i].setAttribute('opacity', on ? '1' : (flow ? '0.95' : '0.7'))
-  }
-}
 
 // ============================================================ 图谱交互
 
@@ -411,7 +418,7 @@ function onNodeClick (nodeId) {
   const node = graph.nodes.find((n) => n.id === nodeId)
   if (!node) return
   selected = { nodeId: node.id }
-  paintGraphDynamic(state, graph)
+  refreshScene(state, graph)
 
   if (node.isHub) {
     // 点汇聚端：只显示信息，不提供切换
@@ -427,6 +434,18 @@ function onNodeClick (nodeId) {
   const streamId = streamIdForNode(node, state)
   if (streamId || (node.isSelf && state.pcSource)) showVolumePanel(state, graph, node)
   else hideVolumePanel()
+}
+
+// 双击节点（scene 回调）：等同于"点一下 → 点操作条里的确认"。
+// 非汇聚端且已有待切换操作条时直接切；否则退化为一次普通点选，不改变任何语义。
+function onNodeActivate (nodeId) {
+  const state = lastState
+  if (!state || !nodeId) return
+  const graph = collectGraph(state)
+  const node = graph.nodes.find((n) => n.id === nodeId)
+  if (!node || node.isHub) return
+  onNodeClick(node.id)
+  if (action && action.mode === 'switch' && action.nodeId === node.id) doSwitch()
 }
 
 function showActionBar (parts, okText, cancelText) {
@@ -872,6 +891,8 @@ function render (state) {
     hideVolumePanel()
     graphBuiltSig = ''
     showScreen(next)
+    // 连接界面时停画（canvas 也 display:none），省掉后台 rAF 重绘
+    if (scene) scene.setActive(next === 'control')
   }
 
   if (screen === 'connect') {
@@ -889,6 +910,7 @@ function render (state) {
     selected = null
     hideActionBar()
     hideVolumePanel()
+    if (scene) scene.setDynamic(sceneDynamic(state, graph))
   }
 
   renderSyncLine()
@@ -1022,6 +1044,7 @@ $('leaveBtn').addEventListener('click', async () => {
 // 调试快照：排查"界面没切换"时直接读它，比看日志快
 window.__hubDebug = () => {
   const graph = lastState ? collectGraph(lastState) : null
+  const sceneDebug = scene ? scene.debug() : null
   return {
     screen: screen,
     hasGraph: !!(graph && graph.hasGraph),
@@ -1033,10 +1056,20 @@ window.__hubDebug = () => {
     selected: selected ? selected.nodeId : null,
     pendingSwitch: pendingSwitch ? pendingSwitch.nodeId : null,
     pcSource: !!(lastState && lastState.pcSource),
-    controlShown: !!$('screenControl') && $('screenControl').style.display !== 'none'
+    controlShown: !!$('screenControl') && $('screenControl').style.display !== 'none',
+    // 3D 场景（e2e 用：nodeScreen 坐标点击、positions 校验、azDeg 方位校验）
+    scene: sceneDebug,
+    spatial: {
+      supported: spatialSupported(),
+      disabled: spatialDisabled,
+      fails: spatialFails,
+      sources: spatialLastSrc.size,
+      listener: spatialLastL
+    }
   }
 }
 
 const unsubscribe = window.hub.onState(render)
 window.addEventListener('beforeunload', unsubscribe)
+startSpatialPump()          // 旧内核/旧 preload 下 spatialSupported()=false，泵不启动
 window.hub.getState().then(render)

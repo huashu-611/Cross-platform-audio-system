@@ -99,6 +99,11 @@ struct Stream {
   Clock::time_point last_packet{};
   float gain = 1.0f;
   bool muted = false;
+  // 3D 空间化状态：只在混音线程使用（MixerLoop 持 mutex 调用 Process）。
+  // ITD 历史环挂在这里，随流生命周期创建/销毁，不需要全局缓冲。
+  SpatialState spatial;
+  // 空间化结果独立缓冲：Process 是原地处理，拷一份再处理，MixBlock 负责求和。
+  std::vector<float> spatial_buffer;
   uint64_t packets = 0;
   // 握手：未经接收方确认的流，混音时按静音处理。
   // 这样"请求-确认"机制是真的生效的，同时不影响直接发包的调试场景
@@ -186,6 +191,18 @@ struct HubCore::Impl {
   std::thread mixer;
 
   SpscRing<float> output_ring{static_cast<size_t>(MsToFrames(100)) * kChannels};
+
+  // ---- 3D 空间化（P0：Windows 汇聚端；坐标不进图谱协议）----
+  // 读写都在上面那把 mutex 下：HTTP 线程写，混音线程每块读一次快照；
+  // 数据量很小（<=32 个设备），与 graph_ 同策略，不另开锁。
+  ListenerPose listener_pose;
+  bool listener_valid = false;
+  SpatialParams spatial_params;
+  struct SpatialPlacement {
+    Vec3 position;
+    bool enabled = true;  // false = 该源旁路空间化（PC 环回音乐，保持立体声）
+  };
+  std::map<std::string, SpatialPlacement> spatial_placements;  // key = 设备 IP
 
   ~Impl() { Stop(); }
 
@@ -930,6 +947,11 @@ struct HubCore::Impl {
       {
         std::lock_guard<std::mutex> lock(mutex);
 
+        // 每块取一次监听位姿快照：HTTP 线程可能正在改；整块用同一份，
+        // 避免块内不同源用不同位姿导致声像互相矛盾。
+        const ListenerPose listener = listener_pose;
+        const bool listener_ok = listener_valid;
+
         // 掉线的流及时清掉，否则手机上按了停止，这边还留着一个死行
         const auto now = Clock::now();
         for (auto it = streams.begin(); it != streams.end();) {
@@ -1018,10 +1040,28 @@ struct HubCore::Impl {
 
           MixInput in;
           in.data = s.block_buffer.data();
-          in.gain = s.gain;
           // 未经确认的流不参与混音——"请求-确认"机制必须真的挡住声音，
           // 否则只是界面上演戏。
           in.active = !s.muted && s.confirmed;
+
+          // 3D 空间化：位置按设备 IP 存（流重连不丢）。没有位置 / 每源旁路 /
+          // 监听位姿还没上报 → 完全走旧路径，保证 2D 行为逐样本不变。
+          const auto sp = listener_ok
+                              ? spatial_placements.find(s.peer_ip_for_bye)
+                              : spatial_placements.end();
+          if (sp != spatial_placements.end() && sp->second.enabled && in.active) {
+            s.spatial.SetTargetPosition(sp->second.position);
+            // Process 原地处理：先拷到每流独立 buffer，MixBlock 再统一求和。
+            // user_gain 已折进每耳总增益，in.gain 必须置 1，否则音量乘两次。
+            if (s.spatial_buffer.size() < block_samples) s.spatial_buffer.resize(block_samples);
+            std::memcpy(s.spatial_buffer.data(), s.block_buffer.data(),
+                        block_samples * sizeof(float));
+            s.spatial.Process(s.spatial_buffer.data(), block, listener, spatial_params, s.gain);
+            in.data = s.spatial_buffer.data();
+            in.gain = 1.0f;
+          } else {
+            in.gain = s.gain;
+          }
           mix_inputs.push_back(in);
         }
 
@@ -1118,6 +1158,61 @@ struct HubCore::Impl {
     std::lock_guard<std::mutex> lock(mutex);
     latency_ms = std::clamp(ms, 20, 250);
     for (auto& kv : streams) kv.second->jitter.SetTargetDelayMs(latency_ms);
+  }
+
+  // ---- 3D 空间化 ----
+
+  // 设备是否"已知"：有流正在从它来，或它还在图谱里（离线也算——图谱保留节点，
+  // 切换汇聚端/重连后界面要沿用同一份布局）。
+  bool KnownDeviceIpLocked(const std::string& ip) const {
+    for (const auto& kv : streams) {
+      if (kv.second->peer_ip_for_bye == ip) return true;
+    }
+    for (const auto& n : graph_.nodes) {
+      if (NodeIpOf(n.id) == ip) return true;
+    }
+    return false;
+  }
+
+  void SetListenerPose(const ListenerPose& pose, bool valid) {
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto clamp_f = [](float v, float lo, float hi) {
+      return std::isfinite(v) ? std::clamp(v, lo, hi) : 0.0f;
+    };
+    ListenerPose p = pose;
+    p.position.x = clamp_f(p.position.x, -kSpatialCoordLimit, kSpatialCoordLimit);
+    p.position.y = clamp_f(p.position.y, -kSpatialCoordLimit, kSpatialCoordLimit);
+    p.position.z = clamp_f(p.position.z, -kSpatialCoordLimit, kSpatialCoordLimit);
+    p.yaw_deg = clamp_f(p.yaw_deg, -180.0f, 180.0f);
+    p.pitch_deg = clamp_f(p.pitch_deg, -90.0f, 90.0f);
+    listener_pose = p;
+    listener_valid = valid;
+  }
+
+  bool SetSourceSpatial(const std::string& node_id, float x, float y, float z, bool enabled) {
+    const std::string ip = NodeIpOf(node_id);
+    if (ip.empty()) return false;
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return false;
+    if (std::fabs(x) > kSpatialCoordLimit || std::fabs(y) > kSpatialCoordLimit ||
+        std::fabs(z) > kSpatialCoordLimit) {
+      return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    // 旁路是安全操作（PC 环回声源可能不在图谱里，也要能关掉空间化）；
+    // 真正的空间化位置只给已知设备存，未知 nodeId 返回 false 让界面别重试。
+    if (enabled && !KnownDeviceIpLocked(ip)) return false;
+    SpatialPlacement p;
+    p.position = Vec3{x, y, z};
+    p.enabled = enabled;
+    spatial_placements[ip] = p;
+    return true;
+  }
+
+  bool ClearSourceSpatial(const std::string& node_id) {
+    const std::string ip = NodeIpOf(node_id);
+    if (ip.empty()) return false;
+    std::lock_guard<std::mutex> lock(mutex);
+    return spatial_placements.erase(ip) > 0;
   }
 
   // ---- 发现 ----
@@ -1312,6 +1407,19 @@ void HubCore::SetMasterGain(float gain) { impl_->SetMasterGain(gain); }
 float HubCore::master_gain() const { return impl_->master_gain.load(); }
 void HubCore::SetLatency(int ms) { impl_->SetLatency(ms); }
 int HubCore::latency() const { return impl_->latency_ms; }
+
+void HubCore::SetListenerPose(const ListenerPose& pose, bool valid) {
+  impl_->SetListenerPose(pose, valid);
+}
+
+bool HubCore::SetSourceSpatial(const std::string& node_id, float x, float y, float z,
+                               bool enabled) {
+  return impl_->SetSourceSpatial(node_id, x, y, z, enabled);
+}
+
+bool HubCore::ClearSourceSpatial(const std::string& node_id) {
+  return impl_->ClearSourceSpatial(node_id);
+}
 
 std::vector<Peer> HubCore::DiscoveredPeers() const { return impl_->DiscoveredPeers(); }
 void HubCore::RefreshDiscovery() { impl_->RefreshDiscovery(); }
