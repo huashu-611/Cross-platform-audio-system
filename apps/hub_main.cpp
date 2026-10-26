@@ -27,7 +27,7 @@ struct Options {
   uint16_t http_port = 0;  // 0 = 不开 HTTP 接口
   bool no_discovery = false;
   bool no_handshake = false;
-  bool auto_accept = false;
+  bool auto_accept = true;
   std::string name = "AudioHub";
   std::string log_path;
 };

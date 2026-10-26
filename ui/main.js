@@ -53,6 +53,8 @@ function stopHub () {
 // 本机作为音源：把电脑的声音送到远端汇聚端。
 // 用现成的 audiohub-source，避免在 Electron 里重写采集。
 let pcSourceProcess = null
+// 音源进程的最新采集状态：界面用它回答"电脑到底采到声音没有"
+let pcSrc = { level: null, pkts: 0, kfps: 0 }
 
 function startPcSource (ip, port) {
   stopPcSource()
@@ -197,6 +199,9 @@ async function fetchState () {
   if (state && mainWindow && !mainWindow.isDestroyed()) {
     // 本机作为音源时的状态：核心只管收流，不知道我们另起了一个发送进程
     state.pcSource = pcSourceProcess !== null
+    state.pcSourceLevel = pcSrc.level
+    state.pcSourcePkts = pcSrc.pkts
+    state.pcSourceKfps = pcSrc.kfps
     mainWindow.webContents.send('hub:push', state)
   }
 }

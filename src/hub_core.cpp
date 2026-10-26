@@ -352,6 +352,16 @@ struct HubCore::Impl {
           }
         }
 
+        // 已经同意过的流再次收到 CONN-REQ（对端没收到 ACK 会重试）：
+        // 直接重发 ACK，绝不能再进待确认 —— 否则界面上那个"同意"按钮
+        // 会一直挂在那里，点了也没用（流已经在 accepted_ids 里了）。
+        if (accepted_ids.count(stream_id) > 0) {
+          const std::string ack =
+              "CONN-ACK|" + display_name + "|" + std::to_string(stream_id) + "\n";
+          handshake_socket.SendToAddr(from_ip, from_port, ack.data(), ack.size());
+          return;
+        }
+
         if (auto_accept_.load() || !require_handshake ||
             PeerAllowedNow(from_ip)) {
           // 自动同意：直接放行

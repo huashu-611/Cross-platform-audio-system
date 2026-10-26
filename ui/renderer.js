@@ -389,7 +389,9 @@ function render (state) {
   const confirmedCount = sources.filter((s) => s.confirmed).length
   // 本机切走汇聚端后会变成"纯音源"：本地没有 sources，
   // 但会话明明还在。只看 sources 会把界面误跳回连接界面。
-  const anyConnection = confirmedCount > 0 || !hubSelf
+  // 本机不是汇聚端时，只有音源进程还活着才算"会话还在"；
+  // 否则用户断开后界面会一直卡在控制页，永远回不到连接页。
+  const anyConnection = confirmedCount > 0 || (!hubSelf && !!state.pcSource)
 
   // 自动切换屏幕：有连接 → 控制；没有 → 连接
   const next = anyConnection ? 'control' : 'connect'
@@ -406,10 +408,18 @@ function render (state) {
     if (note) {
       if (hubSelf) {
         note.textContent = '承担收流 / 混音 / 播放'
+      } else if (!state.pcSource) {
+        note.textContent = '本机声音未发送（音源进程未启动）'
+      } else if (state.pcSourceLevel === null) {
+        note.textContent = '音源进程已启动，等待采集数据…'
+      } else if (state.pcSourceLevel <= -119) {
+        // 这一条最关键：进程在跑、但采到的全是静音
+        note.textContent = '已发送，但采集到的是静音 —— '
+            + '请确认系统默认播放设备就是正在出声的那个（回环只抓默认设备）'
       } else {
-        note.textContent = state.pcSource
-            ? '本机声音已送往远端（本机输出已静音）'
-            : '本机声音未发送（音源进程未启动）'
+        note.textContent = '本机声音已送往远端 · 采集 '
+            + state.pcSourceLevel.toFixed(1) + ' dBFS · '
+            + state.pcSourcePkts + ' 包/s'
       }
     }
   } else {
