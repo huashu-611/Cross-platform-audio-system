@@ -5,16 +5,20 @@
 const { contextBridge, ipcRenderer } = require('electron')
 
 contextBridge.exposeInMainWorld('hub', {
-  // 主动拉一次状态
+  // 主动拉一次状态（含 graph 字段）
   getState: () => ipcRenderer.invoke('hub:state'),
 
-  // 订阅主进程推送（200 ms 一次的状态快照）
+  // 订阅主进程推送（200 ms 一次的状态快照；state.graph 是全网图谱快照）
   onState: (callback) => {
     const handler = (_event, state) => callback(state)
     ipcRenderer.on('hub:push', handler)
     // 返回取消订阅函数，避免重复注册叠加监听器
     return () => ipcRenderer.removeListener('hub:push', handler)
   },
+
+  // 切换汇聚端（图谱上的节点 action）。nodeId = "ip:audioPort"
+  // 主进程 POST /api/graph/switch，返回 { ok, graph }（失败时带 error）
+  switchHub: (nodeId) => ipcRenderer.invoke('hub:switch', { nodeId }),
 
   // 调某一路的音量 / 静音
   setSource: (id, patch) => ipcRenderer.invoke('hub:setSource', { id, patch }),
@@ -28,7 +32,8 @@ contextBridge.exposeInMainWorld('hub', {
   // 主动扫描一轮，返回本次扫到的设备
   scan: () => ipcRenderer.invoke('hub:scan'),
 
-  // 设定汇聚端：self=true 本机；false 时给 ip/audioPort
+  // 旧接口：设定汇聚端（self=true 本机；false 时给 ip/audioPort）。
+  // 新界面不再调用；汇聚端改由 switchHub 按图谱切换。保留给旧脚本/旧页面。
   setRole: (arg) => ipcRenderer.invoke('hub:setRole', arg),
 
   // 清空会话关系表（用户主动断开时）

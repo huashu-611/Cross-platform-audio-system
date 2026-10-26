@@ -95,6 +95,13 @@ public class ReceiverService extends Service {
         }
         if (!ACTION_START.equals(intent.getAction())) return START_NOT_STICKY;
 
+        // 幂等：400ms reconcile / 角色命令可能导致同一个 START 重复下发。
+        // 已经在本端口收流就直接忽略；端口变了则先彻底收尾再按新端口重建，
+        // 否则 bind 失败会被 fail() 当成"端口被占用"直接 stopSelf。
+        final int wantPort = intent.getIntExtra(EXTRA_PORT, 47000);
+        if (running && wantPort == port) return START_NOT_STICKY;
+        if (running) stopAll();
+
         // Android 12+ 对前台服务启动有严格限制，Android 14 对
         // foregroundServiceType 也有要求；任何一项不满足都会抛异常
         // 直接杀进程（表现就是"闪退"）。这里兜住并给出可读原因。
@@ -137,6 +144,7 @@ public class ReceiverService extends Service {
         // 每路一条抖动缓冲：要做"点某个球调它的音量"，
         // 就必须知道每路各自的声音，混在一起之后再想分开是不可能的。
         streams.clear();
+        sStreamPeerIp.clear();
 
         if (!startPlayback()) return START_NOT_STICKY;
 
@@ -207,10 +215,13 @@ public class ReceiverService extends Service {
                 * PacketProtocol.CHANNELS];
         while (running) {
             final int n;
+            final String fromIp;
             try {
                 DatagramPacket pkt = new DatagramPacket(buf, buf.length);
                 dataSocket.receive(pkt);
                 n = pkt.getLength();
+                fromIp = pkt.getAddress() != null
+                        ? pkt.getAddress().getHostAddress() : "";
             } catch (Exception e) {
                 continue;
             }
@@ -224,6 +235,9 @@ public class ReceiverService extends Service {
             final int streamId = (buf[2] & 0xFF) | ((buf[3] & 0xFF) << 8);
             final long samplePos = readU32(buf, 8);
 
+            // 协议 §8：音频包也是"这台设备活着"的证据（不必等到它的 GRAPH）
+            GraphStore.markSeen(fromIp);
+
             // 把小端 int16 转成 short[]
             for (int i = 0; i < frames * PacketProtocol.CHANNELS; ++i) {
                 final int off = PacketProtocol.HEADER_BYTES + i * 2;
@@ -236,6 +250,7 @@ public class ReceiverService extends Service {
                 gains.putIfAbsent(streamId, 1.0f);
                 sStreamCount = streams.size();
             }
+            if (!fromIp.isEmpty()) sStreamPeerIp.put(streamId, fromIp);
             jb.push(samplePos, scratch, frames);
         }
     }
@@ -329,6 +344,19 @@ public class ReceiverService extends Service {
 
     private static final Map<Integer, Float> sGains = new ConcurrentHashMap<>();
 
+    // streamId → 来源 IP。图谱界面用它把"有音频流的节点"和 streamId 对上：
+    // 点某个球调音量时，必须知道这个球对应哪一路流（协议 §7.2 的 Android 版）。
+    private static final Map<Integer, String> sStreamPeerIp = new ConcurrentHashMap<>();
+
+    /** 某个 ip 当前对应的音频流 id；0 = 没有流（离线或还没收到包）。 */
+    public static int streamIdForIp(String ip) {
+        if (ip == null || ip.isEmpty()) return 0;
+        for (Map.Entry<Integer, String> e : sStreamPeerIp.entrySet()) {
+            if (ip.equals(e.getValue())) return e.getKey().intValue();
+        }
+        return 0;
+    }
+
     /**
      * 向对端发 CONN-REQ 并等待 CONN-ACK。
      * 这是"建立连接"的握手，与谁当汇聚端无关。
@@ -372,6 +400,7 @@ public class ReceiverService extends Service {
         running = false;
         sRunning = false;
         streams.clear();
+        sStreamPeerIp.clear();
         sStreamCount = 0;
         if (recvThread != null) { try { recvThread.join(400); } catch (Exception ignored) {} }
         if (playThread != null) { try { playThread.join(400); } catch (Exception ignored) {} }

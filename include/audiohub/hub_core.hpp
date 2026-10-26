@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "audiohub/discovery.hpp"
+#include "audiohub/graph.hpp"
 
 namespace audiohub {
 
@@ -61,6 +62,7 @@ struct StartOptions {
   bool require_handshake = true;   // true = 未经确认的流按静音处理
   bool auto_accept = false;        // 自动同意新连接请求
   std::string display_name;        // 界面上显示的本机名
+  uint16_t http_port = 0;          // HTTP 控制口（图谱节点要广播它），0 = 没有界面
 };
 
 class HubCore {
@@ -123,6 +125,17 @@ class HubCore {
   //   make_hub=false → 告诉对端"把声音送到 hub_ip:hub_port"
   bool SendRoleCommand(const std::string& peer_ip, uint16_t peer_audio_port,
                        bool make_hub, const std::string& hub_ip, uint16_t hub_port);
+
+  // ---- 图谱（docs/GRAPH-PROTOCOL.md）：节点集合 + 汇聚端指针 ----
+  // 谁当汇聚端不再由本机单方面决定，而是图谱里的一个指针（LWW 合并）；
+  // 每个设备都按图谱 reconcile 自己的职责。
+  GraphState Graph() const;
+  std::string graph_self_id() const;             // 本机节点 id = <IP>:<音频口>
+  bool graph_is_hub() const;                     // graph.hubId == selfId
+  bool SwitchGraphHub(const std::string& node_id);  // 本地切换汇聚端（节点不存在返回 false）
+  void SyncGraphNow();                           // 立刻广播图谱 + 逐节点回探（/api/graph/sync）
+  // 某 IP 最近一次收到数据报距今多少毫秒（从未见到 = -1）。界面用它判 online（§7.1）。
+  int64_t graph_peer_last_seen_ms(const std::string& ip) const;
 
   std::string local_ip() const;
   void SetEventCallback(std::function<void(const std::string&)> cb);

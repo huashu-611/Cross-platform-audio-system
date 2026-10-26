@@ -11,7 +11,7 @@
 
   <header>
     <div class="brand">
-      <h1>AudioHub <span>汇聚端</span></h1>
+      <h1>AudioHub <span>连接设备</span></h1>
       <div class="sub">多台设备的声音，汇到这一副耳机里</div>
     </div>
     <div class="addr">
@@ -52,9 +52,20 @@
 
   </div>
 
-  <!-- ============ 控制界面：网络图 ============ -->
+  <!-- ============ 控制界面：全网图谱 ============ -->
   <div id="screenControl" style="display:none">
-    <svg id="graph" viewBox="0 0 920 460" style="width:100%;height:auto;display:block"></svg>
+    <svg id="graph" viewBox="0 0 920 460" role="img" aria-label="全网设备图谱"
+         style="width:100%;height:auto;display:block"></svg>
+
+    <!-- 点节点后的操作条：切换汇聚端确认 / 当前汇聚端信息 -->
+    <div id="graphAction" class="actionbar" style="display:none">
+      <span class="acttext" id="actionText">—</span>
+      <button class="actbtn primary" id="actionSwitch">切换</button>
+      <button class="actbtn" id="actionCancel">取消</button>
+    </div>
+    <!-- 切换后的同步状态：已切换，正在同步… / 已同步（vN） -->
+    <div id="graphStatus" class="graphstatus" style="display:none"></div>
+
     <div id="volumePanel" class="volpanel" style="display:none">
       <div class="volname" id="volName">—</div>
       <div class="row">
@@ -85,7 +96,7 @@
 
     <div class="hubbar">
       <span class="hublabel">汇聚端</span>
-      <select id="hubSelect" class="hubselect"></select>
+      <span class="hubnow" id="hubNow">—</span>
       <span class="hubnote" id="hubNote">承担收流 / 混音 / 播放</span>
       <label class="autochk">
         <input type="checkbox" id="autoAccept">

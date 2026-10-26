@@ -3,11 +3,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
 #include <set>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "audiohub/asrc.hpp"
@@ -35,7 +37,44 @@ constexpr int kAsrcReserveFrames = 8;
 // 控制口 = 音频口 + 2（+1 是 PING/PONG 口）。握手和发现都走文本帧。
 constexpr uint16_t kControlPortOffset = 2;
 
+// ---- 图谱（docs/GRAPH-PROTOCOL.md）----
+// 周期保活 3 秒；本地变化连发 2 次、间隔 60 ms；同一设备 1 秒最多收 5 次，
+// 超出合并成延迟一次；同一来源的 GRAPH-REQ 200 ms 内只回一次。
+constexpr int kGraphPeriodicMs = 3000;
+constexpr int kGraphRepeatMs = 60;
+constexpr int kGraphRequestReplyMs = 200;
+constexpr int kGraphRateWindowMs = 1000;
+constexpr int kGraphRateMaxSends = 5;
+
 using Clock = std::chrono::steady_clock;
+
+// 本机 IP 的测试钩子：AUDIOHUB_LOCAL_IP 非空时优先。
+// 为什么要它：tools/graph-smoke.ps1 在同一台机器上跑两个 hub，自动枚举
+// 只会得到同一个局域网 IP，两个进程的自节点会互相指错。显式覆盖最省事。
+std::string EnvLocalIpOverride() {
+  const char* v = std::getenv("AUDIOHUB_LOCAL_IP");
+  if (v == nullptr) return {};
+  std::string s(v);
+  while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+  const size_t start = s.find_first_not_of(" \t");
+  return start == std::string::npos ? std::string() : s.substr(start);
+}
+
+// 候选地址列表（"a, b, 127.0.0.1"）里取第一个，作为"本机 IP"。
+std::string FirstIp(const std::string& list) {
+  std::string s = list;
+  const size_t comma = s.find(',');
+  if (comma != std::string::npos) s = s.substr(0, comma);
+  while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+  const size_t start = s.find_first_not_of(" \t");
+  return start == std::string::npos ? std::string() : s.substr(start);
+}
+
+// 节点 id 是 "<ip>:<audioPort>"。取 ip 部分（找不到 ':' 返回空串）。
+std::string NodeIpOf(const std::string& id) {
+  const size_t colon = id.rfind(':');
+  return colon == std::string::npos ? std::string() : id.substr(0, colon);
+}
 
 struct Stream {
   explicit Stream(uint16_t stream_id, int latency_ms)
@@ -115,12 +154,31 @@ struct HubCore::Impl {
     std::string peer_name;
     std::string peer_ip;
     uint16_t peer_port = 0;
+    uint16_t peer_audio = 47000;   // 对端音频口（CONN-REQ 第 4 段，老版本缺省 47000）
     int64_t requested_at_ms = 0;
   };
   std::map<uint16_t, Pending> pending;
   // 已确认过的 stream_id。握手模式下发起方收到 ACK 才开始发音频，
   // 所以 Accept 时那个流往往还不存在——必须记住，等它的第一个包来时对号入座。
   std::set<uint16_t> accepted_ids;
+
+  // ---- 图谱状态（docs/GRAPH-PROTOCOL.md）----
+  // 谁当汇聚端、局域网里有哪些设备，全靠这几个字段。
+  // 锁沿用 mutex：图谱由握手线程收、HTTP 线程读/切，数据量很小（<=32 节点），
+  // 单独再开一把锁只会多出一种死锁可能。
+  GraphState graph_;
+  std::string graph_self_ip;        // 本机 IP（AUDIOHUB_LOCAL_IP 可覆盖）
+  std::string self_node_id;         // 本机节点 id = <IP>:<音频口>
+  uint16_t graph_http_port = 0;     // 自节点要广播的 HTTP 口
+  uint64_t graph_seen_version = 0;  // 见过的最大 version（本地改动取 max+1）
+  std::map<std::string, Clock::time_point> graph_last_seen;   // ip -> 最近收到数据报
+  std::map<std::string, Clock::time_point> graph_req_replied; // ip -> 上次回 GRAPH-REQ
+  std::map<std::string, std::vector<Clock::time_point>> graph_sends;  // ip -> 发送时刻
+  std::map<std::string, Clock::time_point> graph_deferred;    // ip -> 被限速合并后的补发
+  std::vector<std::pair<std::string, uint16_t>> graph_probes; // 待发的 GRAPH-REQ
+  int graph_pending_repeats = 0;         // 本地变化还差几次广播（连发 2 次）
+  Clock::time_point graph_next_repeat{};    // 下一次补发时刻
+  Clock::time_point graph_next_periodic{};  // 下一次周期广播
 
   std::thread receiver;
   std::thread control;
@@ -149,6 +207,7 @@ struct HubCore::Impl {
     display_name = opts.display_name.empty() ? "AudioHub" : opts.display_name;
     require_handshake = opts.require_handshake;
     auto_accept_.store(opts.auto_accept);
+    http_port_for_discovery = opts.http_port;
     stop_requested.store(false);
 
     if (!data_socket.Open(port)) {
@@ -185,17 +244,23 @@ struct HubCore::Impl {
     {
       // 信标里带全部候选 IP（逗号分隔，第一个最可能可用）。
       // 一台机器可能同时有 WiFi 和网线，对端自己挑同网段的那个最稳。
-      const std::string all = LocalIPv4List();
-      local_ip_for_invite = all;   // 去掉尾部 ", 127.0.0.1"
-      const size_t loop = local_ip_for_invite.find("127.0.0.1");
-      if (loop != std::string::npos) {
-        local_ip_for_invite = local_ip_for_invite.substr(0, loop);
-        while (!local_ip_for_invite.empty() &&
-               (local_ip_for_invite.back() == ' ' || local_ip_for_invite.back() == ',')) {
-          local_ip_for_invite.pop_back();
+      const std::string env_ip = EnvLocalIpOverride();
+      if (!env_ip.empty()) {
+        // 测试钩子：本机双进程冒烟测试时强制宣告同一个回环地址
+        local_ip_for_invite = env_ip;
+      } else {
+        const std::string all = LocalIPv4List();
+        local_ip_for_invite = all;   // 去掉尾部 ", 127.0.0.1"
+        const size_t loop = local_ip_for_invite.find("127.0.0.1");
+        if (loop != std::string::npos) {
+          local_ip_for_invite = local_ip_for_invite.substr(0, loop);
+          while (!local_ip_for_invite.empty() &&
+                 (local_ip_for_invite.back() == ' ' || local_ip_for_invite.back() == ',')) {
+            local_ip_for_invite.pop_back();
+          }
         }
+        if (local_ip_for_invite.empty()) local_ip_for_invite = "127.0.0.1";
       }
-      if (local_ip_for_invite.empty()) local_ip_for_invite = "127.0.0.1";
     }
     // 两端能力完全一致：都能采音也都能放音。"发送/接收"只是指
     // 建立连接时谁发起，不是角色——汇聚端是用户在界面里选的。
@@ -208,6 +273,16 @@ struct HubCore::Impl {
       // 不能静默：发现不可用意味着"扫不到设备"，必须让用户知道原因
       Emit("[!] 自动发现不可用：端口 47300 被占用（可能有另一个 AudioHub 实例在跑）。"
            "可以手动填写对方 IP 继续使用。");
+    }
+
+    // 图谱：自节点 id = <本机 IP>:<音频口>，kind 固定 "pc"，name 用显示名。
+    // PC 默认当汇聚端（协议 §1），用户之后可以在图谱上把汇聚端切到别的节点。
+    {
+      graph_self_ip = FirstIp(local_ip_for_invite);
+      if (graph_self_ip.empty()) graph_self_ip = "127.0.0.1";
+      graph_http_port = opts.http_port;
+      std::lock_guard<std::mutex> lock(mutex);
+      GraphInitLocked();
     }
 
     running.store(true);
@@ -247,6 +322,8 @@ struct HubCore::Impl {
         std::this_thread::sleep_for(std::chrono::microseconds(200));
         continue;
       }
+      // 音频包也算活标志（协议 §8）：只对图谱里已有的 IP 生效
+      TouchGraphIp(from_ip);
 
       // 协议调试：前若干个包的原始字节。跨平台联调时直接看字节比推理可靠。
       if (raw_dump_budget > 0) {
@@ -320,11 +397,25 @@ struct HubCore::Impl {
       std::string from_ip;
       uint16_t from_port = 0;
       const int n = handshake_socket.ReceiveFrom(buf.data(), buf.size(), &from_ip, &from_port);
+      // 图谱的周期广播/补发/回探全挂在这条线程上：本来就是 50 ms 一拍的循环，
+      // 再开一条定时线程只会多一份竞态。
+      GraphTick();
       if (n <= 0) continue;
-      buf[static_cast<size_t>(n)] = 0;
+      // 任何一条数据报都算"这个 IP 还活着"（协议 §4.2/§8 的活标志）
+      TouchGraphIp(from_ip);
 
-      std::string line(reinterpret_cast<char*>(buf.data()));
+      std::string line(reinterpret_cast<const char*>(buf.data()), static_cast<size_t>(n));
       while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+
+      // 图谱帧与握手命令共用 audioPort+2 这个口，必须先判断
+      if (IsGraphRequestFrame(line)) {
+        ReplyGraphRequest(from_ip, from_port);
+        continue;
+      }
+      if (line.compare(0, 6, "GRAPH|") == 0) {
+        HandleGraphFrame(from_ip, line);
+        continue;
+      }
 
       std::vector<std::string> parts;
       size_t start = 0;
@@ -341,12 +432,12 @@ struct HubCore::Impl {
         // CONN-REQ|<名字>|<streamId>[|<对端音频口>]
         // 第 4 段是后来加的：电脑要能切回手机当汇聚端，
         // 就必须知道手机的音频口。老版本不带，回落到 47000。
+        uint16_t peer_audio = 47000;
+        if (parts.size() >= 4) {
+          const int v = std::atoi(parts[3].c_str());
+          if (v > 0 && v < 65536) peer_audio = static_cast<uint16_t>(v);
+        }
         {
-          uint16_t peer_audio = 47000;
-          if (parts.size() >= 4) {
-            const int v = std::atoi(parts[3].c_str());
-            if (v > 0 && v < 65536) peer_audio = static_cast<uint16_t>(v);
-          }
           std::lock_guard<std::mutex> lock(mutex);
           RememberPeer(from_ip, parts[1], peer_audio);
         }
@@ -371,11 +462,23 @@ struct HubCore::Impl {
           const std::string ack =
               "CONN-ACK|" + display_name + "|" + std::to_string(stream_id) + "\n";
           handshake_socket.SendToAddr(from_ip, from_port, ack.data(), ack.size());
-          return;
+          // 对端没收到 ACK 会重发 CONN-REQ，重发同样算握手成功：
+          // 补一次节点注册 + 互发图谱（协议 §5）。这里以前误写成 return，
+          // 会把整条握手线程结束掉——之后所有握手/图谱帧都收不到了。
+          GraphAddPeer(from_ip, peer_name, peer_audio);
+          continue;
         }
 
-        if (auto_accept_.load() || !require_handshake ||
-            PeerAllowedNow(from_ip)) {
+        // 协议 §5：图谱成员 IP 的连接请求，任何角色都自动 ACK（不弹窗）；
+        // 非成员沿用 auto_accept / 待确认弹窗。非 hub 也必须能放新设备入网，
+        // 否则新设备只能靠发现 hub，而 hub 可能已经切到手机上。
+        bool graph_member = false;
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          graph_member = FindNodeByIp(graph_, from_ip) != nullptr;
+        }
+        if (auto_accept_.load() || !require_handshake || PeerAllowedNow(from_ip) ||
+            graph_member) {
           // 自动同意：直接放行
           std::lock_guard<std::mutex> lock(mutex);
           auto it = streams.find(stream_id);
@@ -404,6 +507,8 @@ struct HubCore::Impl {
           const std::string ack = "CONN-ACK|" + display_name + "|" + std::to_string(stream_id) + "\n";
           handshake_socket.SendToAddr(from_ip, from_port, ack.data(), ack.size());
           Emit("[+] 已接受连接: " + peer_name + " (流 " + std::to_string(stream_id) + ")");
+          // 握手成功：对端入图谱，并立刻和它互发一次当前图谱（协议 §4.1/§5）
+          GraphAddPeerLocked(from_ip, peer_name, peer_audio, nullptr);
         } else {
           // 要人确认：进待确认列表，等界面点同意
           std::lock_guard<std::mutex> lock(mutex);
@@ -411,6 +516,7 @@ struct HubCore::Impl {
           p.peer_name = peer_name;
           p.peer_ip = from_ip;
           p.peer_port = from_port;
+          p.peer_audio = peer_audio;
           p.requested_at_ms = static_cast<int64_t>(
               std::chrono::duration_cast<std::chrono::milliseconds>(
                   Clock::now().time_since_epoch()).count());
@@ -444,6 +550,8 @@ struct HubCore::Impl {
         auto it = streams.find(stream_id);
         if (it != streams.end()) it->second->confirmed = true;
         Emit("[+] 对方已同意: " + parts[1] + " (流 " + std::to_string(stream_id) + ")");
+        // 握手成功（我们是发起方）：对端入图谱 + 立刻互发当前图谱（协议 §5）
+        GraphAddPeerLocked(from_ip, parts[1], 47000, nullptr);
       } else if (cmd == "CONN-NAK" && parts.size() >= 3) {
         Emit("[-] 对方拒绝连接: " + parts[1]);
       } else if (cmd == "CONN-BYE" && parts.size() >= 2) {
@@ -459,6 +567,322 @@ struct HubCore::Impl {
         pending.erase(stream_id);
       }
     }
+  }
+
+  // ------------------------------------------------------------ 图谱
+  //
+  // 契约见 docs/GRAPH-PROTOCOL.md。这里只做"收发 + 什么时候广播"，
+  // 合并/编解码这些纯逻辑全在 graph.hpp（可单测，两端逐字节一致）。
+  // 所有图谱状态都受 mutex 保护；GRAPH 帧走握手口（audioPort+2）。
+
+  // 节点 id 里的音频口 -> 握手口。越界返回 false（UDP 端口最多 65535）。
+  static bool HsPortFor(uint16_t audio_port, uint16_t* out) {
+    if (audio_port == 0 || audio_port > 65535 - kControlPortOffset) return false;
+    *out = static_cast<uint16_t>(audio_port + kControlPortOffset);
+    return true;
+  }
+
+  GraphNode MakeSelfNodeLocked() const {
+    GraphNode me;
+    me.id = self_node_id;
+    me.name = SanitizeName(display_name.empty() ? std::string("AudioHub") : display_name);
+    me.kind = "pc";   // 本仓库的 HubCore 只跑在 PC 上；Android 端自己报 android
+    me.audio_port = port;
+    me.http_port = graph_http_port;
+    return me;
+  }
+
+  // 启动时初始化：PC 默认自己当汇聚端（协议 §1）。
+  void GraphInitLocked() {
+    graph_ = GraphState();
+    self_node_id = graph_self_ip + ":" + std::to_string(port);
+    graph_.version = 1;
+    graph_.origin = self_node_id;
+    graph_.hub_id = self_node_id;
+    graph_.nodes.push_back(MakeSelfNodeLocked());
+    graph_seen_version = 1;
+    graph_last_seen.clear();
+    graph_req_replied.clear();
+    graph_sends.clear();
+    graph_deferred.clear();
+    graph_probes.clear();
+    graph_pending_repeats = 0;
+    graph_next_periodic = Clock::now() + std::chrono::milliseconds(kGraphPeriodicMs);
+  }
+
+  // 会话清空（"全部断开"，协议 §4.6）：版本 +1、origin/hubId 回到自己、只留自节点。
+  // 不广播——对端此刻已经断开/不可达。
+  void GraphResetLocked() {
+    const uint64_t next_version = std::max(graph_.version, graph_seen_version) + 1;
+    graph_ = GraphState();
+    graph_.version = next_version;
+    graph_.origin = self_node_id;
+    graph_.hub_id = self_node_id;
+    graph_.nodes.push_back(MakeSelfNodeLocked());
+    graph_seen_version = next_version;
+    graph_last_seen.clear();
+    graph_req_replied.clear();
+    graph_sends.clear();
+    graph_deferred.clear();
+    graph_probes.clear();
+    graph_pending_repeats = 0;
+  }
+
+  void TouchGraphIp(const std::string& ip) {
+    std::lock_guard<std::mutex> lock(mutex);
+    TouchGraphIpLocked(ip);
+  }
+
+  void TouchGraphIpLocked(const std::string& ip) {
+    if (ip.empty()) return;
+    if (FindNodeByIp(graph_, ip) == nullptr) return;
+    graph_last_seen[ip] = Clock::now();
+  }
+
+  // 本机变化：立刻发 2 次、间隔 60 ms（协议 §4.4）。
+  void GraphScheduleDoubleLocked() {
+    graph_pending_repeats = 2;
+    graph_next_repeat = Clock::now();
+  }
+
+  // 合并导致的变化 / 学会新节点：立刻发 1 次。
+  void GraphScheduleOnceLocked() {
+    if (graph_pending_repeats < 1) graph_pending_repeats = 1;
+    graph_next_repeat = Clock::now();
+  }
+
+  // 限速发送：同一设备 1 秒最多 5 次，超出合并成一次延迟发送（协议 §4.4）。
+  bool GraphTrySendLocked(const std::string& ip, uint16_t port, const std::string& frame) {
+    if (ip.empty() || port == 0) return false;
+    const auto now = Clock::now();
+    auto& hist = graph_sends[ip];
+    hist.erase(std::remove_if(hist.begin(), hist.end(),
+                              [&](const Clock::time_point& t) {
+                                return now - t >= std::chrono::milliseconds(kGraphRateWindowMs);
+                              }),
+               hist.end());
+    if (static_cast<int>(hist.size()) >= kGraphRateMaxSends) {
+      const auto due = hist.front() + std::chrono::milliseconds(kGraphRateWindowMs);
+      auto it = graph_deferred.find(ip);
+      if (it == graph_deferred.end() || due < it->second) graph_deferred[ip] = due;
+      return false;
+    }
+    if (!handshake_socket.SendToAddr(ip, port, frame.data(), frame.size())) return false;
+    hist.push_back(now);
+    return true;
+  }
+
+  void GraphQueueProbeLocked(const std::string& ip, uint16_t port) {
+    if (ip.empty() || port == 0) return;
+    for (const auto& p : graph_probes) {
+      if (p.first == ip && p.second == port) return;
+    }
+    graph_probes.emplace_back(ip, port);
+  }
+
+  // 向 nodes 里除自己外的每个节点单播当前图谱，返回成功发出几个。
+  int GraphBroadcastLocked() {
+    const std::string frame = EncodeGraphFrame(graph_);
+    int sent = 0;
+    for (const auto& n : graph_.nodes) {
+      if (n.id == self_node_id) continue;
+      uint16_t hs = 0;
+      if (!HsPortFor(n.audio_port, &hs)) continue;
+      if (GraphTrySendLocked(NodeIpOf(n.id), hs, frame)) ++sent;
+    }
+    return sent;
+  }
+
+  void GraphSendRequestsLocked() {
+    const std::string req = "GRAPH-REQ\n";
+    for (const auto& p : graph_probes) {
+      handshake_socket.SendToAddr(p.first, p.second, req.data(), req.size());
+    }
+    graph_probes.clear();
+  }
+
+  // 收到 GRAPH-REQ：回当前图谱，同一来源 200 ms 内只回一次（协议 §4.3）。
+  void ReplyGraphRequest(const std::string& ip, uint16_t port) {
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto now = Clock::now();
+    auto it = graph_req_replied.find(ip);
+    if (it != graph_req_replied.end() &&
+        now - it->second < std::chrono::milliseconds(kGraphRequestReplyMs)) {
+      return;
+    }
+    graph_req_replied[ip] = now;
+    const std::string frame = EncodeGraphFrame(graph_);
+    handshake_socket.SendToAddr(ip, port, frame.data(), frame.size());
+  }
+
+  // 收到 GRAPH：merge → 更新活标志 → 只有 changed 才广播（防 ping-pong，协议 §4.2）。
+  // 未变化绝对不回发，否则两端会互相触发一轮广播风暴。
+  void HandleGraphFrame(const std::string& from_ip, const std::string& line) {
+    GraphState remote;
+    if (!DecodeGraphFrame(line, &remote)) return;   // 非法帧整帧丢弃
+
+    bool changed = false;
+    size_t node_count = 0;
+    std::string hub_id;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      TouchGraphIpLocked(from_ip);
+      if (remote.version > graph_seen_version) graph_seen_version = remote.version;
+
+      // 先记下这次新学到的节点：合并后要给它们各补一次 GRAPH-REQ（协议 §4.4）
+      std::vector<std::pair<std::string, uint16_t>> probes;
+      for (const auto& rn : remote.nodes) {
+        if (rn.id == self_node_id) continue;
+        if (FindNode(graph_, rn.id) != nullptr) continue;
+        uint16_t hs = 0;
+        if (HsPortFor(rn.audio_port, &hs)) probes.emplace_back(NodeIpOf(rn.id), hs);
+      }
+
+      const GraphMergeResult result = MergeGraph(&graph_, remote);
+      changed = result.changed;
+      if (changed) {
+        if (graph_.version > graph_seen_version) graph_seen_version = graph_.version;
+        GraphScheduleOnceLocked();   // 合并变化：立即 1 次
+        for (const auto& p : probes) GraphQueueProbeLocked(p.first, p.second);
+      }
+      node_count = graph_.nodes.size();
+      hub_id = graph_.hub_id;
+    }
+
+    if (changed) {
+      Emit("[GRAPH] 合并 v" + std::to_string(remote.version) + " <- " + from_ip + "，节点 " +
+           std::to_string(node_count) + " 个，hub=" + (hub_id.empty() ? "(空)" : hub_id));
+    }
+  }
+
+  // 握手成功 / 主动邀请：对端入图谱，并立刻互发一次当前图谱（协议 §4.1/§5）。
+  // 调用者必须已持锁。返回 true = 新节点。
+  bool GraphAddPeerLocked(const std::string& ip, const std::string& name, uint16_t audio_port,
+                          std::string* node_id) {
+    if (ip.empty()) return false;
+    bool added = false;
+    std::string new_id;
+    const GraphNode* existing = FindNodeByIp(graph_, ip);
+    if (existing == nullptr) {
+      const uint16_t audio = audio_port ? audio_port : 47000;
+      GraphNode n;
+      n.id = ip + ":" + std::to_string(audio);
+      n.name = SanitizeName(name.empty() ? ip : name);
+      // 握手帧里没有 kind。对端后发的 GRAPH 也不会覆盖这个字段
+      // （协议 §3：同 id 冲突保留 local，节点字段会话内不变），
+      // 所以手工邀请/握手学到的节点可能显示 other——已知限制，UI 不依赖 kind 渲染。
+      n.kind = "other";
+      n.audio_port = audio;
+      n.http_port = 0;
+      if (!UpsertNode(&graph_, n)) return false;
+      new_id = n.id;
+      added = true;
+      GraphScheduleDoubleLocked();   // 节点入网属于本地变化：连发 2 次
+    }
+
+    const GraphNode* node = FindNodeByIp(graph_, ip);
+    if (node == nullptr) return added;
+    uint16_t hs = 0;
+    if (HsPortFor(node->audio_port, &hs)) {
+      // §5 的"立刻互发一次当前 GRAPH"：不能等 3 秒定时器，
+      // 否则新入网的设备要空等一轮才知道真正的 hub 是谁。
+      GraphTrySendLocked(ip, hs, EncodeGraphFrame(graph_));
+      GraphQueueProbeLocked(ip, hs);
+    }
+    if (node_id != nullptr && added) *node_id = new_id;
+    return added;
+  }
+
+  // 同上，但调用者不持锁（用于 HTTP/握手线程的回调点）。
+  void GraphAddPeer(const std::string& ip, const std::string& name, uint16_t audio_port) {
+    std::string node_id;
+    bool added = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      added = GraphAddPeerLocked(ip, name, audio_port, &node_id);
+    }
+    if (added) Emit("[GRAPH] 节点加入: " + node_id);
+  }
+
+  // 由握手线程每轮调用一次（50 ms 一拍）：周期广播、补发、延迟发送、GRAPH-REQ。
+  // 不额外开线程：图谱的定时需求（3 s / 60 ms / 200 ms）都远粗于 50 ms 的收包超时。
+  void GraphTick() {
+    std::vector<std::string> deferred_ips;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      const auto now = Clock::now();
+
+      // 周期保活：每 3 秒一次，补偿丢包（协议 §4.4）
+      if (now >= graph_next_periodic) {
+        graph_next_periodic = now + std::chrono::milliseconds(kGraphPeriodicMs);
+        GraphBroadcastLocked();
+      }
+
+      // 本地变化的第 2 次广播（间隔 60 ms）
+      if (graph_pending_repeats > 0 && now >= graph_next_repeat) {
+        graph_pending_repeats--;
+        graph_next_repeat = now + std::chrono::milliseconds(kGraphRepeatMs);
+        GraphBroadcastLocked();
+      }
+
+      // 被限速合并掉的目标：窗口滑过之后补发一次
+      for (auto it = graph_deferred.begin(); it != graph_deferred.end();) {
+        if (now >= it->second) {
+          deferred_ips.push_back(it->first);
+          it = graph_deferred.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      for (const auto& ip : deferred_ips) {
+        const GraphNode* node = FindNodeByIp(graph_, ip);
+        if (node == nullptr || node->id == self_node_id) continue;
+        uint16_t hs = 0;
+        if (!HsPortFor(node->audio_port, &hs)) continue;
+        GraphTrySendLocked(ip, hs, EncodeGraphFrame(graph_));
+      }
+
+      GraphSendRequestsLocked();
+    }
+  }
+
+  // 本地切换汇聚端（协议 §4.5）。节点不存在返回 false（HTTP 回 unknown node）。
+  bool SwitchGraphHub(const std::string& node_id) {
+    bool is_hub_now = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (FindNode(graph_, node_id) == nullptr) return false;
+      // version = max(version, seen) + 1：SwitchHub 内部只做 +1，
+      // 这里先把本地 version 抬到"见过的最大值"，避免比远端回退。
+      if (graph_seen_version > graph_.version) graph_.version = graph_seen_version;
+      if (!SwitchHub(&graph_, self_node_id, node_id)) return false;
+      graph_seen_version = graph_.version;
+      GraphScheduleDoubleLocked();   // 协议 §4.5：连发 2 次
+      is_hub_now = IsHub(graph_, self_node_id);
+    }
+    Emit(std::string("[GRAPH] 汇聚端切换 -> ") + node_id +
+         (is_hub_now ? "（本机是汇聚端）" : "（本机不是汇聚端，输出静音）"));
+    return true;
+  }
+
+  // HTTP /api/graph/sync：立刻广播一次 + 给每个节点发一次 GRAPH-REQ（协议 §7.3）。
+  void SyncGraphNow() {
+    std::lock_guard<std::mutex> lock(mutex);
+    GraphBroadcastLocked();
+    for (const auto& n : graph_.nodes) {
+      if (n.id == self_node_id) continue;
+      uint16_t hs = 0;
+      if (!HsPortFor(n.audio_port, &hs)) continue;
+      GraphQueueProbeLocked(NodeIpOf(n.id), hs);
+    }
+    GraphSendRequestsLocked();
+  }
+
+  int64_t GraphPeerLastSeenMs(const std::string& ip) const {
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto it = graph_last_seen.find(ip);
+    if (it == graph_last_seen.end()) return -1;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - it->second).count();
   }
 
   // ------------------------------------------------------------ 控制线程
@@ -600,6 +1024,11 @@ struct HubCore::Impl {
           in.active = !s.muted && s.confirmed;
           mix_inputs.push_back(in);
         }
+
+        // 协议 §6.1：本机不是汇聚端时混音输出静音。
+        // 上面的取水循环照常跑——不取水的话切回汇聚端的瞬间缓冲已被抽干，
+        // 会有几百毫秒的杂音/欠载。
+        if (!IsHub(graph_, self_node_id)) mix_inputs.clear();
       }
 
       MixBlock(mix_buffer.data(), mix_inputs.data(), static_cast<int>(mix_inputs.size()),
@@ -723,12 +1152,16 @@ struct HubCore::Impl {
   void AcceptConnection(uint16_t stream_id) {
     std::string ack_ip;
     uint16_t ack_port = 0;
+    uint16_t peer_audio = 47000;
+    std::string peer_name;
     {
       std::lock_guard<std::mutex> lock(mutex);
       auto pit = pending.find(stream_id);
       if (pit == pending.end()) return;
       ack_ip = pit->second.peer_ip;
       ack_port = pit->second.peer_port;
+      peer_audio = pit->second.peer_audio;
+      peer_name = pit->second.peer_name;
       accepted_ids.insert(stream_id);
       auto sit = streams.find(stream_id);
       if (sit == streams.end()) {
@@ -752,6 +1185,8 @@ struct HubCore::Impl {
     const std::string ack = "CONN-ACK|" + display_name + "|" + std::to_string(stream_id) + "\n";
     handshake_socket.SendToAddr(ack_ip, ack_port, ack.data(), ack.size());
     Emit("[+] 已同意连接 (流 " + std::to_string(stream_id) + ")");
+    // 界面点"同意"同样是握手成功：对端入图谱 + 立刻互发一次当前图谱（协议 §5）
+    GraphAddPeer(ack_ip, peer_name, peer_audio);
   }
 
   void RejectConnection(uint16_t stream_id) {
@@ -809,6 +1244,9 @@ struct HubCore::Impl {
         RememberPeer(peer_ip, "", peer_audio_port);
       }
       Emit("[>] 已发出邀请: " + peer_ip + ":" + std::to_string(hs_port));
+      // 邀请即占位入图（协议 §4.1）：这样对端随后发 CONN-REQ 时
+      // 已经算"图谱成员"，会走成员自动 ACK，不用用户再点一次。
+      GraphAddPeer(peer_ip, "", peer_audio_port);
     }
     return ok;
   }
@@ -904,6 +1342,8 @@ bool HubCore::SendRoleCommand(const std::string& peer_ip, uint16_t peer_audio_po
     impl_->RememberPeer(peer_ip, "", peer_audio_port);
   }
   impl_->Emit("[>] 角色指令 -> " + peer_ip + ":" + std::to_string(hs_port) + "  " + frame);
+  // 被点名的设备先占位入图（协议 §4.1）；它随后的 CONN-REQ 就会走成员自动 ACK。
+  impl_->GraphAddPeer(peer_ip, "", peer_audio_port);
   return ok;
 }
 
@@ -923,6 +1363,9 @@ std::vector<Peer> HubCore::SessionPeers() const {
 void HubCore::ClearSession() {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   impl_->session_peers.clear();
+  // "全部断开"同时重置图谱（协议 §4.6）：版本 +1、origin/hubId 回到自己、只留自节点。
+  // 不广播：对端已经断开/不可达，广播只会在下次见面时造成一次无意义的合并。
+  impl_->GraphResetLocked();
 }
 
 std::vector<Peer> HubCore::Invites() const {
@@ -950,7 +1393,40 @@ void HubCore::RejectInvite(const std::string& ip) {
 
 bool HubCore::InvitePeer(const Peer& peer) { return impl_->InvitePeer(peer.ip, peer.audio_port); }
 
-std::string HubCore::local_ip() const { return LocalIPv4List(); }
+// ---- 图谱（docs/GRAPH-PROTOCOL.md）----
+
+GraphState HubCore::Graph() const {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->graph_;
+}
+
+std::string HubCore::graph_self_id() const {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->self_node_id;
+}
+
+bool HubCore::graph_is_hub() const {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return IsHub(impl_->graph_, impl_->self_node_id);
+}
+
+bool HubCore::SwitchGraphHub(const std::string& node_id) {
+  return impl_->SwitchGraphHub(node_id);
+}
+
+void HubCore::SyncGraphNow() { impl_->SyncGraphNow(); }
+
+int64_t HubCore::graph_peer_last_seen_ms(const std::string& ip) const {
+  return impl_->GraphPeerLastSeenMs(ip);
+}
+
+// 测试钩子优先：tools/graph-smoke.ps1 在同一台机器上起两个 hub，
+// 自动枚举会给出同一个局域网 IP，两个进程的自节点会互相指错。
+std::string HubCore::local_ip() const {
+  const std::string env = EnvLocalIpOverride();
+  if (!env.empty()) return env;
+  return LocalIPv4List();
+}
 void HubCore::SetEventCallback(std::function<void(const std::string&)> cb) {
   std::lock_guard<std::mutex> lock(impl_->cb_mutex);
   impl_->event_cb = std::move(cb);

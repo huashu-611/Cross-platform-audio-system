@@ -24,17 +24,20 @@
 | N 路混音 + 软限幅 | ✅ | float32 累加，阈值 0.85 |
 | WASAPI 系统音频采集 | ✅ | loopback + AUTOCONVERTPCM |
 | 进程回环 `--include/--exclude` | ✅ | Win10 2004+，只抓/排除指定进程树 |
-| Android 源端 | ✅ 已真机验证 | `android/`，APK 29 KB |
+| Android 源端（采集） | ✅ 已真机验证 | `android/`，APK ≈ 293 KB |
+| Android 接收端（播放/混音） | ✅ 已实现 | `ReceiverService`：AudioTrack 混音输出 |
 | Windows 图形界面 | ✅ | `ui/` Electron 壳，每路音量/静音 + 总音量 |
-| 本地 HTTP 控制接口 | ✅ | `audiohub-hub.exe --http-port 4780` |
+| PC 自己当音源 | ✅ | 非汇聚端时界面自动拉起 `audiohub-source`，音量/静音联动 |
+| 本地 HTTP 控制接口 | ✅ | `--http-port 4780`；含 `/api/state.graph`、`/api/graph/switch` |
+| 共享网络图谱（双端） | ✅ | 设备图谱 + 图上点选切换汇聚端，全网同步（[协议](docs/GRAPH-PROTOCOL.md)） |
 | WASAPI 低延迟输出 | ✅ | 事件驱动，默认 10 ms 缓冲 |
 | 内置信号源 `--tone` | ✅ | 无音频设备也能测；两路正弦叠加可数值验证混音 |
 | 抖动注入 `--jitter` | ✅ | 模拟 WiFi，验抖动缓冲 |
 | 电平表 | ✅ | 每路 + 混音总线 dBFS |
-| 单元测试 | ✅ | 38 个用例，无需声卡 |
+| 单元测试 | ✅ | **65 个用例**（含图谱协议 23 个），无需声卡 |
 | Opus 编码 | ⬜ | 接口已预留，P0 用 int16 PCM |
-| Android 端 | ⬜ | AudioPlaybackCapture + AAudio |
-| 设备发现 / 配对 | ⬜ | 现在靠命令行填 IP |
+| Android 低延迟输出 | ⬜ | 现用 AudioTrack，未上 AAudio |
+| 设备发现 / 配对 | ✅ | UDP 广播发现 + 手工邀请 + 自动同意；未上 mDNS |
 | 蓝牙输出拦截 | ⬜ | 官方警告：蓝牙会 +150~250 ms |
 
 **这不是完成品，是可运行的 P0 骨架。** 传输、缓冲、混音、时钟这几块核心逻辑是完整的，
@@ -105,6 +108,19 @@ ctest --test-dir build --output-on-failure
 
 测试只覆盖平台无关的核心层，**不需要声卡**，可以在 CI 里跑。
 
+### Windows 一键脚本（本项目的实测环境，无需 cmake）
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\build.ps1        # 编译全部 + 跑单测
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\graph-smoke.ps1  # 图谱冒烟：起两个 hub 进程互发 GRAPH，结束自动清理
+node tools\ui-e2e.js                                                       # Electron 界面端到端（需先 cd ui && npm install）
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\build-apk.ps1    # 重新打包 Android APK
+```
+
+> 脚本内部会先把 MSYS2 的 `bin` 加进 `PATH`、并统一用相对路径编译——
+> MinGW 的 `ld` 处理带中文的绝对路径会直接失败（而且报错信息帮不上忙）。
+> `build-apk.ps1` 走 aapt2 + javac(JDK17) + d8 + apksigner，不依赖 Gradle。
+
 ### Visual Studio
 
 ```powershell
@@ -141,6 +157,11 @@ cd ui && npm run dist        # 产物在 ui/release/
 双击后自动做三件事：启动 C++ 音频核心、起本地 HTTP 控制口、打开界面窗口。
 每一路源有独立音量滑杆 + 静音 + 实时电平，底部有总音量和目标延迟
 （40 / 60 / 120 ms）。掉线的流自动从列表消失，音量会被记住。
+
+界面中央是**全网共享的设备图谱**：网络里每台设备（PC / 手机）都是图上的一个球，
+汇聚端是大球。点任意小球 →「把汇聚端切到 <名字>？」→ 确认后本地立即生效，
+并把新图谱广播给所有设备；手机和另一台 PC 的界面会在 1~2 秒内自动跟着变，
+不用每台设备各点一遍。协议与合并规则见 [docs/GRAPH-PROTOCOL.md](docs/GRAPH-PROTOCOL.md)。
 
 窗口顶部直接显示**手机上该填的 IP**，点「复制」即可。
 
@@ -302,7 +323,10 @@ stream 1  水位 56 ms (目标 60) | 比率 1.00018 | 迟到 0 溢出 0 | 欠载
 - **单机跑真实采集必须加 `--exclude audiohub-hub.exe`**：否则 source 抓到的
   系统混音里包含 hub 自己的输出，形成环回反馈。加了这个参数就干净了
   （已实测：hub 正在播 440 Hz 时，排除后的源端抓到 −120 dBFS）。
-- **没有设备发现**，只能命令行填 IP。
+- **图谱 / 握手 / ROLE 全部是明文可信局域网假设**：任何能发 UDP 的机器都能伪造
+  GRAPH 帧改掉汇聚端；跨不可信网络需要配对密钥（还没做）。
+- **发现靠 UDP 广播（47300）**：部分公司网络、跨网段会被拦，此时仍可手工填 IP 邀请。
+- **没有 mDNS**：广播只在同一子网内有效。
 - **Hub 不能同时采集本机音频**。如果要做，必须用 Windows 10 2004+ 的
   `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK` + `EXCLUDE` 模式排除自身进程树，
   否则会自己抓自己，形成无限反馈。
@@ -325,9 +349,9 @@ stream 1  水位 56 ms (目标 60) | 比率 1.00018 | 迟到 0 溢出 0 | 欠载
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | P0 ✅ | Windows→Windows 单源打通 + 测量工具 + 单机可测 | 见 `docs/测试指南.md` |
-| P1 ⬜ | **Android 源端**（`android/`，APK 已打包，未实机验证） | < 100 ms，锁屏 10 min 不掉 |
+| P1 ✅ | **Android 两端**：采集端 + 接收端（APK 已打包，采集端真机验证） | < 100 ms，锁屏 10 min 不掉 |
 | P2 ⬜ | 多源打磨：响度归一化、混音台、混音线程节拍精度 | 3 源，源间差 < 10 ms |
-| P3 ⬜ | 发现配对（mDNS）、蓝牙拦截、校准向导、Opus 编码 | 新设备 60 s 内出声 |
+| P3 🔶 | 发现 / 共享图谱 ✅；剩 mDNS、蓝牙拦截、校准向导、Opus 编码 | 新设备 60 s 内出声 |
 
 Android 端的用法和已知限制见 [android/README.md](android/README.md)。
 

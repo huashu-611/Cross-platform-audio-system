@@ -59,12 +59,24 @@ public class MainActivity extends Activity {
     private LinearLayout ctrlReqList;
     private LinearLayout connectReqList;
 
-    // 会话是否成立。不能只看"服务是否在跑"：切换角色时旧服务先停、
-    // 新服务几百毫秒后才起，这个间隙会让界面误判成"会话结束"而弹回连接页。
-    private boolean sessionActive = false;
-    private int idleTicks = 0;
-    // 用户主动点了"断开"：在服务真正停掉之前，不能再被 sessionActive 拉回来
+    // 用户主动点了"断开"：服务真正停掉之前，不能被图谱/服务状态拉回控制界面
     private boolean userLeft = false;
+
+    // ---- 图谱 / 采集职责（协议 §6.2）----
+    /** 已保存的 MediaProjection 授权：切换目标或 streamId 变了复用它重启采集。 */
+    private int projectionResultCode = 0;
+    private Intent projectionResultData;
+    /** 用户希望本机在采集（点过"送入"或连接成功后自动开始）。 */
+    private boolean sourceIntent = false;
+    /** 上次因目标变化重启采集的时间，防止 400ms 轮询里反复重启。 */
+    private long lastSourceRestartAt = 0;
+    /** 切换汇聚端后的提示状态。 */
+    private String pendingSwitchTarget = "";
+    private long switchSyncedAt = 0;
+    /** 音量面板当前选中的音频流（0 = 没有流）。 */
+    private int selectedStreamId = 0;
+    /** 一次性提示（只 toast 一次，避免每 400ms 刷屏）。 */
+    private String hintText = "";
 
     private LinearLayout ctrlPeerList;
 
@@ -126,6 +138,15 @@ public class MainActivity extends Activity {
         hubIp = prefs.getString("hub_ip", null);
         hubPort = prefs.getInt("hub_port", 47000);
         hubName = prefs.getString("hub_name", null);
+
+        // 图谱：本机节点尽早就位；上次连过的设备先登记成占位节点
+        // （kind 先 other，对端发来 GRAPH 后会被校正成它自己的名字/类型）
+        final String myIp = localIp();
+        if (!myIp.isEmpty()) GraphStore.setSelf(myIp, android.os.Build.MODEL);
+        if (hubIp != null && !hubIp.isEmpty()) {
+            GraphStore.upsertNode(hubIp, hubPort > 0 ? hubPort : GraphStore.AUDIO_PORT,
+                    hubName != null ? hubName : hubIp, GraphStore.KIND_OTHER);
+        }
 
         // 上次如果崩过，把堆栈直接摆到眼前——用户不用连电脑也能发给我们
         showLastCrashIfAny();
@@ -389,8 +410,7 @@ public class MainActivity extends Activity {
         graph.setOnNodeTap(new HubGraphView.OnNodeTap() {
             @Override
             public void onTap(HubGraphView.Node node) {
-                graph.setSelected(node.key);
-                showVolumePanel(node);
+                onGraphNodeTap(node);
             }
         });
         screenControl.addView(graph, new LinearLayout.LayoutParams(
@@ -421,7 +441,7 @@ public class MainActivity extends Activity {
         volSlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar bar, int progress, boolean fromUser) {
-                if (!fromUser || selectedKey == null) return;
+                if (!fromUser || selectedStreamId <= 0) return;
                 final float g = progress / 100f;
                 volPct.setText(Math.round(g * 100) + "%");
                 applyVolume(g);
@@ -474,7 +494,7 @@ public class MainActivity extends Activity {
         ctrlPeerList.setVisibility(View.GONE);
         screenControl.addView(ctrlPeerList);
 
-        // 汇聚端设定：连接建立之后才出现（方案第 4.2 节）
+        // 汇聚端信息：切换靠点图谱里的球（协议 §9.3），不再有下拉/切换按钮
         LinearLayout hubBar = card();
         LinearLayout hubRowC = new LinearLayout(this);
         hubRowC.setOrientation(LinearLayout.HORIZONTAL);
@@ -487,15 +507,9 @@ public class MainActivity extends Activity {
         hubValue.setTextSize(15);
         hubValue.setTextColor(COLOR_TEXT);
         hubInfoC.addView(hubValue);
-        hubSub = sub("当前承担收流 / 混音 / 播放的一端");
+        hubSub = sub("点图谱里的球可切换汇聚端");
         hubInfoC.addView(hubSub);
         hubRowC.addView(hubInfoC);
-        Button switchHub = textButton("切换", COLOR_ACCENT);
-        switchHub.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) { showHubPicker(); }
-        });
-        hubRowC.addView(switchHub);
         hubBar.addView(hubRowC);
         screenControl.addView(hubBar);
 
@@ -503,15 +517,19 @@ public class MainActivity extends Activity {
         leave.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                // 接收端：清掉所有流
+                // 协议 §4.6：清空图谱（不广播），两个服务都停，回连接界面
+                GraphStore.resetSession();
                 startService(new Intent(MainActivity.this, ReceiverService.class)
                         .setAction(ReceiverService.ACTION_STOP));
+                sourceIntent = false;
                 stopSource();
-                sessionActive = false;
+                projectionResultCode = 0;
+                projectionResultData = null;
                 userLeft = true;      // 立刻回连接界面，且不被服务状态拉回
                 manualPeers.clear();  // 主动断开：关系表一起清掉
-                manualPeers.clear();  // 主动断开：关系表一起清掉
-                idleTicks = 0;
+                hubIp = null;
+                hubName = null;
+                saveHub();
                 refresh();
                 Toast.makeText(MainActivity.this, "已断开", Toast.LENGTH_SHORT).show();
             }
@@ -535,74 +553,38 @@ public class MainActivity extends Activity {
         screenConnect.setVisibility("control".equals(next) ? View.GONE : View.VISIBLE);
     }
 
-    private String selectedKey;
-
-    private void showVolumePanel(HubGraphView.Node node) {
-        selectedKey = node.key;
-        final boolean receiving = ReceiverService.sRunning
-                && ReceiverService.sStreamCount > 0;
-        if (!receiving) {
-            // 本机当音源时，音量由对端控制，这里只说明状态
-            volName.setText(("hub".equals(node.key) ? "汇聚端" : node.name)
-                    + " · 音量由汇聚端调节");
+    /** 音量面板：streamId=0 表示这个节点当前没有音频流（只看状态）。 */
+    private void showVolumePanelForStream(int streamId, String label) {
+        selectedStreamId = streamId;
+        if (streamId <= 0) {
+            volName.setText(label + " · 暂无音频流");
             volSlider.setEnabled(false);
             volSlider.setProgress(100);
             volPct.setText("—");
             return;
         }
+        if (!ReceiverService.sRunning) {
+            // 本机当音源时，音量由汇聚端控制，这里只说明状态
+            volName.setText(label + " · 音量由汇聚端调节");
+            volSlider.setEnabled(false);
+            volPct.setText("—");
+            return;
+        }
         volSlider.setEnabled(true);
-        volName.setText(node.hub ? "汇聚端总音量" : node.name);
-        volPct.setText("100%");
+        volName.setText(label);
         volSlider.setProgress(100);
+        volPct.setText("100%");
     }
 
     private void applyVolume(float gain) {
-        if (selectedKey == null || "hub".equals(selectedKey)) return;
-        try {
-            ReceiverService.setStreamGain(Integer.parseInt(selectedKey), gain);
-        } catch (NumberFormatException ignored) {
-        }
+        if (selectedStreamId <= 0) return;
+        ReceiverService.setStreamGain(selectedStreamId, gain);
     }
 
     // ------------------------------------------------------------ 汇聚端
 
     private boolean isLocalHub() {
-        return hubIp == null;
-    }
-
-    private void showHubPicker() {
-        // 候选 = 发现的设备 + 手动添加/上次连接的设备
-        // 只看 discovery 的话，广播被拦（办公网）或对方不广播信标时会一片空白，
-        // 用户就没法切回去 —— 手动添加过的地址必须也在候选里。
-        final java.util.List<Discovery.Device> merged =
-                new java.util.ArrayList<>(manualPeers);
-        final List<Discovery.Device> auto = discovery != null
-                ? discovery.peers() : new java.util.ArrayList<Discovery.Device>();
-        for (Discovery.Device a : auto) {
-            boolean dup = false;
-            for (Discovery.Device m : merged) {
-                if (m.ip.equals(a.ip) && m.audioPort == a.audioPort) { dup = true; break; }
-            }
-            if (!dup) merged.add(a);
-        }
-        final List<Discovery.Device> peers = merged;
-        final String[] names = new String[peers.size() + 1];
-        names[0] = "本机（" + android.os.Build.MODEL + "）";
-        final Discovery.Device[] devices = new Discovery.Device[peers.size()];
-        for (int i = 0; i < peers.size(); ++i) {
-            devices[i] = peers.get(i);
-            names[i + 1] = devices[i].name + "（" + devices[i].ip + "）";
-        }
-        new AlertDialog.Builder(this)
-                .setTitle("选哪台设备当汇聚端")
-                .setItems(names, new android.content.DialogInterface.OnClickListener() {
-                    @Override
-                    public void onClick(android.content.DialogInterface dialog, int which) {
-                        if (which == 0) setLocalHub();
-                        else pickRemoteHub(devices[which - 1]);
-                    }
-                })
-                .show();
+        return GraphStore.isHub();
     }
 
     private void safeStartForegroundService(Intent intent) {
@@ -617,30 +599,45 @@ public class MainActivity extends Activity {
     }
 
     private void setLocalHub() {
-        hubIp = null;
-        hubName = null;
-        saveHub();
+        final String sid = GraphStore.selfId();
+        if (sid.isEmpty()) {
+            Toast.makeText(this, "本机还没有局域网地址（等 WiFi 连上）", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (GraphStore.switchHub(sid)) {
+            pendingSwitchTarget = sid;
+            switchSyncedAt = 0;
+            InviteListener.broadcastGraph();   // 本地变化：2 次 / 60ms（协议 §4.5）
+        }
+        sourceIntent = false;
         stopSource();
-        safeStartForegroundService(new Intent(this, ReceiverService.class)
-                .setAction(ReceiverService.ACTION_START)
-                .putExtra(ReceiverService.EXTRA_PORT, 47000));
+        if (!ReceiverService.sRunning) {
+            safeStartForegroundService(new Intent(this, ReceiverService.class)
+                    .setAction(ReceiverService.ACTION_START)
+                    .putExtra(ReceiverService.EXTRA_PORT, GraphStore.AUDIO_PORT));
+        }
         refresh();
         Toast.makeText(this, "本机已成为汇聚端", Toast.LENGTH_SHORT).show();
     }
 
+    /**
+     * 连入一台设备：图谱语义是先加入它的网络，真正的汇聚端由对端 GRAPH 决定。
+     * 旧版"选中远端当汇聚端"的行为保留兼容：握手成功后自动开始采集，
+     * 音源目标由 reconcile 按图谱里的 hub 自动改投。
+     */
     private void pickRemoteHub(final Discovery.Device d) {
-        // 先把本地角色与界面切过去，握手放到后台。
-        // 之前是先阻塞握手再改状态：对方没点同意时会卡满 30 秒，
-        // 期间界面一点反应都没有，看起来就是"切换没生效"。
+        if (d == null || d.ip == null || d.ip.isEmpty()) return;
+        final int audioPort = d.audioPort > 0 ? d.audioPort : GraphStore.AUDIO_PORT;
+        // 协议 §4.1：手动连接先登记占位节点（kind 先 other，等对端 GRAPH 校正）
+        GraphStore.upsertNode(d.ip, audioPort, d.name, GraphStore.KIND_OTHER);
+        // 旧版兼容：记住这台设备，下次界面里还能选
         hubIp = d.ip;
-        hubPort = d.audioPort;
+        hubPort = audioPort;
         hubName = d.name;
         saveHub();
-        // 记住这台设备：切换之后本机不再收流，discovery 里也未必有它，
-        // 不记下来的话下次想切回去就"没有数据可选"了。
-        addManualPeer(d.ip, d.name, d.audioPort);
-        sessionActive = true;
-        idleTicks = 0;
+        addManualPeer(d.ip, d.name, audioPort);
+        userLeft = false;
+        hintText = "";
         startService(new Intent(this, ReceiverService.class)
                 .setAction(ReceiverService.ACTION_STOP));
         refresh();
@@ -649,7 +646,7 @@ public class MainActivity extends Activity {
             @Override
             public void run() {
                 final boolean ok = ReceiverService.respondToInvite(
-                        d.ip, d.audioPort, android.os.Build.MODEL);
+                        d.ip, audioPort, android.os.Build.MODEL);
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
@@ -659,9 +656,17 @@ public class MainActivity extends Activity {
                                     Toast.LENGTH_LONG).show();
                             return;
                         }
+                        // 收到 ACK = 握手成功（协议 §4.1）：对端入图谱 + 立刻单播 GRAPH
+                        GraphStore.upsertNode(d.ip, audioPort, d.name, GraphStore.KIND_OTHER);
+                        InviteListener.sendGraphTo(d.ip, audioPort + GraphStore.PORT_OFFSET);
+                        InviteListener.requestSync();
                         Toast.makeText(MainActivity.this, "已连接 " + d.name,
                                 Toast.LENGTH_SHORT).show();
-                        ensurePermissionsThenStart();
+                        // 音源目标交给 reconcile：图谱里的 hub 才是真正的汇聚端
+                        if (!GraphStore.isHub()) {
+                            sourceIntent = true;
+                            ensurePermissionsThenStart();
+                        }
                     }
                 });
             }
@@ -680,11 +685,21 @@ public class MainActivity extends Activity {
 
     private void toggleSource() {
         if (CaptureService.sRunning) {
+            sourceIntent = false;
             stopSource();
-        } else if (hubIp != null) {
-            ensurePermissionsThenStart();
         } else {
-            Toast.makeText(this, "请先选择一台远端设备当汇聚端", Toast.LENGTH_SHORT).show();
+            final GraphStore.Snapshot g = GraphStore.snapshot();
+            final GraphStore.Node hub = g.hubNode();
+            if (g.isHub()) {
+                Toast.makeText(this, "本机是汇聚端，声音由其它设备送过来",
+                        Toast.LENGTH_SHORT).show();
+            } else if (hub == null) {
+                Toast.makeText(this, "请先连接一台设备，它会告诉我们谁是汇聚端",
+                        Toast.LENGTH_SHORT).show();
+            } else {
+                sourceIntent = true;
+                ensurePermissionsThenStart();
+            }
         }
         refresh();
     }
@@ -741,118 +756,124 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "没有授权，无法采集", Toast.LENGTH_SHORT).show();
             return;
         }
-        final int port = hubPort != 0 ? hubPort : 47000;
-        getSharedPreferences("audiohub", MODE_PRIVATE).edit()
-                .putInt("port", port).putInt("streamId", 1).apply();
+        // 保存授权：切换汇聚端 / 音源序号变了要用它重启采集（协议 §6.2）
+        projectionResultCode = resultCode;
+        projectionResultData = data;
+        sourceIntent = true;
 
-        startForegroundService(new Intent(this, CaptureService.class)
-                .setAction(CaptureService.ACTION_START)
-                .putExtra(CaptureService.EXTRA_RESULT_CODE, resultCode)
-                .putExtra(CaptureService.EXTRA_RESULT_DATA, data)
-                .putExtra(CaptureService.EXTRA_HOST, hubIp)
-                .putExtra(CaptureService.EXTRA_PORT, port)
-                .putExtra(CaptureService.EXTRA_STREAM_ID, 1));
+        final GraphStore.Snapshot g = GraphStore.snapshot();
+        final GraphStore.Node hub = g.hubNode();
+        final String host = hub != null ? hub.ip : hubIp;
+        final int port = hub != null ? hub.audioPort
+                : (hubPort != 0 ? hubPort : GraphStore.AUDIO_PORT);
+        if (host == null || host.isEmpty()) {
+            Toast.makeText(this, "还没有汇聚端，先连接一台设备", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        final int streamId = g.streamIdForSelf();
+        getSharedPreferences("audiohub", MODE_PRIVATE).edit()
+                .putInt("port", port).putInt("streamId", streamId).apply();
+        try {
+            startForegroundService(new Intent(this, CaptureService.class)
+                    .setAction(CaptureService.ACTION_START)
+                    .putExtra(CaptureService.EXTRA_RESULT_CODE, resultCode)
+                    .putExtra(CaptureService.EXTRA_RESULT_DATA, data)
+                    .putExtra(CaptureService.EXTRA_HOST, host)
+                    .putExtra(CaptureService.EXTRA_PORT, port)
+                    .putExtra(CaptureService.EXTRA_STREAM_ID, streamId));
+        } catch (Throwable t) {
+            android.util.Log.e("AudioHub", "启动采集失败: "
+                    + android.util.Log.getStackTraceString(t));
+            Toast.makeText(this, "启动采集失败：" + t.getClass().getSimpleName(),
+                    Toast.LENGTH_LONG).show();
+        }
     }
 
     // ------------------------------------------------------------ 刷新
 
     private void refresh() {
-        // 汇聚端显示
-        hubValue.setText(isLocalHub() ? "本机" : (hubName != null ? hubName : hubIp));
-        if (hubSub != null) {
-            if (isLocalHub()) {
-                hubSub.setText(ReceiverService.sRunning
-                        ? ("已接收 " + ReceiverService.sStreamCount + " 路 · 总线 "
-                           + String.format("%.1f", ReceiverService.sBusLevel)
-                           + (ReceiverService.sUnderrun > 0
-                               ? " · 欠载 " + ReceiverService.sUnderrun : ""))
-                        : "接收服务未启动");
-            } else {
-                hubSub.setText(CaptureService.sRunning
-                        ? ("正在发送 · " + CaptureService.sPackets + " 包")
-                        : "尚未开始发送");
-            }
+        // 协议 §6.2：先按图谱校正本机职责（采集 / 接收），再刷新界面
+        reconcile();
+
+        final GraphStore.Snapshot g = GraphStore.snapshot();
+        final boolean isHub = g.isHub();
+        final GraphStore.Node hub = g.hubNode();
+        final boolean srcRunning = CaptureService.sRunning;
+        final boolean hubRunning = ReceiverService.sRunning;
+
+        // 汇聚端显示：图谱是唯一依据
+        if (isHub) {
+            hubValue.setText("本机（" + android.os.Build.MODEL + "）");
+        } else if (hub != null) {
+            hubValue.setText(hub.displayName() + (g.isOnline(hub) ? "" : "（离线）"));
+        } else {
+            hubValue.setText("汇聚端未知");
         }
         if (hubSub != null) {
-            if (isLocalHub()) {
-                hubSub.setText(ReceiverService.sRunning
-                        ? ("已接收 " + ReceiverService.sStreamCount + " 路 · 总线 "
-                           + String.format("%.1f", ReceiverService.sBusLevel)
-                           + (ReceiverService.sUnderrun > 0
-                               ? " · 欠载 " + ReceiverService.sUnderrun : ""))
-                        : "接收服务未启动");
-            } else {
-                hubSub.setText(CaptureService.sRunning
-                        ? ("正在发送 · " + CaptureService.sPackets + " 包")
-                        : "尚未开始发送");
+            final StringBuilder sb = new StringBuilder();
+            sb.append("图谱 v").append(g.version).append(" · ")
+              .append(g.nodes.size()).append(" 台设备");
+            if (isHub && hubRunning) {
+                sb.append(" · 已接收 ").append(ReceiverService.sStreamCount).append(" 路");
+            } else if (srcRunning) {
+                sb.append(" · 发送 ").append(CaptureService.sPackets).append(" 包");
             }
+            if (!hintText.isEmpty()) sb.append(" · ").append(hintText);
+            hubSub.setText(sb.toString());
         }
 
         // 本机声音
-        final boolean srcRunning = CaptureService.sRunning;
         sourceToggle.setText(srcRunning ? "停止" : "送入");
         sourceState.setText(srcRunning
                 ? ("发送中 · " + CaptureService.sPackets + " 包 · "
-                   + CaptureService.sLevelDbfs + " dBFS")
-                : (isLocalHub() ? "本机是汇聚端" : "未发送"));
+                   + CaptureService.sLevelDbfs + " dBFS · 通道 " + CaptureService.sStreamId)
+                : (isHub ? "本机是汇聚端"
+                         : (hub != null ? "尚未开始发送" : "未连接")));
 
-        // 只要"有连接"就进控制界面——不论本机是汇聚端还是音源。
-        // 两端看到的是同一张网络图，只是谁是中间那个大球不同。
-        final boolean hubRunning = ReceiverService.sRunning;
-        final boolean receiving = hubRunning && ReceiverService.sStreamCount > 0;
+        // 控制界面显示条件：图谱里至少两台设备，或本机正在采集 / 接收。
+        // 不再用粘滞会话标志——图谱本身就是会话状态的权威来源。
+        if (userLeft && !hubRunning && !srcRunning) userLeft = false;
+        final boolean showControl = !userLeft
+                && (g.nodes.size() >= 2 || hubRunning || srcRunning);
+        showScreen(showControl ? "control" : "connect");
 
-        // 会话成立与否用粘滞标志判断，并给切换留出宽限：
-        // 服务停了不代表会话结束（可能正在切换），连续 15 个 tick
-        // （约 6 秒）都没有任何服务在跑，才认为会话真的结束了。
-        if (userLeft) {
-            // 服务还没停干净时不要重置会话；两个服务都停了才解除
-            if (!hubRunning && !srcRunning) userLeft = false;
-            sessionActive = false;
-            idleTicks = 0;
-        } else if (hubRunning || srcRunning) {
-            sessionActive = true;
-            idleTicks = 0;
-        } else if (sessionActive) {
-            idleTicks++;
-            if (idleTicks > 15) {
-                sessionActive = false;
-                idleTicks = 0;
+        // 画全网图谱：每个节点一个球，汇聚端在中间（协议 §9.3）
+        final java.util.List<HubGraphView.Node> viewNodes = new java.util.ArrayList<>();
+        for (GraphStore.Node n : g.nodes) {
+            final HubGraphView.Node v = new HubGraphView.Node();
+            v.id = n.id;
+            v.name = n.displayName();   // displayName 保证非 null（drawText NPE 教训）
+            v.kind = n.kind;
+            v.hub = n.id.equals(g.hubId);
+            v.self = n.id.equals(g.selfId);
+            v.online = g.isOnline(n);
+            if (v.self) {
+                v.streamId = srcRunning ? CaptureService.sStreamId : 0;
+                v.level = srcRunning ? CaptureService.sLevelDbfs
+                        : (isHub ? ReceiverService.sBusLevel : -120);
+            } else {
+                final int sid = ReceiverService.streamIdForIp(n.ip);
+                v.streamId = sid;
+                v.level = sid > 0 ? ReceiverService.sBusLevel : -120;
             }
+            viewNodes.add(v);
         }
-        final boolean inSession = sessionActive;
-        showScreen(inSession ? "control" : "connect");
+        graph.setData(viewNodes);
 
-        if (inSession) {
-            java.util.List<Integer> ids = new java.util.ArrayList<>();
-            java.util.List<String> names = new java.util.ArrayList<>();
-            java.util.List<Double> levels = new java.util.ArrayList<>();
-            String hubLabel;
-            double hubLevel;
-
-            if (isLocalHub()) {
-                // 本机是汇聚端：大球是本机，小球是各路音源。
-                // 注意判断依据是"角色"，不是"有没有流"——刚切换过来的那一秒
-                // 流还是 0，若按流判断就会错误地画成音源视图（图看起来没变）。
-                hubLabel = "本机";
-                hubLevel = ReceiverService.sBusLevel;
-                for (int i = 1; i <= ReceiverService.sStreamCount; ++i) {
-                    ids.add(i);
-                    names.add("设备 " + i);
-                    levels.add(ReceiverService.sBusLevel);
+        // 切换汇聚端后的"正在同步 / 已同步"提示
+        if (!pendingSwitchTarget.isEmpty()) {
+            if (pendingSwitchTarget.equals(g.hubId)) {
+                if (switchSyncedAt == 0) switchSyncedAt = System.currentTimeMillis();
+                graph.setStatus("已同步（v" + g.version + "）");
+                if (System.currentTimeMillis() - switchSyncedAt > 2500) {
+                    pendingSwitchTarget = "";
+                    switchSyncedAt = 0;
                 }
             } else {
-                // 本机是音源：大球是对面的汇聚端，小球是本机。
-                // 注意：切换角色的瞬间 hubIp/hubName 可能都还是 null，
-                // 而这个值会一路传到 Canvas.drawText() —— drawText(null) 是
-                // 直接抛 NPE 的（UI 线程 = 闪退）。所以必须有兜底。
-                hubLabel = hubName != null ? hubName
-                        : (hubIp != null ? hubIp : "汇聚端");
-                hubLevel = -120;
-                ids.add(0);
-                names.add("本机");
-                levels.add((double) CaptureService.sLevelDbfs);
+                graph.setStatus("已切换，正在同步…");
             }
-            graph.setData(hubLabel, hubLevel, names, ids, levels);
+        } else {
+            graph.setStatus("");
         }
 
         // 对端下发的角色指令：自动同步角色（方案 7.3 的远程分支）
@@ -911,6 +932,169 @@ public class MainActivity extends Activity {
                     .setNegativeButton("拒绝", null)
                     .show();
         }
+    }
+
+    // ------------------------------------------------ 图谱职责 / 点击交互
+
+    private boolean hasProjectionAuth() {
+        return projectionResultCode == RESULT_OK && projectionResultData != null;
+    }
+
+    /** 一次性提示：只在内容变化时 toast，避免 400ms 轮询刷屏。 */
+    private void graphHint(String text) {
+        final String t = text != null ? text : "";
+        if (t.equals(hintText)) return;
+        hintText = t;
+        if (!t.isEmpty()) Toast.makeText(this, t, Toast.LENGTH_SHORT).show();
+    }
+
+    /**
+     * 协议 §6.2：每个 400ms 轮询按图谱校正本机职责。
+     *   isHub      → 保持 ReceiverService 运行，停采集
+     *   isSource   → 采集目标 / streamId 对不上就用已保存授权重启；没授权只提示
+     *   汇聚端未知  → 两个服务都停，回到空闲
+     */
+    private void reconcile() {
+        // 本机 IP 可能后到（WiFi 刚连上）：拿到后更新图谱里的自身节点
+        final String myIp = localIp();
+        if (!myIp.isEmpty() && !myIp.equals(GraphStore.selfIp())) {
+            final boolean first = GraphStore.selfIp().isEmpty();
+            GraphStore.setSelf(myIp, android.os.Build.MODEL);
+            if (first) {
+                InviteListener.requestSync();
+            } else {
+                InviteListener.broadcastGraph();
+            }
+        }
+
+        final GraphStore.Snapshot g = GraphStore.snapshot();
+        final boolean hubRunning = ReceiverService.sRunning;
+        final boolean srcRunning = CaptureService.sRunning;
+
+        if (g.isHub()) {
+            // 汇聚端：本机负责收流放音，不能同时采集（回授）
+            sourceIntent = false;
+            hintText = "";
+            if (srcRunning) stopSource();
+            if (!hubRunning) {
+                safeStartForegroundService(new Intent(this, ReceiverService.class)
+                        .setAction(ReceiverService.ACTION_START)
+                        .putExtra(ReceiverService.EXTRA_PORT, GraphStore.AUDIO_PORT));
+            }
+            return;
+        }
+
+        final GraphStore.Node hub = g.hubNode();
+        if (hub != null) {
+            // 音源：同一台设备不能既发又收，接收服务要停掉
+            if (hubRunning) {
+                startService(new Intent(this, ReceiverService.class)
+                        .setAction(ReceiverService.ACTION_STOP));
+            }
+            final int streamId = g.streamIdForSelf();
+            final String desired = hub.ip + ":" + hub.audioPort + ":" + streamId;
+            if (srcRunning) {
+                final String actual = CaptureService.sHost + ":" + CaptureService.sPort
+                        + ":" + CaptureService.sStreamId;
+                if (!desired.equals(actual)) {
+                    // 目标或音源序号变了：停旧的，下个 tick 用新目标重启（复用授权）
+                    restartSource();
+                } else {
+                    hintText = "";
+                }
+            } else if (sourceIntent) {
+                if (hasProjectionAuth()) {
+                    hintText = "";
+                    startCapture(hub, streamId);
+                } else {
+                    graphHint("本机已设为音源，开始采集后生效");
+                }
+            }
+            return;
+        }
+
+        // 汇聚端未知（可能刚断开 / 还没同步到）：停掉一切，保持空闲
+        if (hubRunning) {
+            startService(new Intent(this, ReceiverService.class)
+                    .setAction(ReceiverService.ACTION_STOP));
+        }
+        if (srcRunning) stopSource();
+    }
+
+    private void startCapture(final GraphStore.Node hub, final int streamId) {
+        if (!hasProjectionAuth()) {
+            graphHint("本机已设为音源，开始采集后生效");
+            return;
+        }
+        try {
+            startForegroundService(new Intent(this, CaptureService.class)
+                    .setAction(CaptureService.ACTION_START)
+                    .putExtra(CaptureService.EXTRA_RESULT_CODE, projectionResultCode)
+                    .putExtra(CaptureService.EXTRA_RESULT_DATA, projectionResultData)
+                    .putExtra(CaptureService.EXTRA_HOST, hub.ip)
+                    .putExtra(CaptureService.EXTRA_PORT, hub.audioPort)
+                    .putExtra(CaptureService.EXTRA_STREAM_ID, streamId));
+        } catch (Throwable t) {
+            android.util.Log.e("AudioHub", "启动采集失败: "
+                    + android.util.Log.getStackTraceString(t));
+            graphHint("启动采集失败：" + t.getClass().getSimpleName());
+        }
+    }
+
+    /** 目标变化时重启采集：先停旧服务（避免同设备双采），1.5s 防抖。 */
+    private void restartSource() {
+        final long now = System.currentTimeMillis();
+        if (now - lastSourceRestartAt < 1500L) return;
+        lastSourceRestartAt = now;
+        startService(new Intent(this, CaptureService.class)
+                .setAction(CaptureService.ACTION_STOP));
+    }
+
+    /** 点图谱里的球：有流的节点展开音量面板；非汇聚端节点弹确认切换。 */
+    private void onGraphNodeTap(final HubGraphView.Node viewNode) {
+        if (viewNode == null || viewNode.id == null) return;
+        final GraphStore.Snapshot g = GraphStore.snapshot();
+        final GraphStore.Node target = g.find(viewNode.id);
+        if (target == null) return;
+
+        // 选中高亮 + 音量面板（有流才可调；协议 §9.3：点带流的球调音量）
+        graph.setSelected(target.id);
+        final int streamId = viewNode.self
+                ? (CaptureService.sRunning ? CaptureService.sStreamId : 0)
+                : ReceiverService.streamIdForIp(target.ip);
+        showVolumePanelForStream(streamId, target.displayName());
+
+        // 当前汇聚端 / 本身是汇聚端时点自己：只显示信息，不切换
+        if (target.id.equals(g.hubId)) return;
+        confirmSwitchHub(target, g.isOnline(target));
+    }
+
+    /** 切换汇聚端确认（协议 §4.5 / §8：离线节点切换前要警告）。 */
+    private void confirmSwitchHub(final GraphStore.Node target, final boolean online) {
+        final String msg = "把汇聚端切到「" + target.displayName() + "」？"
+                + (online ? "\n其它设备的声音会改送到它那里播放。"
+                          : "\n它当前离线，切换后会等它恢复在线。");
+        new AlertDialog.Builder(this)
+                .setTitle("切换汇聚端")
+                .setMessage(msg)
+                .setPositiveButton("切换", new android.content.DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(android.content.DialogInterface dialog, int which) {
+                        if (!GraphStore.switchHub(target.id)) {
+                            Toast.makeText(MainActivity.this, "节点已不在图谱里",
+                                    Toast.LENGTH_SHORT).show();
+                            return;
+                        }
+                        pendingSwitchTarget = target.id;
+                        switchSyncedAt = 0;
+                        InviteListener.broadcastGraph();   // 本地变化：2 次 / 60ms
+                        refresh();
+                        Toast.makeText(MainActivity.this, "已切换，正在同步…",
+                                Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
     }
 
     /**
@@ -1027,16 +1211,21 @@ public class MainActivity extends Activity {
                 @Override
                 public void onClick(View v) {
                     InviteListener.accept(p.streamId);
-                    // 同意"把声音送到本机"就意味着本机要当汇聚端 ——
-                    // 不启动接收服务的话，对方发过来的流没人收，等于白同意。
+                    // 同意"把声音送到本机"= 本机要当汇聚端（协议 §5）：
+                    // 先切图谱 hub，再保证接收服务在跑，否则对方发来的流没人收。
+                    if (!GraphStore.isHub()) {
+                        final String sid = GraphStore.selfId();
+                        if (!sid.isEmpty() && GraphStore.switchHub(sid)) {
+                            pendingSwitchTarget = sid;
+                            switchSyncedAt = 0;
+                            InviteListener.broadcastGraph();
+                        }
+                    }
                     if (!ReceiverService.sRunning) {
-                        hubIp = null;
-                        hubName = null;
-                        saveHub();
                         safeStartForegroundService(new Intent(MainActivity.this,
                                 ReceiverService.class)
                                 .setAction(ReceiverService.ACTION_START)
-                                .putExtra(ReceiverService.EXTRA_PORT, 47000));
+                                .putExtra(ReceiverService.EXTRA_PORT, GraphStore.AUDIO_PORT));
                     }
                     pendingSig = "";
                     refresh();

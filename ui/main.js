@@ -53,19 +53,39 @@ function stopHub () {
 // 本机作为音源：把电脑的声音送到远端汇聚端。
 // 用现成的 audiohub-source，避免在 Electron 里重写采集。
 let pcSourceProcess = null
+// 当前音源进程的目标。图谱 reconcile 靠它判断"要不要重启"：
+// 目标或 streamId 变了才重启，没变就不动 —— 否则每 200ms 一次轮询会把进程杀来杀去。
+let pcSourceTarget = null
+let pcSourceStartedAt = 0
+const PC_SOURCE_RETRY_MS = 3000
 // 音源进程的最新采集状态：界面用它回答"电脑到底采到声音没有"
 let pcSrc = { level: null, pkts: 0, kfps: 0 }
 
-function startPcSource (ip, port) {
+function startPcSource (ip, port, streamId) {
   stopPcSource()
+  const sid = Number.isInteger(streamId) && streamId > 0 ? streamId : 1
   const exe = sourceExePath()
-  pcSourceProcess = spawn(exe, [
+  pcSourceStartedAt = Date.now()
+  pcSourceTarget = { ip: ip, port: port, streamId: sid }
+  console.log('[graph] 启动音源进程 -> ' + ip + ':' + port + '（stream ' + sid + '）')
+  const proc = spawn(exe, [
     '--hub', ip + ':' + port,
     '--handshake',
     '--device-name', os.hostname(),
-    '--stream-id', '1'
+    '--stream-id', String(sid)
   ], { windowsHide: true, stdio: 'ignore' })
-  pcSourceProcess.on('exit', () => { pcSourceProcess = null })
+  pcSourceProcess = proc
+  proc.on('exit', (code) => {
+    // 旧进程的 exit 可能在新进程起来之后才到，必须比对身份再清空
+    if (pcSourceProcess !== proc) return
+    pcSourceProcess = null
+    // 保留 pcSourceTarget：让 reconcile 冷却 3 秒后按图谱重试，而不是 200ms 一次刷屏
+    console.error('[graph] 音源进程退出（code=' + code + '），稍后按图谱重试')
+  })
+  proc.on('error', (err) => {
+    if (pcSourceProcess === proc) pcSourceProcess = null
+    console.error('[graph] 音源进程启动失败: ' + err.message)
+  })
 }
 
 function sourceExePath () {
@@ -88,13 +108,128 @@ function restoreMute () {
 
 function stopPcSource () {
   if (pcSourceProcess) {
-    pcSourceProcess.kill()
+    const proc = pcSourceProcess
     pcSourceProcess = null
+    proc.kill()
+    if (pcSourceTarget) {
+      console.log('[graph] 停止音源进程（原目标 ' + pcSourceTarget.ip + ':' +
+                  pcSourceTarget.port + '）')
+    }
+    pcSourceTarget = null
     restoreMute()
+  } else if (pcSourceTarget) {
+    pcSourceTarget = null
   }
 }
 
-// 汇聚端设定：连接之后才调用（方案 7.3 节）
+// ------------------------------------------------------------------ 图谱职责协调（协议 §6.1）
+//
+// 每 200ms 轮询 /api/state 之后执行一次：
+//   isHub            → 停掉音源进程（本机收流/混音，靠常驻 hub 进程）
+//   hub 存在         → 音源目标 = hub 节点的 ip:audioPort，streamId = 本机在 nodes 里的 1-based 名次
+//   目标/streamId 没变 → 什么都不做（不能重启，重启会断音）
+//   hub 未知         → 停在空闲（没有可发往的目标）
+// 后端还没实现 graph（旧版本 / 启动瞬间）时直接跳过，保留旧行为，绝不因缺字段抛错。
+
+// 节点地址：优先 ip/audioPort 字段，缺失时从 id（ip:audioPort）里拆
+function nodeAddress (node) {
+  let ip = node && typeof node.ip === 'string' ? node.ip : ''
+  let port = node && Number.isInteger(node.audioPort) && node.audioPort > 0
+    ? node.audioPort
+    : 0
+  if ((!ip || !port) && node && typeof node.id === 'string') {
+    const colon = node.id.lastIndexOf(':')
+    if (colon > 0) {
+      if (!ip) ip = node.id.slice(0, colon)
+      if (!port) {
+        const parsed = parseInt(node.id.slice(colon + 1), 10)
+        if (Number.isInteger(parsed) && parsed > 0) port = parsed
+      }
+    }
+  }
+  if (!port) port = DATA_PORT
+  return { ip: ip, port: port }
+}
+
+function graphNodesOf (graph) {
+  const out = []
+  const raw = graph && Array.isArray(graph.nodes) ? graph.nodes : []
+  for (const n of raw) {
+    if (n && typeof n === 'object' && typeof n.id === 'string' && n.id) out.push(n)
+  }
+  return out
+}
+
+// §6：streamId = 1 + 本机在 nodes 按 id 升序的序号（从 0 计）
+function streamIdForGraph (nodes, selfId) {
+  const sorted = nodes.slice().sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+  for (let i = 0; i < sorted.length; ++i) {
+    if (sorted[i].id === selfId) return i + 1
+  }
+  return 1
+}
+
+function reconcileGraph (graph) {
+  if (!graph || typeof graph !== 'object') return
+  const nodes = graphNodesOf(graph)
+  let selfId = typeof graph.selfId === 'string' ? graph.selfId : ''
+  if (!selfId) {
+    const selfNode = nodes.find((n) => n.isSelf === true)
+    if (selfNode) selfId = selfNode.id
+  }
+  const hubId = typeof graph.hubId === 'string' ? graph.hubId : ''
+
+  // 本机 ID 都不知道就没法算职责，先停在空闲
+  if (!selfId) {
+    if (pcSourceProcess || pcSourceTarget) {
+      console.log('[graph] 本机节点未知，停止音源进程')
+      stopPcSource()
+    }
+    return
+  }
+
+  if (hubId === selfId) {
+    if (pcSourceProcess || pcSourceTarget) {
+      console.log('[graph] 本机是汇聚端，停止音源进程')
+      stopPcSource()
+    }
+    return
+  }
+
+  const hubNode = hubId ? nodes.find((n) => n.id === hubId) : null
+  if (!hubNode) {
+    // hubId 为空 / 指向不存在的节点：没有可发往的目标，停在空闲
+    if (pcSourceProcess || pcSourceTarget) {
+      console.log('[graph] 汇聚端未知，停止音源进程')
+      stopPcSource()
+    }
+    return
+  }
+
+  const addr = nodeAddress(hubNode)
+  if (!addr.ip) {
+    if (pcSourceProcess || pcSourceTarget) stopPcSource()
+    return
+  }
+  ensurePcSource(addr.ip, addr.port, streamIdForGraph(nodes, selfId))
+}
+
+function ensurePcSource (ip, port, streamId) {
+  const sameTarget = !!pcSourceTarget &&
+    pcSourceTarget.ip === ip &&
+    pcSourceTarget.port === port &&
+    pcSourceTarget.streamId === streamId
+  if (pcSourceProcess && sameTarget) return          // 已在正确目标上，绝不重启
+  if (!pcSourceProcess && sameTarget &&
+      Date.now() - pcSourceStartedAt < PC_SOURCE_RETRY_MS) {
+    return                                            // 刚退出/刚拉起，等冷却再重试
+  }
+  startPcSource(ip, port, streamId)
+}
+
+// 汇聚端设定：旧接口，保留给旧脚本兼容。
+// 新界面不再调用它 —— 汇聚端由"图谱"决定（点节点 → hub:switch → 后端改图谱），
+// 本机该收还是该发由下面的 reconcileGraph 每次轮询校正。
 ipcMain.handle('hub:setRole', async (_e, arg) => {
   const self = arg && arg.self !== undefined ? arg.self : true
 
@@ -196,7 +331,14 @@ function httpRequest (method, urlPath, body) {
 
 async function fetchState () {
   const state = await httpRequest('GET', '/api/state')
-  if (state && mainWindow && !mainWindow.isDestroyed()) {
+  if (!state) return
+  // 每次轮询都按图谱校正职责（协议 §6.1）。图谱缺失/字段缺失时内部直接跳过。
+  try {
+    reconcileGraph(state.graph)
+  } catch (err) {
+    console.error('[graph] 职责协调失败: ' + err.message)
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
     // 本机作为音源时的状态：核心只管收流，不知道我们另起了一个发送进程
     state.pcSource = pcSourceProcess !== null
     state.pcSourceLevel = pcSrc.level
@@ -291,6 +433,27 @@ app.on('before-quit', () => {
 
 // 只注册这几个具体动作，不暴露 ipcRenderer 本身
 ipcMain.handle('hub:state', async () => httpRequest('GET', '/api/state'))
+
+// 图谱切换汇聚端（协议 §4.5 / §7.2）。
+// 参数形态兼容：nodeId 字符串，或 { nodeId }。返回 { ok, graph }。
+ipcMain.handle('hub:switch', async (_e, arg) => {
+  const nodeId = typeof arg === 'string'
+    ? arg
+    : (arg && typeof arg.nodeId === 'string' ? arg.nodeId : '')
+  if (!nodeId || nodeId.length > 128) return { ok: false, error: 'invalid nodeId' }
+  const res = await httpRequest('POST', '/api/graph/switch', { nodeId: nodeId })
+  if (!res) return { ok: false, error: '音频核心没有响应' }
+  // 切换成功后立即按返回的图谱校正职责，不必等下一次 200ms 轮询
+  if (res.ok && res.graph) {
+    try {
+      reconcileGraph(res.graph)
+    } catch (err) {
+      console.error('[graph] 切换后协调失败: ' + err.message)
+    }
+  }
+  if (typeof res.ok !== 'boolean') res.ok = false
+  return res
+})
 
 ipcMain.handle('hub:setSource', async (_e, arg) => {
   const { id, patch } = arg || {}

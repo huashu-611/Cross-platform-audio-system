@@ -297,6 +297,11 @@ ROLE|source|<ip>:<port>      → 你把声音送到 ip:port（当音源）
 
 桌面端由 `POST /api/role {ip, audioPort, hub, hubIp, hubPort}` 触发。
 
+> **v2.1 起改为图谱驱动**：界面上的汇聚端切换走**共享网络图谱协议**
+> （[GRAPH-PROTOCOL.md](GRAPH-PROTOCOL.md)）：每端维护同一张设备图，点图上任意节点
+> 即本地切换并把新图谱广播给全网，各端 1~2 秒内收敛，不再需要给每台设备单独发 ROLE。
+> ROLE 帧与 `/api/role` 保留为兼容接口，新界面不再调用。
+
 关键实现约束：
 
 - **未确认的流完全不取水**：否则抖动缓冲被抽干，确认后回不来

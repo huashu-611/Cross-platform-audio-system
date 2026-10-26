@@ -1,286 +1,693 @@
 // 渲染层：两个屏幕。
 //
 //   连接界面 —— 建立连接（设备列表 / 待确认请求）
-//   控制界面 —— 可视化网络图：球 = 设备，线 = 连接；汇聚端的球更大。
-//               点任意球调它的音量，实时生效。
+//   控制界面 —— 全网图谱（协议 §9）：节点 = 图谱里的所有设备；
+//               汇聚端大球在中心，本机/离线有角标；点非汇聚端节点可把汇聚端切过去。
 //
-// 切换逻辑：出现第一条已确认的连接 → 自动进控制界面；
-// 连接全部断开 → 回连接界面。汇聚端默认是本机（电脑）。
+// 界面切换：图谱节点数 >= 2（网络已形成）或本机有音频流 → 控制界面。
+// 角色不在这里"猜"：state.graph 说了算，本层不调 setRole（旧接口已废弃）。
+// 本文件必须容忍 graph 缺失 / 字段缺失（旧后端、启动瞬间）：退化成用 sources 拼图，不白屏。
 
 let screen = 'connect'          // 'connect' | 'control'
-let selected = null             // 被点选的球 {kind:'hub'|'source', id}
+let selected = null             // 被点选的节点 { nodeId } 或 null
+let lastState = null
+let autoTouched = false
+let volDragging = false
 
-// 角色：连接之后才确定。默认 PC 为汇聚端（本机）。
-let hubSelf = true
-let hubLabel = '本机'
-let lastRemote = null          // 上一次选中的远端，切回本机时要用它通知对方
-
-let hubSelectSig = ''           // 选择器选项的签名，避免每 tick 重建
+// 切换汇聚端的交互状态
+let pendingSwitch = null        // { nodeId, fromVersion, timer }：等新图谱确认
+let action = null               // { mode: 'switch'|'hub', nodeId }
+let syncText = ''
+let syncTone = ''               // '' | 'ok' | 'warn'
 
 const $ = (id) => document.getElementById(id)
 
 // ============================================================ 工具
 
 const pct = (v) => Math.round(v * 100) + '%'
-const dbText = (v) => (v <= -119 ? '静音' : v.toFixed(1) + ' dBFS')
+
+function dbText (v) {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return '—'
+  if (v <= -119) return '静音'
+  return v.toFixed(1) + ' dBFS'
+}
+
 const levelPct = (level) => Math.max(0, Math.min(100, (level + 60) / 0.6))
 
-function post (path, obj) {
-  fetch(path, { method: 'POST', body: JSON.stringify(obj) }).catch(() => {})
+const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }
+function esc (s) {
+  return String(s === null || s === undefined ? '' : s)
+    .replace(/[&<>"']/g, (c) => ESC_MAP[c])
+}
+
+function shortName (name, max) {
+  const chars = Array.from(String(name === null || name === undefined ? '' : name))
+  if (chars.length <= max) return chars.join('')
+  return chars.slice(0, max).join('') + '…'
+}
+
+function ipFromId (id) {
+  if (typeof id !== 'string') return ''
+  const colon = id.lastIndexOf(':')
+  return colon > 0 ? id.slice(0, colon) : (id === 'self' ? '' : id)
+}
+
+function portFromId (id) {
+  if (typeof id !== 'string') return 47000
+  const colon = id.lastIndexOf(':')
+  if (colon <= 0) return 47000
+  const parsed = parseInt(id.slice(colon + 1), 10)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : 47000
+}
+
+function fmtNumber (v, digits) {
+  return typeof v === 'number' && Number.isFinite(v) ? v.toFixed(digits) : '0'
 }
 
 // ============================================================ 屏幕切换
 
 function showScreen (next) {
   screen = next
-  $('screenConnect').style.display = next === 'connect' ? '' : 'none'
-  $('screenControl').style.display = next === 'control' ? '' : 'none'
-  document.querySelector('h1 span').textContent =
-    next === 'control' ? '控制台' : '连接设备'
+  const connectEl = $('screenConnect')
+  const controlEl = $('screenControl')
+  if (connectEl) connectEl.style.display = next === 'connect' ? '' : 'none'
+  if (controlEl) controlEl.style.display = next === 'control' ? '' : 'none'
+  const title = document.querySelector('h1 span')
+  if (title) title.textContent = next === 'control' ? '控制台' : '连接设备'
 }
 
-// ============================================================ 网络图
+// ============================================================ 图谱数据
+//
+// 统一成一份"渲染用图谱"：
+//   { hasGraph, version, origin, hubId, selfId, nodes[], hubNode, isHubSelf }
+// graph 缺失时用 sources + 本机拼一张兜底图谱（旧后端兼容），此时 hasGraph=false，
+// 不允许点节点切换汇聚端（后端没有 switch 接口，切了也没用）。
 
-// 布局：汇聚端在中间的大球，其它设备围着它排一圈
-function layoutGraph (sources, hubLabel) {
-  const cx = 460, cy = 200
-  const nodes = [{ id: 'hub', kind: 'hub', name: hubLabel, x: cx, y: cy, r: 46 }]
-  const n = Math.max(sources.length, 1)
-  const radius = 185
-  sources.forEach((s, i) => {
-    const angle = -Math.PI / 2 + (i * 2 * Math.PI) / n
+function normalizeNode (raw, hubId, selfId) {
+  const id = raw.id
+  const isHub = hubId ? id === hubId : raw.isHub === true
+  const isSelf = selfId ? id === selfId : raw.isSelf === true
+  return {
+    id: id,
+    name: typeof raw.name === 'string' && raw.name ? raw.name : id,
+    kind: typeof raw.kind === 'string' ? raw.kind : 'other',
+    ip: typeof raw.ip === 'string' && raw.ip ? raw.ip : ipFromId(id),
+    audioPort: Number.isInteger(raw.audioPort) && raw.audioPort > 0
+      ? raw.audioPort
+      : portFromId(id),
+    online: raw.online !== false,
+    isHub: !!isHub,
+    isSelf: !!isSelf,
+    streamId: Number.isInteger(raw.streamId) && raw.streamId > 0 ? raw.streamId : 0,
+    level: typeof raw.level === 'number' && Number.isFinite(raw.level) ? raw.level : -120,
+    occupancy: typeof raw.occupancy === 'number' && Number.isFinite(raw.occupancy) ? raw.occupancy : 0,
+    gain: typeof raw.gain === 'number' && Number.isFinite(raw.gain) ? raw.gain : 1,
+    muted: raw.muted === true
+  }
+}
+
+// 旧后端 / 启动瞬间没有 graph：用 sources + 本机拼一张能看的图
+function legacyGraph (state) {
+  const sources = state && Array.isArray(state.sources) ? state.sources : []
+  const selfId = state && typeof state.ip === 'string' && state.ip ? state.ip : 'self'
+  const nodes = [{
+    id: selfId,
+    name: '本机',
+    kind: 'pc',
+    ip: ipFromId(selfId),
+    audioPort: portFromId(selfId),
+    online: true,
+    isHub: true,
+    isSelf: true,
+    streamId: 0,
+    level: typeof state.busLevel === 'number' ? state.busLevel : -120,
+    occupancy: 0,
+    gain: 1,
+    muted: false
+  }]
+  for (const s of sources) {
+    if (!s || typeof s !== 'object' || !s.confirmed) continue
+    const streamId = Number.isInteger(s.id) && s.id > 0 ? s.id : 0
+    if (!streamId) continue
     nodes.push({
-      id: String(s.id), kind: 'source',
-      name: s.peerName || ('设备 ' + s.id),
-      x: cx + radius * Math.cos(angle),
-      y: cy + radius * Math.sin(angle) * 0.75,   // 稍扁，适合宽屏
-      r: 30, level: s.level
+      id: (typeof s.peerIp === 'string' && s.peerIp ? s.peerIp : 'peer') + ':stream-' + streamId,
+      name: typeof s.peerName === 'string' && s.peerName ? s.peerName : ('设备 ' + streamId),
+      kind: 'other',
+      ip: typeof s.peerIp === 'string' ? s.peerIp : '',
+      audioPort: 47000,
+      online: true,
+      isHub: false,
+      isSelf: false,
+      streamId: streamId,
+      level: typeof s.level === 'number' ? s.level : -120,
+      occupancy: typeof s.occupancy === 'number' ? s.occupancy : 0,
+      gain: typeof s.gain === 'number' ? s.gain : 1,
+      muted: s.muted === true
     })
+  }
+  return {
+    hasGraph: false,
+    version: 0,
+    origin: '',
+    hubId: selfId,
+    selfId: selfId,
+    nodes: nodes,
+    hubNode: nodes[0],
+    isHubSelf: true
+  }
+}
+
+function collectGraph (state) {
+  const g = state && state.graph && typeof state.graph === 'object' ? state.graph : null
+  const raw = g && Array.isArray(g.nodes) ? g.nodes : []
+  const clean = []
+  for (const n of raw) {
+    if (!n || typeof n !== 'object' || typeof n.id !== 'string' || !n.id) continue
+    clean.push(n)
+  }
+  if (!g || clean.length === 0) return legacyGraph(state)
+
+  let selfId = typeof g.selfId === 'string' ? g.selfId : ''
+  if (!selfId) {
+    const selfNode = clean.find((n) => n.isSelf === true)
+    if (selfNode) selfId = selfNode.id
+  }
+  const hubId = typeof g.hubId === 'string' ? g.hubId : ''
+  const nodes = clean.map((n) => normalizeNode(n, hubId, selfId))
+  nodes.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+  let hubNode = hubId ? nodes.find((n) => n.id === hubId) : null
+  if (!hubNode && !hubId) hubNode = nodes.find((n) => n.isHub) || null
+  return {
+    hasGraph: true,
+    version: typeof g.version === 'number' && Number.isFinite(g.version) ? g.version : 0,
+    origin: typeof g.origin === 'string' ? g.origin : '',
+    hubId: hubNode ? hubNode.id : hubId,
+    selfId: selfId,
+    nodes: nodes,
+    hubNode: hubNode,
+    isHubSelf: !!selfId && !!hubNode && hubNode.id === selfId
+  }
+}
+
+// 该节点对应的音频流 id（0 = 没有流）。优先用后端图谱给的 streamId，
+// 旧后端时退回 sources（按 IP / 名字匹配）。
+function streamIdForNode (node, state) {
+  if (!node || node.ghost) return 0
+  if (Number.isInteger(node.streamId) && node.streamId > 0) return node.streamId
+  const sources = state && Array.isArray(state.sources) ? state.sources : []
+  if (node.ip) {
+    const byIp = sources.find((s) => s && s.confirmed && s.peerIp === node.ip)
+    if (byIp && Number.isInteger(byIp.id) && byIp.id > 0) return byIp.id
+  }
+  if (node.name) {
+    const byName = sources.find((s) => s && s.confirmed && s.peerName === node.name)
+    if (byName && Number.isInteger(byName.id) && byName.id > 0) return byName.id
+  }
+  return 0
+}
+
+// 节点显示电平：PC 作为音源时自节点取 pcSource*（协议 §9.2）；
+// 本机作为汇聚端时用总线电平更直观。
+function displayLevel (state, node) {
+  if (!node || node.ghost) return null
+  if (node.isSelf) {
+    if (state && state.pcSource) {
+      return typeof state.pcSourceLevel === 'number' ? state.pcSourceLevel : null
+    }
+    if (state && typeof state.busLevel === 'number') return state.busLevel
+    return typeof node.level === 'number' ? node.level : null
+  }
+  return typeof node.level === 'number' ? node.level : null
+}
+
+function hasFlow (state, node) {
+  if (!node || node.ghost) return false
+  if (node.isSelf) return !!(state && state.pcSource)
+  return streamIdForNode(node, state) > 0
+}
+
+// ============================================================ 网络图布局与绘制
+
+const GRAPH_CX = 460
+const GRAPH_CY = 208
+const HUB_R = 46          // 汇聚端大球 = 其它球的 1.5 倍左右
+const NODE_R = 29
+
+function layoutGraph (graph) {
+  const hub = graph.hubNode || null
+  const placed = []
+  const hubNode = hub
+    ? Object.assign({}, hub, { x: GRAPH_CX, y: GRAPH_CY, r: HUB_R })
+    : {
+        id: '__hub_unknown__',
+        ghost: true,
+        name: '汇聚端未知',
+        ip: '',
+        audioPort: 0,
+        online: false,
+        isHub: true,
+        isSelf: false,
+        streamId: 0,
+        level: null,
+        gain: 1,
+        muted: false,
+        x: GRAPH_CX,
+        y: GRAPH_CY,
+        r: HUB_R
+      }
+  placed.push(hubNode)
+
+  const others = graph.nodes.filter((n) => n.id !== hubNode.id)
+  const count = Math.max(others.length, 1)
+  const ringRadius = 188
+  const ballR = others.length > 9 ? 23 : NODE_R
+  others.forEach((n, i) => {
+    const angle = -Math.PI / 2 + (i * 2 * Math.PI) / count
+    placed.push(Object.assign({}, n, {
+      x: GRAPH_CX + ringRadius * Math.cos(angle),
+      y: GRAPH_CY + ringRadius * Math.sin(angle) * 0.78,   // 稍扁，适合宽屏
+      r: ballR
+    }))
   })
-  return nodes
+  return placed
 }
 
-let graphSig = ''
-
-function renderGraph (state) {
-  const sources = state.sources || []
-  // 只把"节点集合"纳入签名。电平每秒都在变，绝不能因此重建 SVG——
-  // 一重建，用户刚按下的球就被换掉，点击直接丢失（表现为"点不到"）。
-  const sig = sources.map((x) => x.id + ':' + (x.peerName || '')).join('|') +
-              '|hub=' + hubSelf + ':' + hubLabel
-  if (sig !== graphSig) {
-    graphSig = sig
-    buildGraphSvg(state)
-  }
-  paintGraphDynamic(state)
-}
-
-function buildGraphSvg (state) {
-  const svg = $('graph')
-  const sources = state.sources || []
-  // 本机不是汇聚端时，大球是对面的汇聚端，小球是本机（方案 4.2）
-  const nodes = hubSelf
-      ? layoutGraph(sources, hubLabel + ' · 汇聚')
-      : layoutGraph([{ id: 0, peerName: '本机', level: state.busLevel }],
-                    hubLabel + ' · 汇聚')
-  const hub = nodes[0]
-
+function nodeBadge (n) {
+  if (!n || n.ghost) return ''
   const parts = []
-  for (let i = 1; i < nodes.length; ++i) {
-    const n = nodes[i]
-    parts.push('<line data-line="' + n.id + '" x1="' + hub.x + '" y1="' + hub.y +
-      '" x2="' + n.x + '" y2="' + n.y + '" stroke="var(--line)" stroke-width="2" opacity="0.75"/>')
+  if (n.isSelf) parts.push('本机')
+  if (n.isHub) parts.push('汇聚端')
+  if (!n.online) parts.push('离线')
+  return parts.join(' · ')
+}
+
+function graphSignature (state, graph) {
+  const nodeSig = graph.nodes.map((n) =>
+    n.id + ':' + n.name + ':' + (n.online ? '1' : '0') + ':' +
+    (n.isHub ? 'h' : '') + (n.isSelf ? 's' : '') + ':' + n.streamId
+  ).join('|')
+  return (graph.hasGraph ? 'g' + graph.version : 'legacy') +
+    '|hub=' + graph.hubId + '|self=' + graph.selfId + '|' + nodeSig +
+    '|src=' + (state && state.pcSource ? '1' : '0')
+}
+
+let graphBuiltSig = ''
+
+function renderGraph (state, graph) {
+  const sig = graphSignature(state, graph)
+  // 只把"结构"纳入签名。电平每 200ms 都在变，绝不能因此重建 SVG ——
+  // 一重建，用户刚按下的球就被换掉，点击直接丢失（表现为"点不到"）。
+  if (sig !== graphBuiltSig) {
+    graphBuiltSig = sig
+    buildGraphSvg(state, graph)
   }
-  for (const n of nodes) {
-    const label = n.kind === 'hub' ? '汇聚' : String(n.id)
-    parts.push('<g class="node" data-id="' + n.id + '" style="cursor:pointer">' +
-      (n.kind === 'hub'
-        ? '<circle cx="' + n.x + '" cy="' + n.y + '" r="' + (n.r + 9) + '" fill="var(--accent-dim)"/>'
+  paintGraphDynamic(state, graph)
+}
+
+function buildGraphSvg (state, graph) {
+  const svg = $('graph')
+  if (!svg) return
+  const placed = layoutGraph(graph)
+  const hub = placed[0]
+  const parts = []
+
+  // 连线：汇聚端 → 其余每个节点（有音频流的线在 paint 里按电平加粗）
+  for (const n of placed) {
+    if (n.ghost || n.id === hub.id) continue
+    if (!hub.ghost && !hub.online) continue
+    parts.push('<line class="line" data-line="' + esc(n.id) + '" x1="' + hub.x +
+      '" y1="' + hub.y + '" x2="' + n.x + '" y2="' + n.y +
+      '" stroke="var(--line)" stroke-width="2" opacity="0.7"/>')
+  }
+
+  for (const n of placed) {
+    const classes = ['node']
+    if (!n.online) classes.push('offline')
+    if (n.ghost) classes.push('ghost')
+    const fill = n.ghost
+      ? 'oklch(0.26 0.02 255)'
+      : (n.isHub ? 'var(--accent)' : (n.online ? 'oklch(0.4 0.06 255)' : 'oklch(0.3 0.03 255)'))
+    const stroke = n.online ? 'oklch(0.55 0.1 255)' : 'oklch(0.42 0.02 255)'
+    const dash = n.online ? '' : ' stroke-dasharray="5 5"'
+    const inside = n.ghost ? '?' : (n.isSelf ? '本机' : shortName(n.name, n.isHub ? 6 : 4))
+    const badge = nodeBadge(n)
+    parts.push('<g class="' + classes.join(' ') + '" data-id="' + esc(n.id) + '">' +
+      (n.isHub && !n.ghost
+        ? '<circle cx="' + n.x + '" cy="' + n.y + '" r="' + (n.r + 15) +
+          '" fill="var(--accent)" opacity="0.10"/>' +
+          '<circle cx="' + n.x + '" cy="' + n.y + '" r="' + (n.r + 7) +
+          '" fill="var(--accent)" opacity="0.14"/>'
         : '') +
-      '<circle data-ball="' + n.id + '" cx="' + n.x + '" cy="' + n.y + '" r="' + n.r +
-      '" fill="' + (n.kind === 'hub' ? 'var(--accent)' : 'oklch(0.4 0.06 255)') +
-      '" stroke="oklch(0.55 0.1 255)" stroke-width="2"/>' +
+      '<circle class="ball" data-ball="' + esc(n.id) + '" cx="' + n.x + '" cy="' + n.y +
+      '" r="' + n.r + '" fill="' + fill + '" stroke="' + stroke + '" stroke-width="2"' + dash + '/>' +
       '<text x="' + n.x + '" y="' + (n.y + 5) + '" text-anchor="middle" fill="var(--text)"' +
-      ' font-size="' + (n.kind === 'hub' ? 15 : 13) + '" font-weight="600">' + label + '</text>' +
+      ' font-size="' + (n.isHub ? 15 : 12.5) + '" font-weight="600">' + esc(inside) + '</text>' +
+      (badge
+        ? '<text x="' + n.x + '" y="' + (n.y - n.r - 11) + '" text-anchor="middle"' +
+          ' fill="var(--accent-hi)" font-size="10.5" letter-spacing="1">' + esc(badge) + '</text>'
+        : '') +
       '<text x="' + n.x + '" y="' + (n.y + n.r + 20) + '" text-anchor="middle"' +
-      ' fill="var(--dim)" font-size="12.5">' + n.name + '</text>' +
-      '<text data-lvl="' + n.id + '" x="' + n.x + '" y="' + (n.y + n.r + 37) +
+      ' fill="var(--dim)" font-size="12.5">' + esc(n.ghost ? '等待图谱…' : n.name) + '</text>' +
+      '<text data-lvl="' + esc(n.id) + '" x="' + n.x + '" y="' + (n.y + n.r + 37) +
       '" text-anchor="middle" fill="var(--faint)" font-size="11.5">—</text>' +
       '</g>')
   }
   svg.innerHTML = parts.join('')
 
   svg.querySelectorAll('.node').forEach((g) => {
-    g.addEventListener('click', () => {
-      const id = g.dataset.id
-      if (id === 'hub') {
-        selected = { kind: 'hub', id: 'hub' }
-      } else {
-        const src = sources.find((x) => String(x.id) === String(id))
-        if (!src) return
-        selected = { kind: 'source', id: src.id }
-      }
-      paintGraphDynamic(lastState)
-      showVolumePanel(lastState)
-    })
+    g.addEventListener('click', () => onNodeClick(g.dataset.id))
   })
 }
 
-// 只改文本和描边，不重建节点——这样点击永远不会被打断
-function paintGraphDynamic (state) {
-  if (!state) return
+// 只改文本/描边/线宽，不重建节点 —— 这样点击永远不会被打断
+function paintGraphDynamic (state, graph) {
   const svg = $('graph')
-  const sources = state.sources || []
-  const setLvl = (id, text) => {
-    const el = svg.querySelector('[data-lvl="' + id + '"]')
-    if (el) el.textContent = text
-  }
-  setLvl('hub', dbText(state.busLevel))
-  for (const s of sources) setLvl(s.id, dbText(s.level))
+  if (!svg || !state) return
+  const nodeMap = new Map(graph.nodes.map((n) => [n.id, n]))
+  const levels = new Map()
+  for (const n of graph.nodes) levels.set(n.id, displayLevel(state, n))
 
-  // 选中态：描边高亮 + 连线加粗
-  svg.querySelectorAll('[data-ball]').forEach((c) => {
-    const on = selected && String(selected.id) === c.getAttribute('data-ball')
-    c.setAttribute('stroke', on ? 'var(--text)' : 'oklch(0.55 0.1 255)')
-    c.setAttribute('stroke-width', on ? '3' : '2')
-  })
-  svg.querySelectorAll('[data-line]').forEach((l) => {
-    const on = selected && String(selected.id) === l.getAttribute('data-line')
-    l.setAttribute('stroke', on ? 'var(--accent-hi)' : 'var(--line)')
-    l.setAttribute('stroke-width', on ? '3' : '2')
-    l.setAttribute('opacity', on ? '1' : '0.75')
-  })
+  const levelEls = svg.querySelectorAll('[data-lvl]')
+  for (let i = 0; i < levelEls.length; ++i) {
+    const id = levelEls[i].getAttribute('data-lvl')
+    levelEls[i].textContent = levels.has(id) ? dbText(levels.get(id)) : '—'
+  }
+
+  // 选中态：描边加粗
+  const balls = svg.querySelectorAll('[data-ball]')
+  for (let i = 0; i < balls.length; ++i) {
+    const id = balls[i].getAttribute('data-ball')
+    const node = nodeMap.get(id)
+    const on = !!selected && selected.nodeId === id
+    const online = node ? node.online : true
+    balls[i].setAttribute('stroke',
+      on ? 'var(--text)' : (online ? 'oklch(0.55 0.1 255)' : 'oklch(0.42 0.02 255)'))
+    balls[i].setAttribute('stroke-width', on ? '3' : '2')
+  }
+
+  // 连线：有音频流时随电平加粗/变亮
+  const lines = svg.querySelectorAll('[data-line]')
+  for (let i = 0; i < lines.length; ++i) {
+    const id = lines[i].getAttribute('data-line')
+    const node = nodeMap.get(id)
+    const on = !!selected && selected.nodeId === id
+    const flow = hasFlow(state, node)
+    const lv = levels.has(id) ? levels.get(id) : null
+    const boost = flow && typeof lv === 'number' ? levelPct(lv) / 26 : 0
+    const width = on ? Math.max(3, 2 + boost) : (flow ? 2 + boost : 2)
+    lines[i].setAttribute('stroke',
+      on ? 'var(--accent-hi)' : (flow ? 'oklch(0.72 0.15 255 / .9)' : 'var(--line)'))
+    lines[i].setAttribute('stroke-width', String(Math.round(width * 10) / 10))
+    lines[i].setAttribute('opacity', on ? '1' : (flow ? '0.95' : '0.7'))
+  }
 }
 
-let volDragging = false
+// ============================================================ 图谱交互
 
-function showVolumePanel (state) {
+function onNodeClick (nodeId) {
+  const state = lastState
+  if (!state || !nodeId) return
+  const graph = collectGraph(state)
+  const node = graph.nodes.find((n) => n.id === nodeId)
+  if (!node) return
+  selected = { nodeId: node.id }
+  paintGraphDynamic(state, graph)
+
+  if (node.isHub) {
+    // 点汇聚端：只显示信息，不提供切换
+    showHubAction(node, graph)
+    if (graph.isHubSelf) showVolumePanel(state, graph, node)
+    else hideVolumePanel()
+    return
+  }
+
+  if (graph.hasGraph) showSwitchAction(node, graph)
+  else hideActionBar()
+
+  const streamId = streamIdForNode(node, state)
+  if (streamId || (node.isSelf && state.pcSource)) showVolumePanel(state, graph, node)
+  else hideVolumePanel()
+}
+
+function showActionBar (parts, okText, cancelText) {
+  const bar = $('graphAction')
+  const textEl = $('actionText')
+  const okBtn = $('actionSwitch')
+  const cancelBtn = $('actionCancel')
+  if (!bar || !textEl || !okBtn || !cancelBtn) return
+  textEl.textContent = ''
+  for (const p of parts) {
+    if (typeof p === 'string' || typeof p === 'number') {
+      textEl.appendChild(document.createTextNode(String(p)))
+    } else if (p) {
+      const span = document.createElement('span')
+      span.className = p.cls || ''
+      span.textContent = p.text
+      textEl.appendChild(span)
+    }
+  }
+  if (okText) {
+    okBtn.style.display = ''
+    okBtn.textContent = okText
+  } else {
+    okBtn.style.display = 'none'
+  }
+  cancelBtn.textContent = cancelText || '取消'
+  bar.style.display = ''
+}
+
+function hideActionBar () {
+  const bar = $('graphAction')
+  if (bar) bar.style.display = 'none'
+  const okBtn = $('actionSwitch')
+  if (okBtn) okBtn.style.display = 'none'
+  action = null
+}
+
+function showSwitchAction (node, graph) {
+  action = { mode: 'switch', nodeId: node.id }
+  const parts = []
+  if (!node.online) parts.push({ text: '该设备当前离线。', cls: 'warn' })
+  parts.push('把汇聚端切到 ' + node.name + '？')
+  if (node.isSelf) parts.push('（本机将负责收流 / 混音 / 播放）')
+  showActionBar(parts, '切换', '取消')
+}
+
+function showHubAction (node, graph) {
+  action = { mode: 'hub', nodeId: node.id }
+  const info = []
+  if (node.ip) info.push(node.ip + (node.audioPort ? ':' + node.audioPort : ''))
+  info.push(node.online ? '在线' : '离线')
+  info.push('图谱 v' + (graph.version || 0))
+  if (node.isSelf) info.push('本机')
+  showActionBar(['当前汇聚端：' + node.name + ' · ' + info.join(' · ')], null, '关闭')
+}
+
+// 切换后的同步状态提示
+function setSync (text, tone) {
+  syncText = text || ''
+  syncTone = tone || ''
+  renderSyncLine()
+}
+
+function renderSyncLine () {
+  const el = $('graphStatus')
+  if (!el) return
+  el.textContent = syncText
+  el.className = 'graphstatus' + (syncTone ? ' ' + syncTone : '')
+  el.style.display = syncText ? '' : 'none'
+}
+
+// 新图谱到达后确认同步：hubId 已指向目标且版本比切换前新 → "已同步（vN）"
+function checkSwitchSync (graph) {
+  if (!pendingSwitch || !graph || !graph.hasGraph) return
+  if (graph.hubId !== pendingSwitch.nodeId) return
+  if (graph.version > pendingSwitch.fromVersion) {
+    if (pendingSwitch.timer) clearTimeout(pendingSwitch.timer)
+    const version = graph.version
+    pendingSwitch = null
+    setSync('已同步（v' + version + '）', 'ok')
+  }
+}
+
+async function doSwitch () {
+  if (!action || action.mode !== 'switch' || !action.nodeId) return
+  const nodeId = action.nodeId
+  const before = lastState ? collectGraph(lastState) : null
+  const fromVersion = before ? before.version : 0
+  hideActionBar()
+  pendingSwitch = { nodeId: nodeId, fromVersion: fromVersion, timer: null }
+  setSync('已切换，正在同步…', '')
+  // 兜底：6 秒还没等到新图谱就说明同步没成
+  pendingSwitch.timer = setTimeout(() => {
+    if (pendingSwitch && pendingSwitch.nodeId === nodeId) {
+      pendingSwitch = null
+      setSync('仍未收到新图谱，请检查网络或音频核心状态', 'warn')
+    }
+  }, 6000)
+
+  let res = null
+  try {
+    res = await window.hub.switchHub(nodeId)
+  } catch (err) {
+    res = { ok: false, error: (err && err.message) || '调用失败' }
+  }
+  if (!res || !res.ok) {
+    if (pendingSwitch && pendingSwitch.timer) clearTimeout(pendingSwitch.timer)
+    pendingSwitch = null
+    const reason = res && res.error ? res.error : '音频核心未支持图谱切换接口'
+    setSync('切换失败：' + reason, 'warn')
+    return
+  }
+  // 后端一般会立刻返回新图谱：先用它刷新一次，不必等 200ms 轮询
+  if (res.graph && lastState && typeof res.graph === 'object') {
+    render(Object.assign({}, lastState, { graph: res.graph }))
+  }
+}
+
+// ============================================================ 音量面板
+
+function hideVolumePanel () {
+  const panel = $('volumePanel')
+  if (panel) panel.style.display = 'none'
+}
+
+function showVolumePanel (state, graph, node) {
   const panel = $('volumePanel')
   const slider = $('volSlider')
   const nameEl = $('volName')
-  if (!hubSelf) {
-    // 本机只是音源，音量由对面的汇聚端调
-    nameEl.textContent = '本机是音源 · 音量由 ' + hubLabel + ' 调节'
-    slider.value = 100
-    slider.disabled = true
-    $('volPct').textContent = '—'
+  const pctEl = $('volPct')
+  const muteBtn = $('volMute')
+  if (!panel || !slider || !nameEl || !pctEl) return
+  const hubName = graph.hubNode && !graph.hubNode.ghost ? graph.hubNode.name : '汇聚端'
+
+  // 汇聚端节点：本机是 hub 时调总音量；远端 hub 的音量由它自己控制
+  if (node.isHub) {
+    if (graph.isHubSelf) {
+      nameEl.textContent = '汇聚端总音量'
+      slider.disabled = false
+      if (!volDragging) {
+        slider.value = Math.round((typeof state.master === 'number' ? state.master : 1) * 100)
+      }
+      slider.oninput = () => {
+        const g = slider.value / 100
+        pctEl.textContent = pct(g)
+        slider.style.setProperty('--p', (g * 100 / 1.5) + '%')
+        window.hub.setMaster(g)
+      }
+    } else {
+      nameEl.textContent = '当前汇聚端：' + node.name + ' · 音量由该设备控制'
+      slider.disabled = true
+    }
+    if (muteBtn) muteBtn.style.display = 'none'
+    pctEl.textContent = slider.disabled ? '—' : pct(slider.value / 100)
+    if (!slider.disabled) slider.style.setProperty('--p', (slider.value / 1.5) + '%')
     panel.style.display = ''
     return
   }
-  slider.disabled = false
 
-  if (selected.kind === 'hub') {
-    nameEl.textContent = '汇聚端总音量'
-    slider.value = Math.round((state.master || 1) * 100)
-    slider.oninput = () => {
-      const g = slider.value / 100
-      $('volPct').textContent = pct(g)
-      slider.style.setProperty('--p', (g * 100 / 1.5) + '%')
-      window.hub.setMaster(g)
-    }
-  } else {
-    const s = (state.sources || []).find((x) => String(x.id) === String(selected.id))
-    if (!s) { panel.style.display = 'none'; return }
-    nameEl.textContent = s.peerName || ('设备 ' + s.id)
-    // 正在拖的时候不回写，否则滑杆会被状态推回去，手感像"抓不住"
-    if (!volDragging) slider.value = Math.round((s.gain ?? 1) * 100)
-    slider.oninput = () => {
-      const g = slider.value / 100
-      $('volPct').textContent = pct(g)
-      slider.style.setProperty('--p', (g * 100 / 1.5) + '%')
-      window.hub.setSource(s.id, { gain: g })
-    }
+  // 本机是音源：音量由远端汇聚端调，本机只显示状态
+  if (node.isSelf && state.pcSource) {
+    nameEl.textContent = '本机是音源 · 音量由 ' + hubName + ' 调节'
+    slider.disabled = true
+    slider.value = 100
+    pctEl.textContent = '—'
+    if (muteBtn) muteBtn.style.display = 'none'
+    panel.style.display = ''
+    return
   }
-  $('volPct').textContent = pct(slider.value / 100)
+
+  const streamId = streamIdForNode(node, state)
+  if (!streamId) {
+    hideVolumePanel()
+    return
+  }
+  nameEl.textContent = node.name || ('设备 ' + streamId)
+  slider.disabled = false
+  // 正在拖的时候不回写，否则滑杆会被状态推回去，手感像"抓不住"
+  if (!volDragging) slider.value = Math.round(node.gain * 100)
+  slider.oninput = () => {
+    const g = slider.value / 100
+    pctEl.textContent = pct(g)
+    slider.style.setProperty('--p', (g * 100 / 1.5) + '%')
+    window.hub.setSource(streamId, { gain: g })
+  }
+  pctEl.textContent = pct(slider.value / 100)
   slider.style.setProperty('--p', (slider.value / 1.5) + '%')
+  if (muteBtn) {
+    muteBtn.style.display = ''
+    muteBtn.textContent = node.muted ? '已静音' : '静音'
+    muteBtn.classList.toggle('on', !!node.muted)
+  }
   panel.style.display = ''
+}
+
+// 每次状态刷新时同步面板内容（选中节点可能已失效）
+function refreshVolumePanel (state, graph) {
+  if (!selected) return
+  const node = graph.nodes.find((n) => n.id === selected.nodeId)
+  if (!node) {
+    hideVolumePanel()
+    return
+  }
+  const streamId = streamIdForNode(node, state)
+  if (node.isHub) {
+    if (graph.isHubSelf) showVolumePanel(state, graph, node)
+    else hideVolumePanel()
+    return
+  }
+  if (streamId || (node.isSelf && state.pcSource)) showVolumePanel(state, graph, node)
+  else hideVolumePanel()
 }
 
 // 拖动状态：按下到松开之间不回写滑杆
 $('volSlider').addEventListener('pointerdown', () => { volDragging = true })
 window.addEventListener('pointerup', () => { volDragging = false })
 
-// ============================================================ 连接界面
+$('volMute').addEventListener('click', () => {
+  if (!lastState || !selected) return
+  const graph = collectGraph(lastState)
+  const node = graph.nodes.find((n) => n.id === selected.nodeId)
+  if (!node || node.isHub) return
+  const streamId = streamIdForNode(node, lastState)
+  if (!streamId) return
+  window.hub.setSource(streamId, { muted: !node.muted })
+})
 
+$('actionSwitch').addEventListener('click', () => { doSwitch() })
+$('actionCancel').addEventListener('click', () => {
+  hideActionBar()
+})
 
-// 汇聚端选择器：连接建立后才显示（方案 7.3）
-function renderHubSelect (state) {
-  const sel = $('hubSelect')
-  // 候选 = 本机 + 已连接设备 + 发现的设备
-  //
-  // 只列 peers 是不够的：手机端不广播信标（省电），
-  // 所以 PC 的 peers 里往往没有手机——但手机明明已经连上了。
-  // 已连接设备从 sources 取，一定在。
-  const candidates = []
-  const seen = new Set()
+// ============================================================ 汇聚端信息条
 
-  // ① 会话关系表：连过的设备，跨角色切换保留。
-  //    没有这一份，电脑切到手机之后 sources 清空、peers 里也没有手机
-  //    （手机不广播信标），下拉就只剩"本机"，切一次就回不去了。
-  for (const k of (state.sessionPeers || [])) {
-    const key = k.ip + ':' + k.audioPort
-    if (seen.has(key)) continue
-    seen.add(key)
-    candidates.push({ name: k.name, ip: k.ip, port: k.audioPort })
+function renderHubBar (state, graph) {
+  const nowEl = $('hubNow')
+  const noteEl = $('hubNote')
+  if (nowEl) {
+    const hub = graph.hubNode
+    if (hub && !hub.ghost) {
+      nowEl.textContent = hub.name + (hub.ip ? '（' + hub.ip + '）' : '') +
+        (hub.online ? '' : ' 离线')
+      nowEl.classList.toggle('off', !hub.online)
+    } else {
+      nowEl.textContent = graph.hubId ? '汇聚端未知（' + graph.hubId + '）' : '汇聚端未知'
+      nowEl.classList.add('off')
+    }
   }
-
-  // ② 当前已连接的流（带最新名字）
-  for (const s of (state.sources || [])) {
-    if (!s.peerIp) continue
-    const key = s.peerIp + ':' + state.audioPort
-    if (seen.has(key)) continue
-    seen.add(key)
-    candidates.push({ name: s.peerName || ('设备 ' + s.id), ip: s.peerIp, port: 47000 })
+  if (noteEl) {
+    if (graph.isHubSelf) {
+      noteEl.textContent = '本机承担收流 / 混音 / 播放'
+    } else if (state.pcSource) {
+      const hubName = graph.hubNode && !graph.hubNode.ghost ? graph.hubNode.name : '远端'
+      noteEl.textContent = '本机声音正送往 ' + hubName
+    } else {
+      noteEl.textContent = '本机空闲（未作为音源发送）'
+    }
   }
-  for (const p of (state.peers || [])) {
-    const key = p.ip + ':' + p.audioPort
-    if (seen.has(key)) continue
-    seen.add(key)
-    candidates.push({ name: p.name, ip: p.ip, port: p.audioPort })
-  }
-
-  const sig = JSON.stringify(candidates.map((p) => p.name + '@' + p.ip + ':' + p.port)) +
-              '|' + hubSelf + '|' + hubLabel
-  if (sig === hubSelectSig) return
-  hubSelectSig = sig
-
-  const prev = hubSelf ? 'self' : 'remote'
-  sel.innerHTML = ''
-  const optSelf = document.createElement('option')
-  optSelf.value = 'self'
-  optSelf.textContent = '本机（电脑）'
-  sel.appendChild(optSelf)
-  for (const p of candidates) {
-    const o = document.createElement('option')
-    o.value = p.ip + ':' + p.port
-    o.textContent = p.name + '（' + p.ip + '）'
-    sel.appendChild(o)
-  }
-  sel.value = prev
 }
 
-$('hubSelect').addEventListener('change', async (e) => {
-  const v = e.target.value
-  if (v === 'self') {
-    hubSelf = true
-    hubLabel = '本机'
-    await window.hub.setRole({
-      self: true,
-      prevIp: lastRemote ? lastRemote.ip : null,
-      prevPort: lastRemote ? lastRemote.port : 0
-    })
-    lastRemote = null
-  } else {
-    const [ip, portStr] = v.split(':')
-    hubSelf = false
-    hubLabel = ip
-    lastRemote = { ip, port: Number(portStr) }
-    await window.hub.setRole({ self: false, ip, audioPort: Number(portStr) })
-  }
-  hubSelectSig = ''
-  graphSig = ''
-  render(lastState)
-})
+// ============================================================ 连接界面
 
 let connectSig = ''
 let ctrlSig = ''
@@ -289,8 +696,9 @@ let ctrlSig = ''
 let reqBarSig = ''
 
 function renderRequestBar (container, state) {
-  const invites = state.invites || []
-  const pending = state.pending || []
+  if (!container) return false
+  const invites = Array.isArray(state.invites) ? state.invites : []
+  const pending = Array.isArray(state.pending) ? state.pending : []
   const sig = JSON.stringify({
     i: invites.map((x) => x.ip + ':' + x.name),
     p: pending.map((x) => x.streamId + ':' + x.name)
@@ -305,11 +713,13 @@ function renderRequestBar (container, state) {
     const el = document.createElement('div')
     el.className = 'req'
     el.innerHTML =
-      '<span class="who">' + inv.name + '</span>' +
-      '<span class="ip">' + inv.ip + '</span>' +
+      '<span class="who"></span>' +
+      '<span class="ip"></span>' +
       '<span class="ask">邀请你把本机声音送过去</span>' +
       '<button class="btn ok">同意</button>' +
       '<button class="btn no">拒绝</button>'
+    el.querySelector('.who').textContent = inv.name || inv.ip
+    el.querySelector('.ip').textContent = inv.ip || ''
     el.querySelector('.ok').addEventListener('click', () => window.hub.acceptInvite(inv.ip))
     el.querySelector('.no').addEventListener('click', () => window.hub.rejectInvite(inv.ip))
     container.appendChild(el)
@@ -320,11 +730,13 @@ function renderRequestBar (container, state) {
     const el = document.createElement('div')
     el.className = 'req'
     el.innerHTML =
-      '<span class="who">' + p.name + '</span>' +
-      '<span class="ip">' + p.ip + '</span>' +
+      '<span class="who"></span>' +
+      '<span class="ip"></span>' +
       '<span class="ask">请求把声音送到这里</span>' +
       '<button class="btn ok">同意</button>' +
       '<button class="btn no">拒绝</button>'
+    el.querySelector('.who').textContent = p.name || ('设备 ' + p.streamId)
+    el.querySelector('.ip').textContent = p.ip || ''
     el.querySelector('.ok').addEventListener('click', () => window.hub.accept(p.streamId))
     el.querySelector('.no').addEventListener('click', () => window.hub.reject(p.streamId))
     container.appendChild(el)
@@ -334,18 +746,24 @@ function renderRequestBar (container, state) {
 
 // 设备卡片列表
 function renderPeers (container, state) {
+  if (!container) return
   container.innerHTML = ''
-  for (const p of state.peers || []) {
+  const peers = Array.isArray(state.peers) ? state.peers : []
+  for (const p of peers) {
+    if (!p) continue
     const el = document.createElement('div')
     el.className = 'card peer'
     const role = (p.canReceive && p.canSend) ? '音源 / 汇聚' : (p.canReceive ? '汇聚端' : '音源')
     el.innerHTML =
-      '<div class="top"><div class="name"><span class="dot dim"></span>' + p.name +
-      '</div><div class="db">' + role + '</div></div>' +
-      '<div class="row"><span class="ask">' + p.ip + ':' + p.audioPort + '</span></div>' +
+      '<div class="top"><div class="name"><span class="dot dim"></span></div>' +
+      '<div class="db"></div></div>' +
+      '<div class="row"><span class="ask"></span></div>' +
       '<div class="row" style="margin-top:10px">' +
         '<button class="btn go">邀请它把声音送过来</button>' +
       '</div>'
+    el.querySelector('.name').appendChild(document.createTextNode(p.name || ''))
+    el.querySelector('.db').textContent = role
+    el.querySelector('.ask').textContent = p.ip + ':' + p.audioPort
     el.querySelector('.go').addEventListener('click', () =>
       window.hub.invitePeer({ ip: p.ip, audioPort: p.audioPort }))
     container.appendChild(el)
@@ -356,24 +774,29 @@ function renderConnect (state) {
   // 200ms 轮询会把整片 DOM 重建一次，用户正在点的那个按钮就被换掉了。
   // 只有"设备集合/待确认集合"真的变了才重建。
   const sig = JSON.stringify({
-    r: (state.pending || []).map((x) => x.streamId + ':' + x.name + ':' + x.ip),
-    p: (state.peers || []).map((x) => x.name + '@' + x.ip + ':' + x.audioPort)
+    r: (Array.isArray(state.pending) ? state.pending : [])
+      .map((x) => x.streamId + ':' + x.name + ':' + x.ip),
+    p: (Array.isArray(state.peers) ? state.peers : [])
+      .map((x) => x.name + '@' + x.ip + ':' + x.audioPort)
   })
   if (sig === connectSig) return
   connectSig = sig
 
   const hasReq = renderRequestBar($('reqGrid'), state)
-  $('sectReq').style.display = hasReq ? '' : 'none'
+  const sectReq = $('sectReq')
+  if (sectReq) sectReq.style.display = hasReq ? '' : 'none'
   renderPeers($('peerGrid'), state)
-  $('sectPeer').style.display = (state.peers || []).length ? '' : 'none'
+  const sectPeer = $('sectPeer')
+  if (sectPeer) sectPeer.style.display = (state.peers || []).length ? '' : 'none'
 }
 
 // 控制界面里的"新设备"区：会话进行中也能接人
 function renderControlDevices (state) {
   const sig = JSON.stringify({
-    r: (state.pending || []).map((x) => x.streamId + ':' + x.name),
-    i: (state.invites || []).map((x) => x.ip + ':' + x.name),
-    p: (state.peers || []).map((x) => x.name + '@' + x.ip + ':' + x.audioPort)
+    r: (Array.isArray(state.pending) ? state.pending : []).map((x) => x.streamId + ':' + x.name),
+    i: (Array.isArray(state.invites) ? state.invites : []).map((x) => x.ip + ':' + x.name),
+    p: (Array.isArray(state.peers) ? state.peers : [])
+      .map((x) => x.name + '@' + x.ip + ':' + x.audioPort)
   })
   if (sig === ctrlSig) return
   ctrlSig = sig
@@ -396,8 +819,9 @@ function showNotice (text) {
 
 function checkNewSources (state) {
   const ids = new Set()
-  for (const s of (state.sources || [])) {
-    if (!s.confirmed) continue
+  const sources = Array.isArray(state.sources) ? state.sources : []
+  for (const s of sources) {
+    if (!s || !s.confirmed) continue
     ids.add(s.id)
     if (!knownSourceIds.has(s.id)) {
       showNotice((s.peerName || ('设备 ' + s.id)) + ' 已接入')
@@ -408,100 +832,81 @@ function checkNewSources (state) {
 
 // ============================================================ 主刷新
 
-let lastState = null
-
 function render (state) {
-  if (!state) return
+  if (!state || typeof state !== 'object') return
   lastState = state
   checkNewSources(state)
 
+  const graph = collectGraph(state)
+  checkSwitchSync(graph)
+
   const b = $('banner')
-  if (state.error) {
-    b.textContent = state.error
-    b.classList.remove('hidden', 'ok')
-  } else if (noticeText && Date.now() < noticeUntil) {
-    b.textContent = noticeText
-    b.classList.remove('hidden')
-    b.classList.add('ok')
-  } else {
-    b.classList.add('hidden')
-    b.classList.remove('ok')
+  if (b) {
+    if (state.error) {
+      b.textContent = state.error
+      b.classList.remove('hidden', 'ok')
+    } else if (noticeText && Date.now() < noticeUntil) {
+      b.textContent = noticeText
+      b.classList.remove('hidden')
+      b.classList.add('ok')
+    } else {
+      b.classList.add('hidden')
+      b.classList.remove('ok')
+    }
   }
-  $('addr').textContent = state.ip || '—'
+  const addrEl = $('addr')
+  if (addrEl) addrEl.textContent = state.ip || '—'
 
-  const sources = state.sources || []
-  const confirmedCount = sources.filter((s) => s.confirmed).length
-  // 本机切走汇聚端后会变成"纯音源"：本地没有 sources，
-  // 但会话明明还在。只看 sources 会把界面误跳回连接界面。
-  // 本机不是汇聚端时，只有音源进程还活着才算"会话还在"；
-  // 否则用户断开后界面会一直卡在控制页，永远回不到连接页。
-  const anyConnection = confirmedCount > 0 || (!hubSelf && !!state.pcSource)
+  const sources = Array.isArray(state.sources) ? state.sources : []
+  const confirmedCount = sources.filter((s) => s && s.confirmed).length
+  // 控制屏显示条件（协议 §9.2）：图谱节点数 >= 2（网络已形成）或本机有音频流
+  const networkUp = graph.nodes.length >= 2
+  const localFlow = confirmedCount > 0 || !!state.pcSource
+  const anyConnection = networkUp || localFlow
 
-  // 角色跟随事实：只要有设备把声音送到我这里，我就必然是汇聚端。
-  //
-  // 场景：上一次本机切到了手机当汇聚端（hubSelf=false），这次手机主动
-  // 把汇聚端切回本机并发来 CONN-REQ。本机的核心照常接受、sources 里也有
-  // 设备了，但界面还停在"本机声音送往远端"——看起来就是"电脑没反应"。
-  // 所以这里主动把角色切回自己：
-  if (confirmedCount > 0 && !hubSelf) {
-    hubSelf = true
-    hubLabel = '本机'
-    graphSig = ''
-    hubSelectSig = ''
-    window.hub.setRole({
-      self: true,
-      prevIp: lastRemote ? lastRemote.ip : null,
-      prevPort: lastRemote ? lastRemote.port : 0
-    }).catch(() => {})
-    lastRemote = null
-  }
-
-  // 自动切换屏幕：有连接 → 控制；没有 → 连接
+  // 自动切换屏幕：有图谱网络 / 本机有流 → 控制；否则 → 连接
   const next = anyConnection ? 'control' : 'connect'
   if (next !== screen) {
     selected = null
+    hideActionBar()
+    hideVolumePanel()
+    graphBuiltSig = ''
     showScreen(next)
   }
 
   if (screen === 'connect') {
     renderConnect(state)
-    // 本机不是汇聚端：说明本机的声音正被送到对端
-    // 汇聚端说明文案：本机是汇聚端时谈收流，不是时谈发送
-    const note = $('hubNote')
-    if (note) {
-      if (hubSelf) {
-        note.textContent = '承担收流 / 混音 / 播放'
-      } else if (!state.pcSource) {
-        note.textContent = '本机声音未发送（音源进程未启动）'
-      } else if (state.pcSourceLevel === null) {
-        note.textContent = '音源进程已启动，等待采集数据…'
-      } else if (state.pcSourceLevel <= -119) {
-        // 这一条最关键：进程在跑、但采到的全是静音
-        note.textContent = '已发送，但采集到的是静音 —— '
-            + '请确认系统默认播放设备就是正在出声的那个（回环只抓默认设备）'
-      } else {
-        note.textContent = '本机声音已送往远端 · 采集 '
-            + state.pcSourceLevel.toFixed(1) + ' dBFS · '
-            + state.pcSourcePkts + ' 包/s'
-      }
-    }
   } else {
     renderControlDevices(state)
-    renderHubSelect(state)
-    renderGraph(state)
-    if (selected) showVolumePanel(state)
+    renderGraph(state, graph)
+    renderHubBar(state, graph)
+    refreshVolumePanel(state, graph)
   }
+
+  // 回到连接屏 / 选中的节点已从图谱里消失 → 收起操作条与音量面板
+  const selectionGone = !!selected && !graph.nodes.some((n) => n.id === selected.nodeId)
+  if (screen === 'connect' || selectionGone) {
+    selected = null
+    hideActionBar()
+    hideVolumePanel()
+  }
+
+  renderSyncLine()
 
   // 回显自动同意状态（用户刚点过就别覆盖，避免和点击打架）
   const auto = $('autoAccept')
   if (auto && !autoTouched) auto.checked = !!state.autoAccept
 
-  $('stats').innerHTML =
-    '<span>设备 <b>' + confirmedCount + '</b> 台</span>' +
-    '<span>总线 <b>' + dbText(state.busLevel) + '</b></span>' +
-    '<span>码率 <b>' + (state.kbps || 0).toFixed(0) + '</b> kbps</span>' +
-    '<span>坏包 <b>' + state.malformed + '</b></span>' +
-    '<span>渲染欠载 <b>' + state.renderUnderruns + '</b></span>'
+  const statsEl = $('stats')
+  if (statsEl) {
+    statsEl.innerHTML =
+      '<span>设备 <b>' + graph.nodes.length + '</b> 台</span>' +
+      (graph.hasGraph ? '<span>图谱 <b>v' + graph.version + '</b></span>' : '') +
+      '<span>总线 <b>' + dbText(state.busLevel) + '</b></span>' +
+      '<span>码率 <b>' + fmtNumber(state.kbps, 0) + '</b> kbps</span>' +
+      '<span>坏包 <b>' + (Number.isFinite(state.malformed) ? state.malformed : 0) + '</b></span>' +
+      '<span>渲染欠载 <b>' + (Number.isFinite(state.renderUnderruns) ? state.renderUnderruns : 0) + '</b></span>'
+  }
 }
 
 // ============================================================ 事件
@@ -513,12 +918,6 @@ $('copyBtn').addEventListener('click', async (e) => {
     e.target.textContent = '已复制'
     setTimeout(() => { e.target.textContent = '复制' }, 1200)
   } catch (err) { /* 剪贴板不可用时静默失败 */ }
-})
-
-$('volMute').addEventListener('click', () => {
-  if (!selected || selected.kind !== 'source') return
-  window.hub.setSource(selected.id, { muted: true })
-  $('volMute').classList.add('on')
 })
 
 // ---- 主动扫描 ----
@@ -542,7 +941,7 @@ $('scanBtn').addEventListener('click', async () => {
     hint.textContent = '扫描失败：音频核心没有响应'
     return
   }
-  const n = res.peers.length
+  const n = (res.peers || []).length
   if (n === 0) {
     hint.className = 'hint warn'
     hint.textContent = '没有发现设备。请确认：① 手机已打开 App；② 手机和电脑在同一 WiFi / 网段'
@@ -580,8 +979,7 @@ $('manualInviteBtn').addEventListener('click', async () => {
   }
 })
 
-// 自动同意：手机点一下就连上，不必在电脑上再点一次
-let autoTouched = false
+// 自动同意：手机点一下就连上，不必在电脑上再点一次（只影响非成员连接请求）
 $('autoAccept').addEventListener('change', async (e) => {
   autoTouched = true
   await window.hub.setAutoAccept(e.target.checked)
@@ -607,26 +1005,37 @@ $('ctrlInviteBtn').addEventListener('click', async () => {
 
 $('leaveBtn').addEventListener('click', async () => {
   const s = await window.hub.getState()
-  for (const src of s.sources || []) {
-    if (src.confirmed) window.hub.disconnect(src.id)
+  const sources = s && Array.isArray(s.sources) ? s.sources : []
+  for (const src of sources) {
+    if (src && src.confirmed) window.hub.disconnect(src.id)
   }
-  // 用户主动"断开所有"：连关系表一起清掉，下拉回到只有本机
+  // 用户主动"断开所有"：连关系表一起清掉；后端同时把图谱重置为只有本机
   await window.hub.clearSession()
+  selected = null
+  hideActionBar()
+  hideVolumePanel()
+  setSync('', '')
 })
 
 // ============================================================ 订阅
 
 // 调试快照：排查"界面没切换"时直接读它，比看日志快
-window.__hubDebug = () => ({
-  screen,
-  hubSelf,
-  hubLabel,
-  sources: (lastState && lastState.sources ? lastState.sources : []).length,
-  confirmed: (lastState && lastState.sources ? lastState.sources : [])
-      .filter((x) => x.confirmed).length,
-  peers: (lastState && lastState.peers ? lastState.peers : []).length,
-  controlShown: !!$('screenControl') && $('screenControl').style.display !== 'none'
-})
+window.__hubDebug = () => {
+  const graph = lastState ? collectGraph(lastState) : null
+  return {
+    screen: screen,
+    hasGraph: !!(graph && graph.hasGraph),
+    version: graph ? graph.version : null,
+    hubId: graph ? graph.hubId : '',
+    selfId: graph ? graph.selfId : '',
+    nodes: graph ? graph.nodes.length : 0,
+    hubOnline: !!(graph && graph.hubNode && graph.hubNode.online),
+    selected: selected ? selected.nodeId : null,
+    pendingSwitch: pendingSwitch ? pendingSwitch.nodeId : null,
+    pcSource: !!(lastState && lastState.pcSource),
+    controlShown: !!$('screenControl') && $('screenControl').style.display !== 'none'
+  }
+}
 
 const unsubscribe = window.hub.onState(render)
 window.addEventListener('beforeunload', unsubscribe)

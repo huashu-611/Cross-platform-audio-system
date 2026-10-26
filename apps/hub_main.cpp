@@ -91,6 +91,88 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
   return true;
 }
 
+// 图谱 JSON（docs/GRAPH-PROTOCOL.md §7.1）：节点上的"流字段"按 source.peer_ip
+// 与节点 IP 匹配，没有流的节点给默认值，界面就不用判断 null 了。
+// 只放在 hub_main 里：HubCore 保持平台无关，不依赖 JSON。
+std::string GraphStateJson(const audiohub::HubCore& hub,
+                           const std::vector<audiohub::SourceInfo>& sources,
+                           const std::vector<audiohub::Peer>& discovered,
+                           const std::vector<audiohub::Peer>& session_peers) {
+  const audiohub::GraphState g = hub.Graph();
+  const std::string self_id = hub.graph_self_id();
+
+  std::ostringstream o;
+  o << "{\"version\":" << g.version << ",\"origin\":\"" << audiohub::JsonEscape(g.origin)
+    << "\",\"hubId\":\"" << audiohub::JsonEscape(g.hub_id) << "\",\"selfId\":\""
+    << audiohub::JsonEscape(self_id) << "\",\"isHub\":"
+    << (hub.graph_is_hub() ? "true" : "false") << ",\"nodes\":[";
+  for (size_t i = 0; i < g.nodes.size(); ++i) {
+    const audiohub::GraphNode& n = g.nodes[i];
+    // 节点 id 一定是 "ip:端口"；取最后一个冒号前的部分当 IP
+    const size_t colon = n.id.rfind(':');
+    const std::string ip = colon == std::string::npos ? n.id : n.id.substr(0, colon);
+
+    // 活标志：本机恒在线；否则看音频流/会话关系表/发现列表/10s 内的 GRAPH（协议 §8）
+    bool online = (n.id == self_id);
+    if (!online) {
+      for (const auto& s : sources) {
+        if (s.peer_ip == ip) {
+          online = true;
+          break;
+        }
+      }
+    }
+    if (!online) {
+      for (const auto& p : session_peers) {
+        if (p.ip == ip) {
+          online = true;
+          break;
+        }
+      }
+    }
+    if (!online) {
+      for (const auto& p : discovered) {
+        if (p.ip == ip) {
+          online = true;
+          break;
+        }
+      }
+    }
+    if (!online) {
+      const int64_t since_ms = hub.graph_peer_last_seen_ms(ip);
+      if (since_ms >= 0 && since_ms < 10000) online = true;
+    }
+
+    // 承载的流 id：汇聚端不送流（0），其余节点按 id 升序的 rank+1（协议 §6）
+    const uint16_t stream_id = (n.id == g.hub_id) ? 0 : audiohub::StreamIdFor(g, n.id);
+
+    const audiohub::SourceInfo* src = nullptr;
+    for (const auto& s : sources) {
+      if (s.peer_ip == ip) {
+        src = &s;
+        break;
+      }
+    }
+
+    if (i) o << ",";
+    o << "{\"id\":\"" << audiohub::JsonEscape(n.id) << "\""
+      << ",\"name\":\"" << audiohub::JsonEscape(n.name) << "\""
+      << ",\"kind\":\"" << audiohub::JsonEscape(n.kind) << "\""
+      << ",\"ip\":\"" << audiohub::JsonEscape(ip) << "\""
+      << ",\"audioPort\":" << n.audio_port << ",\"httpPort\":" << n.http_port
+      << ",\"online\":" << (online ? "true" : "false")
+      << ",\"isSelf\":" << (n.id == self_id ? "true" : "false")
+      << ",\"isHub\":" << (n.id == g.hub_id ? "true" : "false")
+      << ",\"streamId\":" << stream_id
+      << ",\"level\":" << (src != nullptr ? src->level_dbfs : -120.0)
+      << ",\"occupancy\":" << (src != nullptr ? src->occupancy_ms : 0)
+      << ",\"gain\":" << (src != nullptr ? src->gain : 1.0)
+      << ",\"muted\":" << ((src != nullptr && src->muted) ? "true" : "false") << "}";
+  }
+  o << "]}";
+  return o.str();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -103,6 +185,10 @@ int main(int argc, char** argv) {
     if (w_argv != nullptr && w_argc > 0) {
       static std::vector<std::string> utf8_args;
       static std::vector<char*> utf8_argp;
+      // 先 reserve：机造成 vector 扩容时，之前 push 进 utf8_argp 的 data() 指针
+      // 会全部悬空，argv 里随即出现乱码/“未知参数”（起两个进程时尤其容易撞上）。
+      utf8_args.reserve(static_cast<size_t>(w_argc));
+      utf8_argp.reserve(static_cast<size_t>(w_argc) + 1);
       for (int i = 0; i < w_argc; ++i) {
         const int n = WideCharToMultiByte(CP_UTF8, 0, w_argv[i], -1, nullptr, 0, nullptr, nullptr);
         utf8_args.emplace_back(n > 0 ? static_cast<size_t>(n - 1) : 0, '\0');
@@ -140,6 +226,7 @@ int main(int argc, char** argv) {
   opts.require_handshake = !opt.no_handshake;
   opts.auto_accept = opt.auto_accept;
   opts.display_name = opt.name;
+  opts.http_port = opt.http_port;  // 图谱里要暴露给对端的 HTTP 端口（Android 用不上时为 0）
 
   std::string error;
   if (!hub.Start(opt.port, opt.latency_ms, opt.render_latency_ms, opts, &error)) {
@@ -162,6 +249,9 @@ int main(int argc, char** argv) {
                        if (path == "/api/state") {
                          const auto stats = hub.Stats();
                          const auto sources = hub.Sources();
+                         // 图谱渲染也要用这两份，顺手只取一次（Sources() 会带走电平快照）
+                         const auto discovered = hub.DiscoveredPeers();
+                         const auto session_peers = hub.SessionPeers();
 
                          // 收包速率：接口被轮询的频率不固定，用增量/时间算
                          static uint64_t last_total = 0;
@@ -214,7 +304,7 @@ int main(int argc, char** argv) {
                          }
                          o << "],\"sessionPeers\":[";
                          {
-                           const auto sp = hub.SessionPeers();
+                           const auto& sp = session_peers;
                            for (size_t i = 0; i < sp.size(); ++i) {
                              if (i) o << ",";
                              o << "{\"name\":\"" << audiohub::JsonEscape(sp[i].name) << "\","
@@ -246,7 +336,8 @@ int main(int argc, char** argv) {
                              << ",\"underrun\":" << s.underrun_frames
                              << ",\"overflow\":" << s.overflow_packets << "}";
                          }
-                         o << "]}";
+                         o << "],\"graph\":"
+                           << GraphStateJson(hub, sources, discovered, session_peers) << "}";
                          return o.str();
                        }
 
@@ -359,7 +450,38 @@ int main(int argc, char** argv) {
                          }
                          return "{\"ok\":true}";
                        }
-                       return "{\"ok\":false}";
+                       if (method == "POST" && path == "/api/graph/switch") {
+                          std::string node_id;
+                          if (!audiohub::JsonGetString(body, "nodeId", &node_id) ||
+                              node_id.empty()) {
+                            return "{\"ok\":false,\"error\":\"unknown node\"}";
+                          }
+                          // 节点不存在时协议要求明确的 unknown node（§7.2）
+                          if (!hub.SwitchGraphHub(node_id)) {
+                            return "{\"ok\":false,\"error\":\"unknown node\"}";
+                          }
+                          std::ostringstream o;
+                          o << "{\"ok\":true,\"graph\":"
+                            << GraphStateJson(hub, hub.Sources(), hub.DiscoveredPeers(),
+                                              hub.SessionPeers())
+                            << "}";
+                          return o.str();
+                        }
+                        if (method == "POST" && path == "/api/graph/sync") {
+                          hub.SyncGraphNow();
+                          const auto g = hub.Graph();
+                          // sent = 实际发出的广播份数（不含自己）
+                          const size_t sent = g.nodes.empty() ? 0 : g.nodes.size() - 1;
+                          std::ostringstream o;
+                          o << "{\"ok\":true,\"sent\":" << sent << "}";
+                          return o.str();
+                        }
+                        if (method == "POST" && path == "/api/session/clear") {
+                          // 与旧 /api/clear-session 同义；ClearSession 里额外重置图谱（§4.6）
+                          hub.ClearSession();
+                          return "{\"ok\":true}";
+                        }
+                        return "{\"ok\":false}";
                      },
                      &http_error)) {
       std::printf("%s\n", http_error.c_str());

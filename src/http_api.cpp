@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -55,10 +56,54 @@ struct HttpApi::Impl {
     }
   }
 
+  // 从头部块里取 Content-Length（大小写不敏感）。
+  //
+  // 为什么不能只等 "\r\n\r\n"：客户端常常把"请求头"和"请求体"分两次 write，
+  // 两次 write 在回环上也可能落在两个 TCP 段里。原来收到头部就返回，
+  // body 为空——于是 /api/graph/switch 的 nodeId、/api/auto-accept 的 on
+  // 全都解析不到，表现为 "unknown node" 或"设置无效"，甚至客户端还在写请求体
+  // 时服务端已经回包并关连接，报 "connection was closed unexpectedly"。
+  // 现在按 Content-Length 把请求体读完再交给处理器（GET 没有长度，长度 0）。
+  static size_t HeaderContentLength(const std::string& head) {
+    size_t pos = 0;
+    while (pos < head.size()) {
+      size_t eol = head.find("\r\n", pos);
+      if (eol == std::string::npos) eol = head.size();
+      const std::string line = head.substr(pos, eol - pos);
+      const size_t colon = line.find(':');
+      if (colon != std::string::npos) {
+        std::string name = line.substr(0, colon);
+        for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (name == "content-length") {
+          // strtoul 不抛异常，解析失败返回 0（没有请求体）。
+          return static_cast<size_t>(std::strtoul(line.c_str() + colon + 1, nullptr, 10));
+        }
+      }
+      pos = eol + 2;
+    }
+    return 0;
+  }
+
   static bool ReadRequest(SOCKET client, std::string* out) {
+    // 客户端可能半途不发，别让一个坏连接永久占住线程。
+    DWORD timeout = 3000;
+    ::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout),
+                 sizeof(timeout));
+
     std::string buf;
     char tmp[4096];
-    while (buf.find("\r\n\r\n") == std::string::npos) {
+    size_t header_end = std::string::npos;
+    size_t body_size = 0;
+    while (true) {
+      if (header_end == std::string::npos) {
+        header_end = buf.find("\r\n\r\n");
+        if (header_end != std::string::npos) {
+          body_size = HeaderContentLength(buf.substr(0, header_end));
+          // 声明了不可能的体积就直接拒绝，别白等到 recv 超时。
+          if (body_size > 64 * 1024) return false;
+        }
+      }
+      if (header_end != std::string::npos && buf.size() >= header_end + 4 + body_size) break;
       const int n = ::recv(client, tmp, sizeof(tmp), 0);
       if (n <= 0) return false;
       buf.append(tmp, static_cast<size_t>(n));

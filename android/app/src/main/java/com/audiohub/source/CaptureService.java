@@ -61,6 +61,12 @@ public class CaptureService extends Service {
     public static volatile int sLevelDbfs = -120;
     public static volatile double sKbps = 0;
 
+    // ---- 当前采集目标。MainActivity 的 400ms reconcile 拿它和图谱比对：
+    // 目标 IP / 端口 / streamId 任何一个变了，就用已保存的 MediaProjection 授权重启。----
+    public static volatile String sHost = "";
+    public static volatile int sPort = 0;
+    public static volatile int sStreamId = 0;
+
     private MediaProjection projection;
     private MediaProjection.Callback projectionCallback;
     private AudioRecord record;
@@ -102,6 +108,17 @@ public class CaptureService extends Service {
         port = intent.getIntExtra(EXTRA_PORT, 47000);
         streamId = intent.getIntExtra(EXTRA_STREAM_ID, 1);
 
+        // 幂等：400ms reconcile 可能重复下发同一个 START。
+        // 目标完全一样 → 直接忽略；目标变了（切换汇聚端 / streamId 变化）→ 先收尾再用
+        // 调用方保存的授权重建，避免两个 AudioRecord / 两个 socket 同时存在。
+        if (running || sRunning) {
+            if (host != null && host.equals(sHost)
+                    && port == sPort && streamId == sStreamId) {
+                return START_NOT_STICKY;
+            }
+            stopCapture();
+        }
+
         if (resultCode != Activity.RESULT_OK || resultData == null) {
             fail("没有拿到屏幕/音频采集授权");
             return START_NOT_STICKY;
@@ -128,7 +145,15 @@ public class CaptureService extends Service {
 
         MediaProjectionManager manager =
                 (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
-        projection = manager.getMediaProjection(resultCode, resultData);
+        try {
+            projection = manager.getMediaProjection(resultCode, resultData);
+        } catch (Throwable t) {
+            // 切换汇聚端时复用上次授权：Android 14 起部分 ROM 会在这里抛
+            // SecurityException（一个授权令牌不能重开两路采集）。兜住并让用户重新授权，
+            // 否则这里会直接崩进程。
+            fail("复用采集授权失败，请重新授权: " + t.getClass().getSimpleName());
+            return START_NOT_STICKY;
+        }
         if (projection == null) {
             fail("获取 MediaProjection 失败（可能授权已过期，请重新授权）");
             return START_NOT_STICKY;
@@ -150,7 +175,11 @@ public class CaptureService extends Service {
 
         acquireLocks();
         sRunning = true;
-        sStatus = "已连接 " + host + ":" + port;
+        sHost = host;
+        sPort = port;
+        sStreamId = streamId;
+        sPackets = 0;
+        sStatus = "已连接 " + host + ":" + port + " · 通道 " + streamId;
         return START_NOT_STICKY;
     }
 
@@ -302,6 +331,9 @@ public class CaptureService extends Service {
     private void stopCapture() {
         running = false;
         sRunning = false;
+        sHost = "";
+        sPort = 0;
+        sStreamId = 0;
 
         if (worker != null) {
             try {
