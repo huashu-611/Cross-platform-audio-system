@@ -412,6 +412,18 @@ public class MainActivity extends Activity {
 
     private void showVolumePanel(HubGraphView.Node node) {
         selectedKey = node.key;
+        final boolean receiving = ReceiverService.sRunning
+                && ReceiverService.sStreamCount > 0;
+        if (!receiving) {
+            // 本机当音源时，音量由对端控制，这里只说明状态
+            volName.setText(("hub".equals(node.key) ? "汇聚端" : node.name)
+                    + " · 音量由汇聚端调节");
+            volSlider.setEnabled(false);
+            volSlider.setProgress(100);
+            volPct.setText("—");
+            return;
+        }
+        volSlider.setEnabled(true);
         volName.setText(node.hub ? "汇聚端总音量" : node.name);
         volPct.setText("100%");
         volSlider.setProgress(100);
@@ -593,25 +605,38 @@ public class MainActivity extends Activity {
                    + CaptureService.sLevelDbfs + " dBFS")
                 : (isLocalHub() ? "本机是汇聚端" : "未发送"));
 
-        // 屏幕自动切换：有已确认的连接 → 控制界面；没有 → 连接界面
+        // 只要"有连接"就进控制界面——不论本机是汇聚端还是音源。
+        // 两端看到的是同一张网络图，只是谁是中间那个大球不同。
         final boolean hubRunning = ReceiverService.sRunning;
-        final boolean anyConnection = (hubRunning && ReceiverService.sStreamCount > 0)
-                || srcRunning;
-        showScreen(anyConnection ? "control" : "connect");
+        final boolean receiving = hubRunning && ReceiverService.sStreamCount > 0;
+        final boolean inSession = receiving || srcRunning;
+        showScreen(inSession ? "control" : "connect");
 
-        // 网络图数据
-        if (hubRunning) {
-            List<Integer> ids = new java.util.ArrayList<>();
-            List<String> names = new java.util.ArrayList<>();
-            List<Double> levels = new java.util.ArrayList<>();
-            // ReceiverService 目前只暴露流数；球按流编号铺开，名字用编号
-            for (int i = 1; i <= ReceiverService.sStreamCount; ++i) {
-                ids.add(i);
-                names.add("设备 " + i);
-                levels.add(ReceiverService.sBusLevel);
+        if (inSession) {
+            java.util.List<Integer> ids = new java.util.ArrayList<>();
+            java.util.List<String> names = new java.util.ArrayList<>();
+            java.util.List<Double> levels = new java.util.ArrayList<>();
+            String hubLabel;
+            double hubLevel;
+
+            if (receiving) {
+                // 本机是汇聚端：大球是本机，小球是各路音源
+                hubLabel = "本机";
+                hubLevel = ReceiverService.sBusLevel;
+                for (int i = 1; i <= ReceiverService.sStreamCount; ++i) {
+                    ids.add(i);
+                    names.add("设备 " + i);
+                    levels.add(ReceiverService.sBusLevel);
+                }
+            } else {
+                // 本机是音源：大球是对面的汇聚端，小球是本机
+                hubLabel = hubName != null ? hubName : hubIp;
+                hubLevel = -120;
+                ids.add(0);
+                names.add("本机");
+                levels.add((double) CaptureService.sLevelDbfs);
             }
-            graph.setData(isLocalHub() ? "本机" : (hubName != null ? hubName : hubIp),
-                    ReceiverService.sBusLevel, names, ids, levels);
+            graph.setData(hubLabel, hubLevel, names, ids, levels);
         }
 
         // PC 发来的邀请：弹窗确认
@@ -625,7 +650,6 @@ public class MainActivity extends Activity {
                     .setPositiveButton("同意", new android.content.DialogInterface.OnClickListener() {
                         @Override
                         public void onClick(android.content.DialogInterface dialog, int which) {
-                            // 同意后对方开始发送；汇聚端已就绪，无需额外动作
                             Toast.makeText(MainActivity.this, "已同意", Toast.LENGTH_SHORT).show();
                         }
                     })

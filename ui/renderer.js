@@ -53,41 +53,47 @@ function layoutGraph (sources, hubLabel) {
   return nodes
 }
 
+let graphSig = ''
+
 function renderGraph (state) {
+  const sources = state.sources || []
+  // 只把"节点集合"纳入签名。电平每秒都在变，绝不能因此重建 SVG——
+  // 一重建，用户刚按下的球就被换掉，点击直接丢失（表现为"点不到"）。
+  const sig = sources.map((x) => x.id + ':' + (x.peerName || '')).join('|')
+  if (sig !== graphSig) {
+    graphSig = sig
+    buildGraphSvg(state)
+  }
+  paintGraphDynamic(state)
+}
+
+function buildGraphSvg (state) {
   const svg = $('graph')
   const sources = state.sources || []
   const nodes = layoutGraph(sources, '本机 · 汇聚')
   const hub = nodes[0]
 
   const parts = []
-  // 连线
   for (let i = 1; i < nodes.length; ++i) {
     const n = nodes[i]
-    const on = selected && selected.id === n.id
-    parts.push('<line x1="' + hub.x + '" y1="' + hub.y + '" x2="' + n.x + '" y2="' + n.y +
-      '" stroke="' + (on ? 'var(--accent-hi)' : 'var(--line)') + '" stroke-width="' +
-      (on ? 3 : 2) + '" opacity="' + (on ? 1 : 0.75) + '"/>')
+    parts.push('<line data-line="' + n.id + '" x1="' + hub.x + '" y1="' + hub.y +
+      '" x2="' + n.x + '" y2="' + n.y + '" stroke="var(--line)" stroke-width="2" opacity="0.75"/>')
   }
-  // 球
   for (const n of nodes) {
-    const isSel = selected && selected.id === n.id
-    const fill = n.kind === 'hub' ? 'var(--accent)' : 'oklch(0.4 0.06 255)'
     const label = n.kind === 'hub' ? '汇聚' : String(n.id)
     parts.push('<g class="node" data-id="' + n.id + '" style="cursor:pointer">' +
       (n.kind === 'hub'
-        ? '<circle cx="' + n.x + '" cy="' + n.y + '" r="' + (n.r + 9) +
-          '" fill="var(--accent-dim)"/>'
+        ? '<circle cx="' + n.x + '" cy="' + n.y + '" r="' + (n.r + 9) + '" fill="var(--accent-dim)"/>'
         : '') +
-      '<circle cx="' + n.x + '" cy="' + n.y + '" r="' + n.r + '" fill="' + fill +
-      '" stroke="' + (isSel ? 'var(--text)' : 'oklch(0.55 0.1 255)') +
-      '" stroke-width="' + (isSel ? 3 : 2) + '"/>' +
+      '<circle data-ball="' + n.id + '" cx="' + n.x + '" cy="' + n.y + '" r="' + n.r +
+      '" fill="' + (n.kind === 'hub' ? 'var(--accent)' : 'oklch(0.4 0.06 255)') +
+      '" stroke="oklch(0.55 0.1 255)" stroke-width="2"/>' +
       '<text x="' + n.x + '" y="' + (n.y + 5) + '" text-anchor="middle" fill="var(--text)"' +
       ' font-size="' + (n.kind === 'hub' ? 15 : 13) + '" font-weight="600">' + label + '</text>' +
       '<text x="' + n.x + '" y="' + (n.y + n.r + 20) + '" text-anchor="middle"' +
       ' fill="var(--dim)" font-size="12.5">' + n.name + '</text>' +
-      '<text x="' + n.x + '" y="' + (n.y + n.r + 37) + '" text-anchor="middle"' +
-      ' fill="var(--faint)" font-size="11.5">' +
-      dbText(n.kind === 'hub' ? state.busLevel : n.level) + '</text>' +
+      '<text data-lvl="' + n.id + '" x="' + n.x + '" y="' + (n.y + n.r + 37) +
+      '" text-anchor="middle" fill="var(--faint)" font-size="11.5">—</text>' +
       '</g>')
   }
   svg.innerHTML = parts.join('')
@@ -98,15 +104,43 @@ function renderGraph (state) {
       if (id === 'hub') {
         selected = { kind: 'hub', id: 'hub' }
       } else {
-        const s = sources.find((x) => String(x.id) === String(id))
-        if (!s) return
-        selected = { kind: 'source', id: s.id }
+        const src = sources.find((x) => String(x.id) === String(id))
+        if (!src) return
+        selected = { kind: 'source', id: src.id }
       }
-      renderGraph(state)
-      showVolumePanel(state)
+      paintGraphDynamic(lastState)
+      showVolumePanel(lastState)
     })
   })
 }
+
+// 只改文本和描边，不重建节点——这样点击永远不会被打断
+function paintGraphDynamic (state) {
+  if (!state) return
+  const svg = $('graph')
+  const sources = state.sources || []
+  const setLvl = (id, text) => {
+    const el = svg.querySelector('[data-lvl="' + id + '"]')
+    if (el) el.textContent = text
+  }
+  setLvl('hub', dbText(state.busLevel))
+  for (const s of sources) setLvl(s.id, dbText(s.level))
+
+  // 选中态：描边高亮 + 连线加粗
+  svg.querySelectorAll('[data-ball]').forEach((c) => {
+    const on = selected && String(selected.id) === c.getAttribute('data-ball')
+    c.setAttribute('stroke', on ? 'var(--text)' : 'oklch(0.55 0.1 255)')
+    c.setAttribute('stroke-width', on ? '3' : '2')
+  })
+  svg.querySelectorAll('[data-line]').forEach((l) => {
+    const on = selected && String(selected.id) === l.getAttribute('data-line')
+    l.setAttribute('stroke', on ? 'var(--accent-hi)' : 'var(--line)')
+    l.setAttribute('stroke-width', on ? '3' : '2')
+    l.setAttribute('opacity', on ? '1' : '0.75')
+  })
+}
+
+let volDragging = false
 
 function showVolumePanel (state) {
   const panel = $('volumePanel')
@@ -126,7 +160,8 @@ function showVolumePanel (state) {
     const s = (state.sources || []).find((x) => String(x.id) === String(selected.id))
     if (!s) { panel.style.display = 'none'; return }
     nameEl.textContent = s.peerName || ('设备 ' + s.id)
-    slider.value = Math.round((s.gain ?? 1) * 100)
+    // 正在拖的时候不回写，否则滑杆会被状态推回去，手感像"抓不住"
+    if (!volDragging) slider.value = Math.round((s.gain ?? 1) * 100)
     slider.oninput = () => {
       const g = slider.value / 100
       $('volPct').textContent = pct(g)
@@ -139,9 +174,24 @@ function showVolumePanel (state) {
   panel.style.display = ''
 }
 
+// 拖动状态：按下到松开之间不回写滑杆
+$('volSlider').addEventListener('pointerdown', () => { volDragging = true })
+window.addEventListener('pointerup', () => { volDragging = false })
+
 // ============================================================ 连接界面
 
+let connectSig = ''
+
 function renderConnect (state) {
+  // 200ms 轮询会把整片 DOM 重建一次，用户正在点的那个按钮就被换掉了。
+  // 只有"设备集合/待确认集合"真的变了才重建。
+  const sig = JSON.stringify({
+    r: (state.pending || []).map((x) => x.streamId + ':' + x.name + ':' + x.ip),
+    p: (state.peers || []).map((x) => x.name + '@' + x.ip + ':' + x.audioPort)
+  })
+  if (sig === connectSig) return
+  connectSig = sig
+
   const reqGrid = $('reqGrid')
   reqGrid.innerHTML = ''
   for (const p of state.pending || []) {
