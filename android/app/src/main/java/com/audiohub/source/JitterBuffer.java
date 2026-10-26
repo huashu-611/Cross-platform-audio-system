@@ -65,7 +65,10 @@ final class JitterBuffer {
             for (int i = 0; i < frames; ++i) {
                 final long abs = pos + i;
                 if (abs < readPos || abs >= readPos + capacityFrames) continue;
-                final int idx = (int) (abs % capacityFrames);
+                // 必须用 floorMod：首包之前 readPos 会是负数
+                // （pos - 60ms），而 Java 的 % 对负数返回负值，
+                // 直接当数组下标就是 ArrayIndexOutOfBoundsException。
+                final int idx = (int) Math.floorMod(abs, capacityFrames);
                 data[idx * channels] = samples[i * channels];
                 if (channels > 1) data[idx * channels + 1] = samples[i * channels + 1];
                 valid[idx] = true;
@@ -96,7 +99,10 @@ final class JitterBuffer {
             final int n = Math.min(step, cap);
             for (int i = 0; i < n; ++i) {
                 final long abs = readPos + i;
-                final int idx = (int) (abs % capacityFrames);
+                // 必须用 floorMod：首包之前 readPos 会是负数
+                // （pos - 60ms），而 Java 的 % 对负数返回负值，
+                // 直接当数组下标就是 ArrayIndexOutOfBoundsException。
+                final int idx = (int) Math.floorMod(abs, capacityFrames);
                 if (valid[idx]) {
                     scratch[i * channels] = data[idx * channels];
                     if (channels > 1) scratch[i * channels + 1] = data[idx * channels + 1];

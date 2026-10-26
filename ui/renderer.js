@@ -273,10 +273,38 @@ $('hubSelect').addEventListener('change', async (e) => {
 let connectSig = ''
 let ctrlSig = ''
 
-// 待确认请求：连接界面和控制界面都要显示
-function renderPending (container, state) {
+// 请求栏：对端发来的邀请 + 待确认的连接请求，合成一条，避免互相清空
+let reqBarSig = ''
+
+function renderRequestBar (container, state) {
+  const invites = state.invites || []
+  const pending = state.pending || []
+  const sig = JSON.stringify({
+    i: invites.map((x) => x.ip + ':' + x.name),
+    p: pending.map((x) => x.streamId + ':' + x.name)
+  })
+  if (sig === reqBarSig) return invites.length + pending.length > 0
+  reqBarSig = sig
+
   container.innerHTML = ''
-  for (const p of state.pending || []) {
+
+  // 邀请：对方希望本机把声音送过去
+  for (const inv of invites) {
+    const el = document.createElement('div')
+    el.className = 'req'
+    el.innerHTML =
+      '<span class="who">' + inv.name + '</span>' +
+      '<span class="ip">' + inv.ip + '</span>' +
+      '<span class="ask">邀请你把本机声音送过去</span>' +
+      '<button class="btn ok">同意</button>' +
+      '<button class="btn no">拒绝</button>'
+    el.querySelector('.ok').addEventListener('click', () => window.hub.acceptInvite(inv.ip))
+    el.querySelector('.no').addEventListener('click', () => window.hub.rejectInvite(inv.ip))
+    container.appendChild(el)
+  }
+
+  // 待确认：对方要把声音送到本机
+  for (const p of pending) {
     const el = document.createElement('div')
     el.className = 'req'
     el.innerHTML =
@@ -289,6 +317,7 @@ function renderPending (container, state) {
     el.querySelector('.no').addEventListener('click', () => window.hub.reject(p.streamId))
     container.appendChild(el)
   }
+  return invites.length + pending.length > 0
 }
 
 // 设备卡片列表
@@ -321,8 +350,8 @@ function renderConnect (state) {
   if (sig === connectSig) return
   connectSig = sig
 
-  renderPending($('reqGrid'), state)
-  $('sectReq').style.display = (state.pending || []).length ? '' : 'none'
+  const hasReq = renderRequestBar($('reqGrid'), state)
+  $('sectReq').style.display = hasReq ? '' : 'none'
   renderPeers($('peerGrid'), state)
   $('sectPeer').style.display = (state.peers || []).length ? '' : 'none'
 }
@@ -331,11 +360,12 @@ function renderConnect (state) {
 function renderControlDevices (state) {
   const sig = JSON.stringify({
     r: (state.pending || []).map((x) => x.streamId + ':' + x.name),
+    i: (state.invites || []).map((x) => x.ip + ':' + x.name),
     p: (state.peers || []).map((x) => x.name + '@' + x.ip + ':' + x.audioPort)
   })
   if (sig === ctrlSig) return
   ctrlSig = sig
-  renderPending($('ctrlReq'), state)
+  renderRequestBar($('ctrlReq'), state)
   renderPeers($('ctrlPeers'), state)
 }
 

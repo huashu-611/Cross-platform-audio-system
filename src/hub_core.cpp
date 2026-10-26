@@ -381,6 +381,26 @@ struct HubCore::Impl {
           pending[stream_id] = p;
           Emit("[?] 连接请求: " + peer_name + " (流 " + std::to_string(stream_id) + ")，等待确认");
         }
+      } else if (cmd == "CONN-INVITE") {
+        // CONN-INVITE|<对端名>|<它自己的 ip:音频口>|<序号>
+        //
+        // 以前这里什么都没有 —— 手机发来的邀请到了就被丢掉，
+        // 界面上自然"没反应"。现在入队，由界面决定要不要接受。
+        std::string invite_ip = from_ip;
+        uint16_t invite_port = 0;
+        if (parts.size() >= 3) {
+          const size_t colon = parts[2].rfind(':');
+          if (colon != std::string::npos) {
+            invite_ip = parts[2].substr(0, colon);
+            invite_port = static_cast<uint16_t>(std::atoi(parts[2].c_str() + colon + 1));
+          }
+        }
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          invite_list[invite_ip] = (parts.size() >= 2 ? parts[1] : invite_ip);
+        }
+        Emit("[<] 收到邀请: " + invite_ip + ":" + std::to_string(invite_port) +
+             (parts.size() >= 2 ? ("  来自 " + parts[1]) : ""));
       } else if (cmd == "CONN-ACK" && parts.size() >= 3) {
         // 我们是发起方，对方同意了
         const uint16_t stream_id = static_cast<uint16_t>(std::stoi(parts[2]));
@@ -741,6 +761,8 @@ struct HubCore::Impl {
     return ok;
   }
 
+  // 待确认的邀请：ip -> 对端名
+  std::map<std::string, std::string> invite_list;
   std::string local_ip_for_invite;
   uint32_t invite_seq_ = 1;
 };
@@ -788,6 +810,29 @@ bool HubCore::SendRoleCommand(const std::string& peer_ip, uint16_t peer_audio_po
   const bool ok = impl_->handshake_socket.SendToAddr(peer_ip, hs_port, frame.data(), frame.size());
   impl_->Emit("[>] 角色指令 -> " + peer_ip + ":" + std::to_string(hs_port) + "  " + frame);
   return ok;
+}
+
+std::vector<Peer> HubCore::Invites() const {
+  std::vector<Peer> out;
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  for (const auto& kv : impl_->invite_list) {
+    Peer p;
+    p.ip = kv.first;
+    p.name = kv.second;
+    p.audio_port = impl_->port;
+    out.push_back(p);
+  }
+  return out;
+}
+
+void HubCore::AcceptInvite(const std::string& ip) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  impl_->invite_list.erase(ip);
+}
+
+void HubCore::RejectInvite(const std::string& ip) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  impl_->invite_list.erase(ip);
 }
 
 bool HubCore::InvitePeer(const Peer& peer) { return impl_->InvitePeer(peer.ip, peer.audio_port); }

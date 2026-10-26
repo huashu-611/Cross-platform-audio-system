@@ -569,7 +569,21 @@ public class MainActivity extends Activity {
     }
 
     private void showHubPicker() {
-        final List<Discovery.Device> peers = discovery.peers();
+        // 候选 = 发现的设备 + 手动添加/上次连接的设备
+        // 只看 discovery 的话，广播被拦（办公网）或对方不广播信标时会一片空白，
+        // 用户就没法切回去 —— 手动添加过的地址必须也在候选里。
+        final java.util.List<Discovery.Device> merged =
+                new java.util.ArrayList<>(manualPeers);
+        final List<Discovery.Device> auto = discovery != null
+                ? discovery.peers() : new java.util.ArrayList<Discovery.Device>();
+        for (Discovery.Device a : auto) {
+            boolean dup = false;
+            for (Discovery.Device m : merged) {
+                if (m.ip.equals(a.ip) && m.audioPort == a.audioPort) { dup = true; break; }
+            }
+            if (!dup) merged.add(a);
+        }
+        final List<Discovery.Device> peers = merged;
         final String[] names = new String[peers.size() + 1];
         names[0] = "本机（" + android.os.Build.MODEL + "）";
         final Discovery.Device[] devices = new Discovery.Device[peers.size()];

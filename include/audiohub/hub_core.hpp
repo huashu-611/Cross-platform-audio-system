@@ -89,6 +89,12 @@ class HubCore {
 
   // ---- 发现 ----
   std::vector<Peer> DiscoveredPeers() const;
+
+  // 别人发来的邀请（对方希望把声音送到它那里）。
+  // 收到 CONN-INVITE 时入队，界面确认后再由界面侧启动音源进程。
+  std::vector<Peer> Invites() const;
+  void AcceptInvite(const std::string& ip);
+  void RejectInvite(const std::string& ip);
   void RefreshDiscovery();  // 立即发一轮探测，不用等下一个广播周期
 
   // ---- 连接握手 ----

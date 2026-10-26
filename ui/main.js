@@ -309,6 +309,24 @@ ipcMain.handle('hub:setMaster', async (_e, arg) => {
 
 // 主动扫描：让音频核心发一轮 WHO 探测，等对端回信标后再回读状态。
 // 只调 refresh 不等待的话，界面拿到的还是探测前那份 peers。
+// 接受对端邀请：把本机的声音送过去，并告诉它"你来当汇聚端"
+ipcMain.handle('hub:accept-invite', async (_e, arg) => {
+  const ip = arg && arg.ip
+  if (!ip) return { ok: false }
+  await httpRequest('POST', '/api/accept-invite', { ip })
+  // 让对方开始接收（ROLE|hub），本机转为音源
+  await httpRequest('POST', '/api/role', { ip, audioPort: DATA_PORT, hub: 1 })
+  startPcSource(ip, DATA_PORT)
+  return { ok: true }
+})
+
+ipcMain.handle('hub:reject-invite', async (_e, arg) => {
+  const ip = arg && arg.ip
+  if (!ip) return { ok: false }
+  await httpRequest('POST', '/api/reject-invite', { ip })
+  return { ok: true }
+})
+
 ipcMain.handle('hub:scan', async () => {
   await httpRequest('POST', '/api/refresh', {})
   await new Promise((resolve) => setTimeout(resolve, 800))

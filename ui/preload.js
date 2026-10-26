@@ -31,6 +31,10 @@ contextBridge.exposeInMainWorld('hub', {
   // 设定汇聚端：self=true 本机；false 时给 ip/audioPort
   setRole: (arg) => ipcRenderer.invoke('hub:setRole', arg),
 
+  // 对端发来的邀请
+  acceptInvite: (ip) => ipcRenderer.invoke('hub:accept-invite', { ip }),
+  rejectInvite: (ip) => ipcRenderer.invoke('hub:reject-invite', { ip }),
+
   // 连接握手
   invitePeer: (peer) => ipcRenderer.invoke('hub:invite', peer),
   accept: (streamId) => ipcRenderer.invoke('hub:accept', { streamId }),

@@ -212,6 +212,15 @@ int main(int argc, char** argv) {
                                << "\"ip\":\"" << p.peer_ip << "\"}";
                            }
                          }
+                         o << "],\"invites\":[";
+                         {
+                           const auto invites = hub.Invites();
+                           for (size_t i = 0; i < invites.size(); ++i) {
+                             if (i) o << ",";
+                             o << "{\"name\":\"" << audiohub::JsonEscape(invites[i].name) << "\","
+                               << "\"ip\":\"" << invites[i].ip << "\"}";
+                           }
+                         }
                          o << "],\"sources\":[";
                          for (size_t i = 0; i < sources.size(); ++i) {
                            const auto& s = sources[i];
@@ -277,6 +286,22 @@ int main(int argc, char** argv) {
                        if (method == "POST" && path == "/api/auto-accept") {
                          bool b = false;
                          if (audiohub::JsonFindBool(body, "on", &b)) hub.SetAutoAccept(b);
+                         return "{\"ok\":true}";
+                       }
+                       if (method == "POST" && path == "/api/accept-invite") {
+                         std::string ip;
+                         if (!audiohub::JsonGetString(body, "ip", &ip) || ip.empty()) {
+                           return "{\"ok\":false,\"error\":\"ip missing\"}";
+                         }
+                         hub.AcceptInvite(ip);
+                         return "{\"ok\":true}";
+                       }
+                       if (method == "POST" && path == "/api/reject-invite") {
+                         std::string ip;
+                         if (!audiohub::JsonGetString(body, "ip", &ip) || ip.empty()) {
+                           return "{\"ok\":false,\"error\":\"ip missing\"}";
+                         }
+                         hub.RejectInvite(ip);
                          return "{\"ok\":true}";
                        }
                        if (method == "POST" && path == "/api/role") {
