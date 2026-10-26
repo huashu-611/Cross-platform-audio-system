@@ -240,7 +240,9 @@ struct HubCore::Impl {
     std::vector<float> scratch;
 
     while (!stop_requested.load()) {
-      const int n = data_socket.ReceiveFrom(buffer.data(), buffer.size(), nullptr, nullptr);
+      std::string from_ip;
+      uint16_t from_port = 0;
+      const int n = data_socket.ReceiveFrom(buffer.data(), buffer.size(), &from_ip, &from_port);
       if (n <= 0) {
         std::this_thread::sleep_for(std::chrono::microseconds(200));
         continue;
@@ -283,6 +285,7 @@ struct HubCore::Impl {
       auto it = streams.find(header.stream_id);
       if (it == streams.end()) {
         auto created = std::make_unique<Stream>(header.stream_id, latency_ms);
+        created->peer_ip_for_bye = from_ip;
         // 三种情况视为已确认：没启用握手 / 之前握手通过过 / 之前 Accept 过
         created->confirmed =
             !require_handshake || accepted_ids.count(header.stream_id) > 0;
@@ -590,6 +593,7 @@ struct HubCore::Impl {
       info.underrun_frames = st.frames_underrun;
       info.overflow_packets = st.packets_overflow;
       info.confirmed = s.confirmed;
+      info.peer_ip = s.peer_ip_for_bye;
       info.peer_name = s.peer_name;
       out.push_back(info);
     }

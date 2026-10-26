@@ -93,7 +93,29 @@ public class ReceiverService extends Service {
         }
         if (!ACTION_START.equals(intent.getAction())) return START_NOT_STICKY;
 
-        startForegroundNotification();
+        // Android 12+ 对前台服务启动有严格限制，Android 14 对
+        // foregroundServiceType 也有要求；任何一项不满足都会抛异常
+        // 直接杀进程（表现就是"闪退"）。这里兜住并给出可读原因。
+        try {
+            // Android 12+ 对前台服务启动有严格限制，Android 14 对
+        // foregroundServiceType 也有要求；任何一项不满足都会抛异常
+        // 直接杀进程（表现就是"闪退"）。这里兜住并给出可读原因。
+        try {
+            startForegroundNotification();
+        } catch (Throwable t) {
+            android.util.Log.e("AudioHubReceiver", "startForeground 失败: "
+                    + android.util.Log.getStackTraceString(t));
+            sStatus = "无法启动前台服务: " + t.getClass().getSimpleName();
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+        } catch (Throwable t) {
+            android.util.Log.e("AudioHubReceiver", "startForeground 失败: "
+                    + android.util.Log.getStackTraceString(t));
+            sStatus = "无法启动前台服务: " + t.getClass().getSimpleName();
+            stopSelf();
+            return START_NOT_STICKY;
+        }
 
         port = intent.getIntExtra(EXTRA_PORT, 47000);
 

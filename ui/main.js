@@ -20,6 +20,7 @@ if (typeof electronModule === 'string') {
 const { app, BrowserWindow, ipcMain } = electronModule
 const path = require('path')
 const { spawn } = require('child_process')
+const os = require('os')
 const http = require('http')
 
 const DATA_PORT = 47000   // 音频 UDP 口，手机上填的就是它
@@ -61,7 +62,7 @@ function startPcSource (ip, port) {
   pcSourceProcess = spawn(exe, [
     '--hub', ip + ':' + port,
     '--handshake',
-    '--device-name', 'PC 音源',
+    '--device-name', os.hostname(),
     '--stream-id', '1'
   ], { windowsHide: true, stdio: 'ignore' })
   pcSourceProcess.on('exit', () => { pcSourceProcess = null })
@@ -90,6 +91,7 @@ ipcMain.handle('hub:setRole', async (_e, arg) => {
 function startHub () {
   const exe = hubExePath()
   hubProcess = spawn(exe, [
+    '--name', os.hostname(),
     '--port', String(DATA_PORT),
     '--http-port', String(HTTP_PORT),
     '--latency', String(LATENCY_MS)

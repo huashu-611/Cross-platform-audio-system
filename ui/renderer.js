@@ -204,8 +204,28 @@ window.addEventListener('pointerup', () => { volDragging = false })
 // 汇聚端选择器：连接建立后才显示（方案 7.3）
 function renderHubSelect (state) {
   const sel = $('hubSelect')
-  const peers = state.peers || []
-  const sig = JSON.stringify(peers.map((p) => p.name + '@' + p.ip + ':' + p.audioPort)) +
+  // 候选 = 本机 + 已连接设备 + 发现的设备
+  //
+  // 只列 peers 是不够的：手机端不广播信标（省电），
+  // 所以 PC 的 peers 里往往没有手机——但手机明明已经连上了。
+  // 已连接设备从 sources 取，一定在。
+  const candidates = []
+  const seen = new Set()
+  for (const s of (state.sources || [])) {
+    if (!s.peerIp) continue
+    const key = s.peerIp + ':' + state.audioPort
+    if (seen.has(key)) continue
+    seen.add(key)
+    candidates.push({ name: s.peerName || ('设备 ' + s.id), ip: s.peerIp, port: 47000 })
+  }
+  for (const p of (state.peers || [])) {
+    const key = p.ip + ':' + p.audioPort
+    if (seen.has(key)) continue
+    seen.add(key)
+    candidates.push({ name: p.name, ip: p.ip, port: p.audioPort })
+  }
+
+  const sig = JSON.stringify(candidates.map((p) => p.name + '@' + p.ip + ':' + p.port)) +
               '|' + hubSelf + '|' + hubLabel
   if (sig === hubSelectSig) return
   hubSelectSig = sig
@@ -216,9 +236,9 @@ function renderHubSelect (state) {
   optSelf.value = 'self'
   optSelf.textContent = '本机（电脑）'
   sel.appendChild(optSelf)
-  for (const p of peers) {
+  for (const p of candidates) {
     const o = document.createElement('option')
-    o.value = p.ip + ':' + p.audioPort
+    o.value = p.ip + ':' + p.port
     o.textContent = p.name + '（' + p.ip + '）'
     sel.appendChild(o)
   }

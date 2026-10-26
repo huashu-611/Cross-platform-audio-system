@@ -92,6 +92,25 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        // 兜底：任何未捕获异常都写进 logcat，并把堆栈落盘一份。
+        // 用户报"闪退"时，没有堆栈就完全没法查。
+        final Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
+            @Override
+            public void uncaughtException(Thread t, Throwable e) {
+                try {
+                    final String text = android.util.Log.getStackTraceString(e);
+                    android.util.Log.e("AudioHub", "未捕获异常 @ " + t.getName() + ": " + text);
+                    java.io.FileOutputStream fos = openFileOutput("crash.txt", MODE_PRIVATE);
+                    fos.write((t.getName() + "\n" + text).getBytes("UTF-8"));
+                    fos.close();
+                } catch (Throwable ignored) {
+                }
+                if (prev != null) prev.uncaughtException(t, e);
+            }
+        });
+
         setContentView(buildUi());
 
         SharedPreferences prefs = getSharedPreferences("audiohub", MODE_PRIVATE);
@@ -102,7 +121,13 @@ public class MainActivity extends Activity {
         poller.post(new Runnable() {
             @Override
             public void run() {
-                refresh();
+                // Handler 里的 Runnable 抛异常 = 主线程崩溃 = 闪退。
+                // 刷新只是投影状态，绝不能因为它把整个进程带走。
+                try {
+                    refresh();
+                } catch (Throwable t) {
+                    android.util.Log.e("AudioHub", "refresh 异常: " + android.util.Log.getStackTraceString(t));
+                }
                 poller.postDelayed(this, 400);
             }
         });
@@ -512,12 +537,23 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    private void safeStartForegroundService(Intent intent) {
+        try {
+            startForegroundService(intent);
+        } catch (Throwable t) {
+            android.util.Log.e("AudioHub", "启动服务失败: "
+                    + android.util.Log.getStackTraceString(t));
+            Toast.makeText(this, "启动接收服务失败：" + t.getClass().getSimpleName(),
+                    Toast.LENGTH_LONG).show();
+        }
+    }
+
     private void setLocalHub() {
         hubIp = null;
         hubName = null;
         saveHub();
         stopSource();
-        startForegroundService(new Intent(this, ReceiverService.class)
+        safeStartForegroundService(new Intent(this, ReceiverService.class)
                 .setAction(ReceiverService.ACTION_START)
                 .putExtra(ReceiverService.EXTRA_PORT, 47000));
         refresh();
@@ -815,7 +851,16 @@ public class MainActivity extends Activity {
     }
 
     /** 待确认请求：连接界面和控制界面各渲染一份。 */
+    private String pendingSig = "";
+
     private void renderPending(LinearLayout container, List<InviteListener.Pending> pending) {
+        final StringBuilder sig = new StringBuilder();
+        for (InviteListener.Pending p : pending) {
+            sig.append(p.streamId).append(':').append(p.name).append(';');
+        }
+        if (sig.toString().equals(pendingSig)) return;
+        pendingSig = sig.toString();
+
         container.removeAllViews();
         if (pending.isEmpty()) return;
         for (final InviteListener.Pending p : pending) {
@@ -832,7 +877,22 @@ public class MainActivity extends Activity {
             Button ok = textButton("同意", COLOR_ACCENT);
             ok.setOnClickListener(new View.OnClickListener() {
                 @Override
-                public void onClick(View v) { InviteListener.accept(p.streamId); }
+                public void onClick(View v) {
+                    InviteListener.accept(p.streamId);
+                    // 同意"把声音送到本机"就意味着本机要当汇聚端 ——
+                    // 不启动接收服务的话，对方发过来的流没人收，等于白同意。
+                    if (!ReceiverService.sRunning) {
+                        hubIp = null;
+                        hubName = null;
+                        saveHub();
+                        safeStartForegroundService(new Intent(MainActivity.this,
+                                ReceiverService.class)
+                                .setAction(ReceiverService.ACTION_START)
+                                .putExtra(ReceiverService.EXTRA_PORT, 47000));
+                    }
+                    pendingSig = "";
+                    refresh();
+                }
             });
             Button no = textButton("拒绝", COLOR_WARN);
             no.setOnClickListener(new View.OnClickListener() {

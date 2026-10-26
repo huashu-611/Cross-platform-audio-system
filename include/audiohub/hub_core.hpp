@@ -33,6 +33,7 @@ struct SourceInfo {
   uint64_t overflow_packets = 0;
   bool confirmed = true;      // false = 握手还没通过，混音时按静音处理
   std::string peer_name;      // 发现协议拿到的设备名，比"流 1"可读
+  std::string peer_ip;        // 对端地址：界面切汇聚端时要用它
 };
 
 struct HubStats {

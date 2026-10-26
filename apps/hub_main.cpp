@@ -221,6 +221,7 @@ int main(int argc, char** argv) {
                              << ",\"muted\":" << (s.muted ? "true" : "false")
                              << ",\"confirmed\":" << (s.confirmed ? "true" : "false")
                              << ",\"peerName\":\"" << audiohub::JsonEscape(s.peer_name) << "\""
+                             << ",\"peerIp\":\"" << audiohub::JsonEscape(s.peer_ip) << "\""
                              << ",\"occupancy\":" << s.occupancy_ms
                              << ",\"packets\":" << s.packets
                              << ",\"underrun\":" << s.underrun_frames
