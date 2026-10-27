@@ -272,3 +272,63 @@ TEST(SpatialDefaultLayoutStable) {
     CHECK_NEAR(a.y, 0.0f, 1e-6f);
   }
 }
+
+TEST(SpatialDelayRampHasNoBlockJumps) {
+  // 拖动节点时 ITD 每块都在变。如果只在块边界改延时，读指针会每 5~10 ms 被拽 1~2
+  // 个样点，宽带/高频内容上就是"嘶啦"的电流声；逐样本铺开后读指针才是连续的。
+  //
+  // 判据：正弦的"接缝残差" r[n] = y[n] - 2*y[n-1] + y[n-2]。
+  //   慢速正弦的块内残差恒为 A*(2πf/fs)^2 量级；延时在块边界跳 2 帧会把它抬高一个量级。
+  // 信号频率故意取 503 Hz（与 480 帧块长不整除），让块边界的正弦相位扫遍全周，避免
+  // 撞在零交叉上把台阶掩蔽掉——第一版用 9 kHz（每块恰好 90 周）和 ±90° 甩动都栽在这。
+  const int kFrames = 480;
+  const float kAmp = 0.3f;
+  const float kFreq = 503.0f;
+  const double two_pi = 6.28318530717958647692;
+  std::vector<float> buf(static_cast<size_t>(kFrames) * 2);
+  SpatialState st;
+  st.Reset(48000.0f);
+  SpatialParams params;
+  const ListenerPose listener = DefaultListener();
+  for (int k = 0; k < 40; ++k) {  // 先让增益/延时平滑量收敛
+    for (float& v : buf) v = 0.0f;
+    st.Process(buf.data(), kFrames, listener, params, 1.0f);
+  }
+
+  // 匀速拖动：每块转 0.75°，延时以 2 帧/块的恒定速度滑动（最坏情况），不会来回抖动。
+  const int kBlocks = 240;
+  float prev[2] = {0.0f, 0.0f};       // y[n-1]
+  float prev2[2] = {0.0f, 0.0f};      // y[n-2]
+  int have = 0;
+  float max_boundary = 0.0f, max_interior = 0.0f;
+  long long n = 0;
+  for (int k = 0; k < kBlocks; ++k) {
+    const float deg = -90.0f + 180.0f * static_cast<float>(k) / static_cast<float>(kBlocks - 1);
+    const float rad = deg * kPi / 180.0f;
+    st.SetTargetPosition(Vec3{std::sin(rad), 0.0f, -std::cos(rad)});
+    for (int i = 0; i < kFrames; ++i) {
+      const float v = kAmp * static_cast<float>(std::sin(two_pi * kFreq * (static_cast<double>(n) / 48000.0)));
+      buf[2 * i] = buf[2 * i + 1] = v;
+      ++n;
+    }
+    st.Process(buf.data(), kFrames, listener, params, 1.0f);
+    for (int i = 0; i < kFrames; ++i) {
+      for (int c = 0; c < 2; ++c) {
+        const float y = buf[2 * i + c];
+        if (have >= 2) {
+          const float r = std::fabs(y - 2.0f * prev[c] + prev2[c]);
+          // 块首两个样本的残差都跨接缝，都算 boundary。
+          float& bucket = (i < 2) ? max_boundary : max_interior;
+          bucket = std::max(bucket, r);
+        }
+        prev2[c] = prev[c];
+        prev[c] = y;
+      }
+      if (have < 2) ++have;
+    }
+  }
+  // 平滑极限：A*(2πf/fs)^2*增益 ≈ 0.3*0.00434*1.4 ≈ 0.0018。
+  // 块常量延时的旧实现实测 0.032（18 倍），逐样本铺开后 0.0018。
+  CHECK_TRUE(max_interior > 0.001f);                 // 有信号、判据有效
+  CHECK_TRUE(max_boundary < 0.01f);                  // 旧实现 0.032 -> 红
+}

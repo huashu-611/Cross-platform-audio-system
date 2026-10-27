@@ -179,17 +179,24 @@ void SpatialState::Process(float* interleaved, int frames, const ListenerPose& l
   // ---- 逐样本：写历史 -> 双耳分数延时读取 -> 后向闷化(干湿混合) -> 等功率/距离增益
   const float alpha = 1.0f - std::exp(-2.0f * kPi * cutoff_hz / sample_rate_);
   const bool ramp = frames > 1;
+  // 延时也要逐样本铺开：只在块边界改延时，等于每 5~10 ms 给读指针一个台阶，
+  // 宽带信号上听起来就是"嘶啦"的电流声（拖动节点时 ITD 每块都在变，尤其明显）。
+  // 把上一块结束时的延时到本块目标延时在块内做线性插值，读指针才是连续的。
+  const float dl_start = delay_l_;
+  const float dr_start = delay_r_;
+  const float dl_span = dl - dl_start;
+  const float dr_span = dr - dr_start;
   for (int i = 0; i < frames; ++i) {
     hist_[0][hist_pos_] = 0.5f * (interleaved[2 * i] + interleaved[2 * i + 1]);
     hist_pos_ = (hist_pos_ + 1) % kSpatialHistoryFrames;
 
-    const float l = ReadHistory(dl);
-    const float r = ReadHistory(dr);
+    const float t = ramp ? static_cast<float>(i) / static_cast<float>(frames - 1) : 1.0f;
+    const float l = ReadHistory(dl_start + dl_span * t);
+    const float r = ReadHistory(dr_start + dr_span * t);
     const float mid = 0.5f * (l + r);
     lp_ += alpha * (mid - lp_);
     // 干湿混合：前方全频；正后方只剩 4 kHz 以下（一阶），两条线索叠加才够"听到身后"。
     const float dull = sm_rear_ * (lp_ - mid);
-    const float t = ramp ? static_cast<float>(i) / static_cast<float>(frames - 1) : 1.0f;
     const float gl = gain_l_ + (target_l - gain_l_) * t;
     const float gr = gain_r_ + (target_r - gain_r_) * t;
     interleaved[2 * i] = (l + dull) * gl;

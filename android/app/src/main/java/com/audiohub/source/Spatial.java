@@ -510,17 +510,24 @@ public final class Spatial {
             final float alpha = 1.0f
                     - (float) Math.exp(-2.0f * kPi * cutoffHz / sampleRate);
             final boolean ramp = frames > 1;
+            // 延时也要逐样本铺开：只在块边界改延时，等于每 5 ms 给读指针一个台阶，
+            // 宽带/高频信号上听起来就是"嘶啦"的电流声（拖动节点时 ITD 每块都在变，尤其明显）。
+            // 把上一块结束时的延时到本块目标延时在块内做线性插值，读指针才是连续的。
+            final float dlStart = delayL;
+            final float drStart = delayR;
+            final float dlSpan = dl - dlStart;
+            final float drSpan = dr - drStart;
             for (int i = 0; i < frames; ++i) {
                 hist[0][histPos] = 0.5f * (interleaved[2 * i] + interleaved[2 * i + 1]);
                 histPos = (histPos + 1) % kSpatialHistoryFrames;
 
-                final float l = readHistory(dl);
-                final float r = readHistory(dr);
+                final float t = ramp ? (float) i / (float) (frames - 1) : 1.0f;
+                final float l = readHistory(dlStart + dlSpan * t);
+                final float r = readHistory(drStart + drSpan * t);
                 final float mid = 0.5f * (l + r);
                 lp += alpha * (mid - lp);
                 // 干湿混合：前方全频；正后方只剩 4 kHz 以下（一阶），两条线索叠加才够"听到身后"。
                 final float dull = smRear * (lp - mid);
-                final float t = ramp ? (float) i / (float) (frames - 1) : 1.0f;
                 final float gl = gainL + (targetL - gainL) * t;
                 final float gr = gainR + (targetR - gainR) * t;
                 interleaved[2 * i] = (l + dull) * gl;

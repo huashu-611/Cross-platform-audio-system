@@ -40,6 +40,7 @@ public final class SpatialCheck {
         smoothingTimeConstantIs50ms();
         itdSlewBoundedPerBlock();
         processFiniteAndBounded();
+        delayRampHasNoBlockJumps();
         framesEdgeCases();
         resetClearsState();
         defaultLayoutStable();
@@ -611,5 +612,76 @@ public final class SpatialCheck {
             near("y=0 (" + ids[i] + ")", a.y, 0.0f, 1e-6f);
         }
         end("SpatialDefaultLayoutStable", f);
+    }
+
+    // ------------------------------------------------ 19. 延时逐样本过渡（C++ SpatialDelayRampHasNoBlockJumps）
+
+    /**
+     * 拖动节点时 ITD 每块都在变。如果只在块边界改延时，读指针会每 5~10 ms 被拽 1~2
+     * 个样点，宽带/高频内容上就是"嘶啦"的电流声（用户报的问题）；逐样本铺开后读指针才是连续的。
+     *
+     * 判据：正弦的"接缝残差" r[n] = y[n] - 2*y[n-1] + y[n-2]。
+     *   慢速正弦的块内残差恒为 A*(2πf/fs)^2 量级；延时在块边界跳 2 帧会把它抬高一个量级。
+     * 信号频率故意取 503 Hz（与 480 帧块长不整除），让块边界的正弦相位扫遍全周，避免
+     * 撞在零交叉上把台阶掩蔽掉——第一版用 9 kHz（每块恰好 90 周）和 ±90° 甩动都栽在这。
+     * 与 tests/test_spatial.cpp 的 SpatialDelayRampHasNoBlockJumps 同构（同参数/同判据）。
+     */
+    private static void delayRampHasNoBlockJumps() {
+        final int f = begin("SpatialDelayRampHasNoBlockJumps");
+        final int frames = 480;
+        final float amp = 0.3f;
+        final float freq = 503.0f;
+        final double twoPi = 6.28318530717958647692;
+        final float[] buf = new float[frames * 2];
+        final Spatial.SpatialState st = newState();
+        final Spatial.SpatialParams params = new Spatial.SpatialParams();
+        final Spatial.ListenerPose listener = Spatial.defaultListener();
+        for (int k = 0; k < 40; ++k) {   // 与 C++ 一致：先跑 40 块（当前无目标，process 直通）
+            zeros(buf);
+            st.process(buf, frames, listener, params, 1.0f);
+        }
+
+        // 匀速拖动：half-circle 240 块、每块 0.75°，延时以 2 帧/块的恒定速度滑动（最坏情况）。
+        final int blocks = 240;
+        final float[] prev = new float[2];    // y[n-1]
+        final float[] prev2 = new float[2];   // y[n-2]
+        int have = 0;
+        float maxBoundary = 0.0f;
+        float maxInterior = 0.0f;
+        long n = 0;
+        for (int k = 0; k < blocks; ++k) {
+            final float deg = -90.0f + 180.0f * (float) k / (float) (blocks - 1);
+            final float rad = deg * Spatial.kDegToRad;
+            st.setTargetPosition(new Spatial.Vec3((float) Math.sin(rad), 0.0f, -(float) Math.cos(rad)));
+            for (int i = 0; i < frames; ++i) {
+                final float v = amp * (float) Math.sin(twoPi * freq * ((double) n / 48000.0));
+                buf[2 * i] = v;
+                buf[2 * i + 1] = v;
+                ++n;
+            }
+            st.process(buf, frames, listener, params, 1.0f);
+            for (int i = 0; i < frames; ++i) {
+                for (int c = 0; c < 2; ++c) {
+                    final float y = buf[2 * i + c];
+                    if (have >= 2) {
+                        final float r = Math.abs(y - 2.0f * prev[c] + prev2[c]);
+                        // 块首两个样本的残差都跨接缝，都算 boundary。
+                        if (i < 2) {
+                            maxBoundary = Math.max(maxBoundary, r);
+                        } else {
+                            maxInterior = Math.max(maxInterior, r);
+                        }
+                    }
+                    prev2[c] = prev[c];
+                    prev[c] = y;
+                }
+                if (have < 2) ++have;
+            }
+        }
+        System.out.println("      （接缝残差 max_boundary=" + maxBoundary
+                + "  max_interior=" + maxInterior + "；块常量延时旧实现约 0.032）");
+        check("判据有信号 max_interior>0.001", maxInterior > 0.001f);   // 守卫：判据本身有效
+        check("接缝残差 max_boundary=" + maxBoundary + " (<0.01)", maxBoundary < 0.01f);
+        end("SpatialDelayRampHasNoBlockJumps", f);
     }
 }
