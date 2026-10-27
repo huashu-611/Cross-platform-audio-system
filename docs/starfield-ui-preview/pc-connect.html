@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>AudioHub · 星空主题预览（PC 连接界面）</title>
+<link rel="stylesheet" href="shared.css">
+<style>
+  /* 预览页局部：只做排版微调，不引入新功能 */
+  .connect-body { overflow: hidden; }
+  .grid { grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
+  .peer-orb-wrap { flex: 0 0 auto; display: grid; place-items: center; }
+  .subnote { font-size: 11px; color: var(--faint); letter-spacing: .03em; margin-top: 5px; }
+  .connectspacer { flex: 1 1 auto; min-height: 8px; }
+  .deco { flex: 0 0 auto; display: flex; flex-direction: column; align-items: center;
+    gap: 9px; padding: 2px 0 4px; }
+  .deco svg { opacity: .42; }
+  .statline { padding-top: 8px; border-top: 1px solid var(--line-faint); }
+</style>
+</head>
+<body>
+<canvas id="sky" data-seed="7"></canvas>
+<div class="veil"></div>
+
+<div class="pc">
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>AudioHub <span>连接设备</span></h1>
+        <div class="sub">把多台设备的声音汇到一处 · 同一 Wi-Fi 下自动发现</div>
+      </div>
+      <div class="hdr-right">
+        <div class="addr">
+          <div>
+            <div class="k">本机地址 · 供手机填写</div>
+            <div class="v tabnum">192.168.1.23:47000</div>
+          </div>
+          <button class="chipbtn">复制</button>
+        </div>
+      </div>
+    </header>
+
+    <div class="banner ok"><span class="bicon">✦</span>已邀请 书房PC，等待对方确认…</div>
+
+    <div class="connect-body">
+      <div class="sect">待确认接入 · 1</div>
+      <div class="req">
+        <div>
+          <div class="who">小米 14</div>
+          <div class="ip">192.168.1.44</div>
+        </div>
+        <div class="ask">请求把声音送到这里 · 同意后它将成为一颗新的行星</div>
+        <button class="btn primary">同意</button>
+        <button class="btn ghost">拒绝</button>
+      </div>
+
+      <div class="sectrow" style="margin-top:15px">
+        <div class="sect">发现的设备 · 2</div>
+        <button class="scanbtn">重新扫描</button>
+      </div>
+      <div class="hint ok" style="margin:8px 0 9px">扫描完成，发现 2 台设备</div>
+
+      <div class="grid">
+        <div class="peer-card">
+          <div class="peer-orb-wrap"><div class="orb"></div></div>
+          <div class="peer-main">
+            <div class="peer-top">
+              <div class="peer-name">小米 14</div>
+              <div class="peer-role">音源</div>
+            </div>
+            <div class="peer-ip">192.168.1.44</div>
+          </div>
+          <button class="btn">邀请它</button>
+        </div>
+
+        <div class="peer-card">
+          <div class="peer-orb-wrap"><div class="orb violet"></div></div>
+          <div class="peer-main">
+            <div class="peer-top">
+              <div class="peer-name">书房PC</div>
+              <div class="peer-role">音源 / 汇聚</div>
+            </div>
+            <div class="peer-ip">192.168.1.51 · 已邀请</div>
+          </div>
+          <button class="btn ghost">已邀请</button>
+        </div>
+      </div>
+
+      <div class="sect" style="margin-top:16px">按 IP 直接邀请</div>
+      <div class="manual-card glass">
+        <input class="ipinput" value="192.168.1.44:47000" spellcheck="false">
+        <button class="btn primary">邀请</button>
+      </div>
+      <div class="subnote">对方需在同一网络内；端口与上方本机地址一致。</div>
+
+      <div class="connectspacer"></div>
+      <div class="deco">
+        <svg width="214" height="54" viewBox="0 0 214 54" fill="none">
+          <g stroke="#9fc4ff" stroke-opacity=".5" stroke-width="1">
+            <path d="M26 38 L62 18 L98 33 L134 12 L170 28 L196 20"/>
+          </g>
+          <g fill="#dfeaff">
+            <circle cx="26" cy="38" r="1.8"/><circle cx="62" cy="18" r="2.3"/><circle cx="98" cy="33" r="1.5"/>
+            <circle cx="134" cy="12" r="2"/><circle cx="170" cy="28" r="1.6"/><circle cx="196" cy="20" r="1.4"/>
+          </g>
+          <g fill="#ffd27a">
+            <circle cx="134" cy="12" r="6.5" fill-opacity=".14"/>
+            <circle cx="134" cy="12" r="1.4"/>
+          </g>
+        </svg>
+        <div class="hint" style="color:var(--faint);text-align:center">连接后：汇聚端会亮成恒星，设备成为它周围静止的行星</div>
+      </div>
+      <div class="connectspacer"></div>
+
+      <div class="statline">
+        <div class="stats">
+          <span>设备 <b>1</b> 台</span>
+          <span>已确认 <b>0</b></span>
+          <span>待确认 <b>1</b></span>
+          <span>总线 <b>静音</b></span>
+          <span>码率 <b>0 kbps</b></span>
+          <span>坏包 <b>0</b></span>
+          <span>渲染欠载 <b>0</b></span>
+          <span class="glow">阶段 <b>等待连接</b></span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="starfield.js"></script>
+</body>
+</html>

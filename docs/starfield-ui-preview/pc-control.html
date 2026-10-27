@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>AudioHub · 星空主题预览（PC 控制界面）</title>
+<link rel="stylesheet" href="shared.css">
+<style>
+  /* 预览页局部 */
+  .pc .wrap { gap: 9px; }
+  .devsrow .plus { font-size: 15px; line-height: 1; }
+  .statline { padding-top: 2px; }
+</style>
+</head>
+<body>
+<canvas id="sky" data-seed="7"></canvas>
+<div class="veil"></div>
+
+<div class="pc">
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>AudioHub <span>连接设备</span></h1>
+        <div class="sub">把多台设备的声音汇到一处 · 同一 Wi-Fi 下自动发现</div>
+      </div>
+      <div class="hdr-right">
+        <div class="addr">
+          <div>
+            <div class="k">本机地址 · 供手机填写</div>
+            <div class="v tabnum">192.168.1.23:47000</div>
+          </div>
+          <button class="chipbtn">复制</button>
+        </div>
+        <button class="leavebtn">全部断开</button>
+      </div>
+    </header>
+
+    <div class="banner ok"><span class="bicon">✦</span>书房手机 已接入 · 图谱已同步（v7）</div>
+
+    <!-- ================= 星图 ================= -->
+    <div class="graphwrap">
+      <canvas id="graph"></canvas>
+
+      <div class="legend">
+        <i><span class="star-dot">✦</span>恒星 · 汇聚端</i>
+        <i><span class="planet-dot">●</span>行星 · 设备</i>
+        <i><span class="beam-dot">━</span>音频流</i>
+        <i><span class="off-dot">┈</span>离线</i>
+      </div>
+      <div class="graph-hint">左键拖动摆位（距离即音量） · 空白拖动旋转视角 · 滚轮缩放 · 右键星球菜单</div>
+
+      <div class="ctxmenu" id="ctxmenu">
+        <div class="ctxtitle">书房手机 · 192.168.1.44</div>
+        <button>切换汇聚端到此设备<span class="h">本机将负责收流 / 混音 / 播放</span></button>
+        <button>位置复位<span class="h">回到自动排位（全网同步）</span></button>
+      </div>
+    </div>
+
+    <div class="graphstatus"><span class="spark">✦</span>已同步（v7） · 5 台设备 · 位置与音量已广播到全网</div>
+
+    <!-- ================= 汇聚端信息条 ================= -->
+    <div class="hubbar glass">
+      <div>
+        <div class="hublabel">当前汇聚端</div>
+        <div class="hubnow">客厅PC<span class="tag">本机</span></div>
+      </div>
+      <div class="hubnote">本机承担收流 / 混音 / 播放 · 其余设备把声音送到恒星</div>
+      <label class="autochk"><span class="cb">✓</span>自动同意新设备</label>
+    </div>
+
+    <!-- ================= 新设备 ================= -->
+    <div class="devsrow">
+      <div class="sect">新设备</div>
+      <button class="scanbtn"><span class="plus">＋</span> 添加设备</button>
+    </div>
+
+    <div class="statline">
+      <div class="stats">
+        <span>设备 <b>5</b> 台</span>
+        <span>图谱 <b>v7</b></span>
+        <span class="glow">总线 <b>−9.2 dBFS</b></span>
+        <span>码率 <b>3,152 kbps</b></span>
+        <span>坏包 <b>0</b></span>
+        <span>渲染欠载 <b>0</b></span>
+        <span>流欠载 <b>60 帧</b></span>
+        <span>迟到溢出 <b>0</b></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="starfield.js"></script>
+<script>
+  (function () {
+    var canvas = document.getElementById('graph')
+    var menu = document.getElementById('ctxmenu')
+    var wrap = canvas.parentElement
+    var raf = 0
+
+    function draw () {
+      var res = StarUI.drawPcGraph(canvas, {
+        seed: 13,
+        phi: 0, pitch: 40, dist: 3.4,
+        hub: { name: '客厅PC', level: -9.2, badge: '本机 · 汇聚端' },
+        nodes: [
+          { id: 'a', name: '书房手机', x: -1.6, z: -1.5, level: -12.4, palette: 'cyan', streaming: true },
+          { id: 'b', name: '卧室平板', x: 1.15, z: -1.1, level: -18.2, palette: 'violet', streaming: true },
+          { id: 'c', name: '备用手机', x: -0.55, z: 1.15, level: null, online: false, palette: 'ice', rings: true, badge: '离线' },
+          { id: 'd', name: '小米平板', x: 0.9, z: 1.2, level: -26.8, palette: 'rose', streaming: true }
+        ]
+      })
+
+      // 右键菜单贴近「书房手机」，并夹在图内
+      var target = null
+      for (var i = 0; i < res.nodes.length; i++) if (res.nodes[i].id === 'a') target = res.nodes[i]
+      if (!target) return
+      var mw = menu.offsetWidth || 232
+      var mh = menu.offsetHeight || 122
+      // 优先摆在星球左侧（左侧是空的天区，不遮住中心的恒星）
+      var left = target.sx - target.rPx - 16 - mw
+      if (left < 10) left = target.sx + target.rPx + 16
+      left = Math.max(10, Math.min(left, wrap.clientWidth - mw - 10))
+      var top = target.sy - 22
+      top = Math.max(10, Math.min(top, wrap.clientHeight - mh - 10))
+      menu.style.left = Math.round(left) + 'px'
+      menu.style.top = Math.round(top) + 'px'
+    }
+
+    function redraw () { cancelAnimationFrame(raf); raf = requestAnimationFrame(draw) }
+    window.addEventListener('load', draw)
+    window.addEventListener('resize', redraw)
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(redraw)
+  })()
+</script>
+</body>
+</html>

@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>AudioHub · 星空主题预览（Android 连接界面）</title>
+<link rel="stylesheet" href="shared.css">
+<style>
+  /* 预览页局部：手机屏幕内星野 + 少量排版微调 */
+  .phone .screen #phsky {
+    position: absolute; inset: 0; z-index: 0;
+    display: block; width: 100%; height: 100%; pointer-events: none;
+  }
+  .phone .screen .veil2 {
+    position: absolute; inset: 0; z-index: 1; pointer-events: none;
+    background:
+      radial-gradient(420px 640px at 50% 40%, transparent 40%, rgba(2, 4, 11, .5) 100%),
+      linear-gradient(180deg, rgba(3, 5, 12, .28), transparent 22%, transparent 78%, rgba(2, 3, 9, .42));
+  }
+  .connectspacer { flex: 1 1 auto; min-height: 6px; }
+  .deco {
+    flex: 0 0 auto; display: flex; flex-direction: column; align-items: center;
+    gap: 7px; padding: 2px 0 8px; text-align: center;
+  }
+  .deco svg { opacity: .5; }
+  .deco .ahint { max-width: 300px; text-align: center; }
+</style>
+</head>
+<body>
+<canvas id="sky" data-seed="21"></canvas>
+<div class="veil"></div>
+
+<div class="phonepage">
+  <div class="phone">
+    <div class="punch"></div>
+    <div class="screen">
+      <canvas id="phsky" data-seed="21"></canvas>
+      <div class="veil2"></div>
+
+      <div class="statusbar">
+        <span>21:48</span>
+        <span class="sicons">
+          <svg width="14" height="10" viewBox="0 0 14 10" fill="none" stroke="#cfe0ff" stroke-width="1.3" stroke-linecap="round">
+            <path d="M1 3.4a9 9 0 0 1 12 0"/><path d="M3.2 5.6a6 6 0 0 1 7.6 0"/><path d="M5.5 7.8a2.8 2.8 0 0 1 3 0"/>
+            <circle cx="7" cy="9" r=".7" fill="#cfe0ff" stroke="none"/>
+          </svg>
+          <svg width="19" height="10" viewBox="0 0 19 10">
+            <rect x=".6" y=".6" width="15" height="8.8" rx="2.4" fill="none" stroke="#cfe0ff" stroke-opacity=".72"/>
+            <rect x="2.2" y="2.2" width="10.6" height="5.6" rx="1.2" fill="#cfe0ff" fill-opacity=".82"/>
+            <path d="M17 .9v8.2" stroke="#cfe0ff" stroke-opacity=".55" stroke-width="1.6" stroke-linecap="round"/>
+          </svg>
+        </span>
+      </div>
+
+      <div class="app">
+        <div class="ahead">
+          <div class="atitle">AudioHub</div>
+          <div class="asub">多台设备的声音，汇到一处</div>
+          <div class="atag">星图 · <b>v1.7-bye</b> · 本机 192.168.1.77</div>
+        </div>
+
+        <div class="pendingrow">
+          <span class="pdot"></span>1 个连接请求待处理
+          <span class="chev">›</span>
+        </div>
+
+        <div class="ahint">先建立连接，再在控制界面里指定谁当汇聚端</div>
+
+        <div class="acard">
+          <div class="amain">
+            <div class="atitle2">本机声音</div>
+            <div class="asub2">未发送 · 接入后可把本机的声音送进汇聚端</div>
+          </div>
+          <button class="abtn primary">送入</button>
+        </div>
+
+        <div class="asect">附近设备</div>
+        <div class="acard">
+          <div class="amain">
+            <div class="atitle2">设备列表</div>
+            <div class="asub2">已连接 0 · 已发现 2</div>
+          </div>
+          <button class="alink">扫描</button>
+          <button class="alink">手动添加</button>
+          <button class="abtn">设备列表</button>
+        </div>
+        <div class="ahint ok">已发现 2 台设备</div>
+        <div class="ahint dim">客厅PC · 书房手机 等 2 台，点「设备列表」连接</div>
+
+        <div class="connectspacer"></div>
+
+        <div class="deco">
+          <svg width="168" height="46" viewBox="0 0 168 46" fill="none">
+            <g stroke="#9fc4ff" stroke-opacity=".45" stroke-width="1">
+              <path d="M20 32 L48 16 L76 28 L104 10 L132 24"/>
+            </g>
+            <g fill="#dfeaff">
+              <circle cx="20" cy="32" r="1.6"/><circle cx="48" cy="16" r="2.1"/><circle cx="76" cy="28" r="1.4"/>
+              <circle cx="104" cy="10" r="1.8"/><circle cx="132" cy="24" r="1.5"/>
+            </g>
+            <g fill="#ffd27a">
+              <circle cx="104" cy="10" r="3.4" fill-opacity=".18"/>
+              <circle cx="104" cy="10" r="1.2"/>
+            </g>
+          </svg>
+          <div class="ahint dim">连接后：汇聚端亮成恒星，设备成为它周围静止的行星</div>
+        </div>
+        <div class="connectspacer"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="starfield.js"></script>
+<script>
+  (function () {
+    var c = document.getElementById('phsky')
+    var raf = 0
+    function sky () { StarUI.paintSky(c, { seed: 21 }) }
+    function redraw () { cancelAnimationFrame(raf); raf = requestAnimationFrame(sky) }
+    window.addEventListener('load', sky)
+    window.addEventListener('resize', redraw)
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(redraw)
+  })()
+</script>
+</body>
+</html>

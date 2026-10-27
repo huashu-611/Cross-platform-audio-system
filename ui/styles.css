@@ -1,35 +1,49 @@
 /* ============================================================
-   AudioHub 汇聚端 — 设计方向：录音室仪表台
+   AudioHub 汇聚端 — 设计方向：深空观星台（v1.8 星空主题）
    ------------------------------------------------------------
-   定位：一边听歌一边盯着看的控制面板。所以：
-   - 数字要像硬件仪表一样稳（tabular-nums + 等宽数字字体）
-   - 电平条要有"硬件 VU 表"的分段感，而不是一条渐变横幅
-   - 中性色带一点蓝，避免和主色脱节的纯灰
-   - 待确认连接是"交通事件"，用内嵌警示条而不是再来一张同款卡片
+   语义：汇聚端 = 恒星（中心，暖金），设备 = 行星（静止，朝恒星受光），
+        音频流 = 恒星↔行星的光束，离线 = 灰暗 + 虚线。
+   为什么这么定（用户定案，2026-10-27）：
+   - 「不需要转动」= 行星不做公转/自转动画；但保留相机轨道旋转、滚轮缩放、
+     拖拽摆位（距离即音量）、右键菜单等全部既有功能；
+   - 整页星野只做背景（#sky，ui/starfield.js），不参与任何状态表达，不抢数据；
+   - 面板 = 玻璃 HUD：数据要像仪表一样稳（tabular-nums），信息层级不能因为"好看"变浅。
    动效全部 ease-out-expo（状态变化），不做弹跳。
    ============================================================ */
 
 :root {
-  /* ---- 颜色令牌（oklch，中性色偏向品牌蓝）---- */
-  --bg:        oklch(0.17 0.02 255);
-  --bg-2:      oklch(0.21 0.03 255);
-  --card:      oklch(0.24 0.025 255 / .55);
-  --line:      oklch(0.35 0.03 255 / .6);
-  --text:      oklch(0.94 0.01 255);
-  --dim:       oklch(0.68 0.02 255);
-  --faint:     oklch(0.52 0.02 255);
-  --accent:    oklch(0.62 0.17 255);
-  --accent-hi: oklch(0.72 0.15 255);
-  --accent-dim:oklch(0.62 0.17 255 / .16);
-  --warn:      oklch(0.80 0.15 85);
-  --bad:       oklch(0.66 0.19 25);
+  /* ---- 星空色板 ---- */
+  --bg-0: #04060f;
+  --bg-1: #070b19;
+  --bg-2: #0b1024;
+  --text: #eaf1ff;
+  --dim: #a3b3d1;
+  --faint: #6e7d9d;
+  --cyan: #6fe0ff;
+  --cyan-soft: #a9ecff;
+  --violet: #b7a4ff;
+  --gold: #ffd27a;
+  --rose: #ff9cc6;
+  --green: #7df0b3;
+  --warn: #ffd166;
+  --bad: #ff8a99;
+  /* scene3d.js 从这些名字读色（readTheme），改名要同步 */
+  --accent: #6fe0ff;
+  --accent-hi: #a9ecff;
+  --accent-dim: rgba(111, 224, 255, .12);
+
+  --glass: linear-gradient(165deg, rgba(24, 36, 70, .78), rgba(11, 18, 38, .72) 55%, rgba(15, 22, 46, .68));
+  --glass-soft: linear-gradient(165deg, rgba(20, 31, 60, .62), rgba(9, 15, 33, .56));
+  --line: rgba(126, 163, 255, .17);
+  --line-strong: rgba(140, 185, 255, .34);
+  --line-faint: rgba(126, 163, 255, .10);
 
   --ease: cubic-bezier(.19, 1, .22, 1);   /* ease-out-expo */
   --fast: .16s;
   --slow: .38s;
 
-  --radius: 14px;
-  --radius-s: 9px;
+  --radius: 16px;
+  --radius-s: 11px;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -41,10 +55,7 @@ html, body { height: 100%; }
 body {
   font-family: "Bahnschrift", "Segoe UI Variable", "Segoe UI", "PingFang SC",
                "Microsoft YaHei", sans-serif;
-  background:
-    radial-gradient(1200px 560px at 14% -10%, oklch(0.26 0.06 255) 0%, transparent 58%),
-    radial-gradient(920px 500px at 90% 2%,  oklch(0.24 0.05 235) 0%, transparent 60%),
-    var(--bg);
+  background: var(--bg-0);
   color: var(--text);
   height: 100vh;
   height: 100dvh;
@@ -55,7 +66,20 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* 整页星野：固定在最底层，窗口尺寸变化时重绘一次（renderer.js paintSkyLayer） */
+#sky {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  z-index: 0;
+  pointer-events: none;
+}
+
 .wrap {
+  position: relative;
+  z-index: 2;
   width: 100%;
   height: 100%;
   min-height: 0;
@@ -73,33 +97,36 @@ header {
 }
 h1 {
   font-size: clamp(20px, 2.2vw, 27px);
-  font-weight: 600; letter-spacing: .02em;
+  font-weight: 600; letter-spacing: .04em;
   text-transform: uppercase;
+  text-shadow: 0 0 26px rgba(120, 180, 255, .22);
 }
-h1 span { color: var(--accent-hi); font-weight: 300; }
-.sub { color: var(--dim); font-size: 12px; margin-top: 3px; letter-spacing: .04em; }
+h1 span { color: var(--cyan-soft); font-weight: 300; }
+.sub { color: var(--dim); font-size: 12px; margin-top: 4px; letter-spacing: .05em; }
 
 .addr {
   display: flex; align-items: center; gap: 10px;
-  background: var(--accent-dim);
-  border: 1px solid oklch(0.62 0.17 255 / .35);
+  background: rgba(16, 40, 66, .5);
+  border: 1px solid rgba(111, 224, 255, .26);
   border-radius: var(--radius-s); padding: 7px 10px 7px 12px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .06), 0 0 22px rgba(80, 190, 255, .07);
 }
 .addr .k {
-  font-size: 10px; color: var(--accent-hi);
-  letter-spacing: .14em; text-transform: uppercase;
+  font-size: 9.5px; color: var(--cyan-soft);
+  letter-spacing: .16em; text-transform: uppercase;
 }
 .addr .v {
   font-size: 15px; font-weight: 600;
-  font-variant-numeric: tabular-nums; letter-spacing: .02em;
+  font-variant-numeric: tabular-nums; letter-spacing: .03em;
+  margin-top: 1px;
 }
 .addr button {
-  background: transparent; color: var(--accent-hi);
-  border: 1px solid oklch(0.62 0.17 255 / .35); border-radius: 7px;
+  background: transparent; color: var(--cyan-soft);
+  border: 1px solid rgba(120, 195, 255, .3); border-radius: 8px;
   padding: 5px 11px; font-size: 11.5px; letter-spacing: .06em;
-  cursor: pointer; transition: background var(--fast) var(--ease), color var(--fast) var(--ease);
+  cursor: pointer; transition: background var(--fast) var(--ease), border-color var(--fast) var(--ease);
 }
-.addr button:hover { background: var(--accent-hi); color: oklch(0.18 0.03 255); }
+.addr button:hover { background: rgba(110, 220, 255, .16); border-color: rgba(150, 225, 255, .55); }
 
 /* ---------- 头部右侧：地址框 + 「全部断开」 ---------- */
 .hdr-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -107,26 +134,35 @@ h1 span { color: var(--accent-hi); font-weight: 300; }
 /* 断开全部是破坏性操作：常驻头部右侧的一颗小按钮，不占控制屏的一整行卡片；
    只在控制界面出现（connect 界面由 renderer.showScreen 隐藏）。 */
 .leavebtn {
-  background: transparent; color: var(--bad);
-  border: 1px solid oklch(0.66 0.19 25 / .4); border-radius: 7px;
+  background: rgba(255, 138, 153, .08); color: var(--bad);
+  border: 1px solid rgba(255, 138, 153, .34); border-radius: 8px;
   padding: 6px 12px; font-size: 11.5px; letter-spacing: .06em;
-  cursor: pointer; transition: background var(--fast) var(--ease), color var(--fast) var(--ease);
+  cursor: pointer; transition: background var(--fast) var(--ease);
 }
-.leavebtn:hover { background: var(--bad); color: oklch(0.16 0.02 25); }
+.leavebtn:hover { background: rgba(255, 138, 153, .18); }
 
-/* ---------- 警示条 ---------- */
+/* ---------- 警示条 / 通知 ---------- */
 .banner {
-  background: oklch(0.66 0.19 25 / .14);
-  border: 1px solid oklch(0.66 0.19 25 / .4);
-  color: oklch(0.82 0.1 25);
-  border-radius: var(--radius-s); padding: 11px 14px;
+  background: rgba(255, 138, 153, .1);
+  border: 1px solid rgba(255, 138, 153, .34);
+  border-left: 3px solid var(--bad);
+  color: #ffc4cc;
+  border-radius: var(--radius-s); padding: 10px 14px;
   font-size: 13px; margin-bottom: 16px;
+  flex: 0 0 auto; margin-bottom: 0;
+  backdrop-filter: blur(8px);
 }
 .banner.hidden { display: none; }
 
-/* ---------- 两个屏幕：都吃满 header 以下的剩余高度（不撑出页面滚动条） ---------- */
-.banner { flex: 0 0 auto; margin-bottom: 0; }
+/* 瞬时通知（新设备接入）走同一个横幅，只是换成绿色 */
+.banner.ok {
+  background: rgba(125, 240, 179, .1);
+  border-color: rgba(125, 240, 179, .34);
+  border-left-color: var(--green);
+  color: #b9f7d8;
+}
 
+/* ---------- 两个屏幕：都吃满 header 以下的剩余高度（不撑出页面滚动条） ---------- */
 #screenConnect {
   flex: 1 1 auto; min-height: 0;
   display: flex; flex-direction: column;
@@ -144,16 +180,20 @@ h1 span { color: var(--accent-hi); font-weight: 300; }
   color: var(--faint); margin: 14px 0 8px;
   display: flex; align-items: center; gap: 10px;
 }
-.sect::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+.sect::after {
+  content: ""; flex: 1; height: 1px;
+  background: linear-gradient(90deg, var(--line), transparent);
+}
 
 /* ---------- 待确认：内嵌警示条，不是卡片克隆 ---------- */
 .req {
   display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
-  background: oklch(0.80 0.15 85 / .1);
-  border: 1px solid oklch(0.80 0.15 85 / .38);
+  background: rgba(255, 209, 102, .09);
+  border: 1px solid rgba(255, 209, 102, .32);
   border-left: 3px solid var(--warn);
   border-radius: var(--radius-s); padding: 11px 14px;
   margin-bottom: 8px;
+  backdrop-filter: blur(8px);
   animation: slide-in var(--slow) var(--ease);
 }
 @keyframes slide-in { from { opacity: 0; transform: translateY(-6px); } }
@@ -161,43 +201,54 @@ h1 span { color: var(--accent-hi); font-weight: 300; }
 .req .ip { color: var(--dim); font-size: 12px; font-variant-numeric: tabular-nums; }
 .req .ask { color: var(--dim); font-size: 12px; flex: 1; min-width: 140px; }
 .req .btn { flex: 0 0 auto; padding: 7px 16px; }
-.req .ok  { background: oklch(0.62 0.17 255 / .2); color: var(--accent-hi);
-            border-color: oklch(0.62 0.17 255 / .4); }
-.req .ok:hover { background: var(--accent-hi); color: oklch(0.18 0.03 255); }
-.req .no  { background: transparent; color: var(--bad); border-color: oklch(0.66 0.19 25 / .4); }
-.req .no:hover { background: oklch(0.66 0.19 25 / .2); }
+.req .ok  { background: rgba(111, 224, 255, .16); color: var(--cyan-soft);
+            border-color: rgba(120, 195, 255, .4); }
+.req .ok:hover { background: rgba(110, 220, 255, .28); border-color: rgba(150, 225, 255, .6); }
+.req .no  { background: transparent; color: var(--bad); border-color: rgba(255, 138, 153, .34); }
+.req .no:hover { background: rgba(255, 138, 153, .16); }
 
-/* ---------- 混音台 ---------- */
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
+/* ---------- 卡片 / 混音台（连接页设备卡与控制页容器共用） ---------- */
+/* auto-fit：只有 1~2 个设备时卡片会拉宽铺满，而不是挤在左侧留一大片空星空 */
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
 
 .card {
-  background: var(--card);
+  background: var(--glass);
   border: 1px solid var(--line);
-  border-radius: var(--radius); padding: 12px 14px 11px;
-  transition: border-color var(--slow) var(--ease), transform var(--slow) var(--ease);
+  border-radius: var(--radius); padding: 13px 15px 12px;
+  backdrop-filter: blur(10px);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .05);
+  transition: border-color var(--slow) var(--ease), box-shadow var(--slow) var(--ease);
 }
-.card:hover { border-color: oklch(0.45 0.05 255 / .8); }
-.card.pending { border-left: 3px solid var(--bad); opacity: .82; }
+.card:hover { border-color: var(--line-strong); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .06), 0 0 28px rgba(90, 160, 255, .1); }
+.card.pending { border-left: 3px solid var(--bad); opacity: .86; }
 
-.card .top { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px; }
-.name { font-size: 14px; font-weight: 600; letter-spacing: .02em; display: flex; align-items: center; gap: 8px; }
-.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 8px var(--accent); transition: all var(--slow) var(--ease); }
-.dot.off { background: oklch(0.45 0.01 255); box-shadow: none; }
-.dot.warn { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+.card .top { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.name { font-size: 14px; font-weight: 600; letter-spacing: .02em; display: flex; align-items: center; gap: 8px; min-width: 0; }
+/* 小行星图标：取代旧的实心圆点，颜色与星图里的行星一致 */
+.dot {
+  flex: 0 0 auto; width: 10px; height: 10px; border-radius: 50%;
+  background: radial-gradient(circle at 34% 30%, #e2fbff, #59c6ea 46%, #0a2a42 100%);
+  box-shadow: 0 0 10px rgba(111, 224, 255, .75);
+  transition: background var(--slow) var(--ease), box-shadow var(--slow) var(--ease);
+}
+.dot.dim { background: radial-gradient(circle at 34% 30%, #eef5ff, #a8bad4 48%, #2a3648 100%); box-shadow: 0 0 8px rgba(160, 185, 215, .4); }
+.dot.off { background: #3a4459; box-shadow: none; }
+.dot.warn { background: radial-gradient(circle at 34% 30%, #fff4d6, #e8b45e 46%, #4a2d0c 100%); box-shadow: 0 0 10px rgba(255, 209, 102, .7); }
 .db { font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums; }
 
-/* 电平条：硬件 VU 表的分段感 */
+/* 电平条：硬件 VU 表的分段感（当前 renderer 不再生成，保留给旧状态/调试视图） */
 .meter {
-  height: 8px; background: oklch(0.14 0.02 255 / .8);
-  border-radius: 3px; overflow: hidden; margin-bottom: 13px;
+  height: 8px; background: rgba(4, 8, 18, .8);
+  border-radius: 4px; overflow: hidden; margin-bottom: 13px;
   display: flex; gap: 2px; padding: 1px;
+  border: 1px solid var(--line-faint);
 }
 .meter i {
   flex: 1; border-radius: 1px;
-  background: oklch(0.28 0.02 255);
+  background: rgba(80, 100, 140, .4);
   transition: background var(--fast) var(--ease);
 }
-.meter i.on       { background: var(--accent); }
+.meter i.on       { background: var(--cyan); }
 .meter i.on.hot   { background: var(--warn); }
 .meter i.on.clip  { background: var(--bad); }
 
@@ -212,11 +263,11 @@ h1 span { color: var(--accent-hi); font-weight: 300; }
 
 .foot {
   display: flex; gap: 15px; margin-top: 11px; padding-top: 10px;
-  border-top: 1px solid oklch(0.3 0.02 255 / .5);
+  border-top: 1px solid var(--line-faint);
   font-size: 11px; color: var(--faint); font-variant-numeric: tabular-nums; flex-wrap: wrap;
 }
 
-/* ---------- 底部面板 ---------- */
+/* ---------- 底部面板（旧版遗留结构，保留样式以防旧状态视图） ---------- */
 .panel { margin-top: 16px; display: flex; gap: 13px; flex-wrap: wrap; }
 .box { flex: 1; min-width: 250px; }
 .box h3 { font-size: 10.5px; color: var(--faint); letter-spacing: .18em; text-transform: uppercase; margin-bottom: 10px; }
@@ -228,48 +279,161 @@ h1 span { color: var(--accent-hi); font-weight: 300; }
   font-size: 12.5px; letter-spacing: .04em; cursor: pointer;
   transition: all var(--fast) var(--ease);
 }
-.seg button:hover { color: var(--text); border-color: oklch(0.45 0.05 255 / .8); }
-.seg button.on { background: var(--accent-dim); color: var(--accent-hi); border-color: oklch(0.62 0.17 255 / .45); }
+.seg button:hover { color: var(--text); border-color: var(--line-strong); }
+.seg button.on { background: var(--accent-dim); color: var(--cyan-soft); border-color: rgba(120, 195, 255, .4); }
+
+/* ---------- 通用按钮 ---------- */
+.btn {
+  background: var(--glass-soft);
+  border: 1px solid var(--line-strong);
+  color: var(--text);
+  border-radius: 9px; padding: 8px 15px;
+  font: inherit; font-size: 12.5px; letter-spacing: .04em;
+  cursor: pointer; transition: all var(--fast) var(--ease);
+}
+.btn:hover { border-color: rgba(150, 205, 255, .55); box-shadow: 0 0 20px rgba(110, 200, 255, .12), inset 0 1px 0 rgba(255, 255, 255, .1); }
 
 /* ---------- 发现的设备 ---------- */
+.peer .row { flex-wrap: wrap; }
 .peer .go {
-  background: var(--accent-dim); color: var(--accent-hi);
-  border: 1px solid oklch(0.62 0.17 255 / .4); border-radius: 7px;
-  padding: 7px 14px; font-size: 12px; letter-spacing: .04em; cursor: pointer;
-  transition: all var(--fast) var(--ease); flex: 0 0 auto;
+  width: 100%;
+  background: linear-gradient(120deg, rgba(111, 224, 255, .2), rgba(183, 164, 255, .16));
+  color: var(--cyan-soft);
+  border: 1px solid rgba(120, 195, 255, .4); border-radius: 9px;
+  padding: 8px 14px; font-size: 12.5px; letter-spacing: .05em; cursor: pointer;
+  transition: all var(--fast) var(--ease);
 }
-.peer .go:hover { background: var(--accent-hi); color: oklch(0.18 0.03 255); }
+.peer .go:hover {
+  background: linear-gradient(120deg, rgba(111, 224, 255, .3), rgba(183, 164, 255, .24));
+  border-color: rgba(150, 225, 255, .6);
+  box-shadow: 0 0 24px rgba(110, 220, 255, .18);
+}
 .peer .ask { font-size: 12px; color: var(--dim); flex: 1; font-variant-numeric: tabular-nums; }
 .empty {
   text-align: center; padding: 22px 20px; color: var(--faint); font-size: 13px;
 }
 .empty b { display: block; color: var(--dim); font-size: 14.5px; margin-bottom: 6px; font-weight: 600; }
 
+/* ---------- 底部遥测：贴着屏幕底的一条玻璃带 ---------- */
 .stats {
   margin-top: 0; display: flex; gap: 18px; flex-wrap: wrap;
   font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums;
   flex: 0 0 auto;
+  padding: 8px 14px;
+  background: rgba(9, 15, 32, .5);
+  border: 1px solid var(--line-faint);
+  border-radius: 12px;
+  backdrop-filter: blur(10px);
 }
 .stats b { color: var(--dim); font-weight: 600; }
 
-/* ---------- 控制界面：全网图谱与音量面板 ---------- */
-/* 图谱绘制层是 Canvas（ui/scene3d.js）：逻辑视口恒 920x460，画布在 .graphwrap 里
-   100% 撑开、等比缩放并居中（多余方向留边，不拉伸也不裁掉节点）。
-   这里只负责“占满剩余高度、可交互、不选中文字”；节点/连线/文字全部在 canvas 内绘制。 */
+/* ---------- 控制界面：星图 ---------- */
+/* 图谱绘制层是 Canvas（ui/scene3d.js + ui/starfield.js）：逻辑视口恒 920x460，
+   画布在 .graphwrap 里 100% 撑开、等比缩放并居中（多余方向留边，不拉伸也不裁掉节点）。
+   画布本身透明 —— 页面 #sky 的星野从下面透出来；这里只加一层很淡的"观星窗"tint。 */
 .graphwrap {
   position: relative;
   flex: 1 1 auto;
   min-height: 110px;
   margin-top: 2px;
+  border: 1px solid var(--line-faint);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: radial-gradient(120% 90% at 50% 45%, rgba(30, 46, 92, .18), rgba(4, 7, 16, .32) 72%);
+  box-shadow: inset 0 0 60px rgba(3, 6, 14, .5);
 }
 #graph {
   position: absolute; inset: 0;
   display: block; width: 100%; height: 100%;
   cursor: grab; touch-action: none;
   user-select: none; -webkit-user-select: none;
-  border-radius: var(--radius-s);
 }
 #graph:active { cursor: grabbing; }
+
+/* 图例 + 操作提示：放在星图下方单独一行（压在图上会和节点标签/角标互相遮挡） */
+.graph-meta {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; flex-wrap: wrap;
+  flex: 0 0 auto;
+  margin: 2px 2px 0;
+}
+.legend {
+  display: flex; align-items: center; gap: 13px; flex-wrap: wrap;
+  padding: 4px 11px;
+  background: rgba(8, 13, 28, .45);
+  border: 1px solid var(--line-faint);
+  border-radius: 999px;
+  backdrop-filter: blur(8px);
+  font-size: 10.5px; letter-spacing: .03em; color: var(--dim);
+}
+.legend .lg { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.legend i { font-style: normal; font-size: 12px; line-height: 1; }
+.legend .star-dot { color: var(--gold); text-shadow: 0 0 9px rgba(255, 200, 110, .8); }
+.legend .planet-dot { color: var(--cyan); text-shadow: 0 0 9px rgba(110, 220, 255, .8); }
+.legend .beam-dot { color: var(--violet); text-shadow: 0 0 9px rgba(170, 150, 255, .8); }
+.legend .off-dot { color: #7d879c; }
+.graph-hint {
+  font-size: 10.5px; letter-spacing: .02em;
+  color: rgba(163, 179, 209, .72);
+  text-align: right;
+}
+
+/* 切换后的同步状态 */
+.graphstatus {
+  font-size: 12px; color: var(--dim); letter-spacing: .02em;
+  margin: 0; min-height: 14px;
+  flex: 0 0 auto;
+  padding-left: 2px;
+}
+.graphstatus.ok { color: var(--green); text-shadow: 0 0 14px rgba(125, 240, 179, .3); }
+.graphstatus.warn { color: var(--warn); }
+
+/* ---------- 节点右键菜单 ---------- */
+.ctxmenu {
+  position: fixed; z-index: 60;
+  min-width: 208px; max-width: 272px;
+  background: linear-gradient(165deg, rgba(18, 28, 56, .97), rgba(9, 14, 30, .97));
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-s); padding: 5px;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, .6), 0 0 0 1px rgba(111, 224, 255, .05), 0 0 30px rgba(80, 180, 255, .08);
+  backdrop-filter: blur(12px);
+  display: flex; flex-direction: column; gap: 2px;
+  animation: menu-in var(--fast) var(--ease);
+}
+@keyframes menu-in { from { opacity: 0; transform: translateY(-4px); } }
+.ctxmenu .ctxtitle {
+  font-size: 11px; color: var(--faint); letter-spacing: .08em;
+  padding: 5px 9px 7px; margin-bottom: 3px;
+  border-bottom: 1px solid var(--line-faint);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ctxmenu button {
+  display: flex; flex-direction: column; gap: 1px;
+  background: transparent; border: 0; border-radius: 8px;
+  color: var(--text); font: inherit; font-size: 13px;
+  text-align: left; padding: 7px 9px; cursor: pointer;
+  transition: background var(--fast) var(--ease);
+}
+.ctxmenu button:hover:not(:disabled) { background: rgba(110, 200, 255, .14); }
+.ctxmenu button:disabled { color: var(--faint); cursor: default; }
+.ctxmenu button .h { font-size: 10.5px; color: var(--faint); line-height: 1.4; }
+
+/* ---------- 汇聚端信息条（连接后才出现；切换入口在图谱节点上） ---------- */
+.hubbar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: var(--glass); border: 1px solid var(--line);
+  border-radius: var(--radius-s); padding: 8px 13px; margin-top: 0;
+  backdrop-filter: blur(10px);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .05);
+  flex: 0 0 auto;
+}
+.hublabel { font-size: 10px; color: var(--faint); letter-spacing: .16em; text-transform: uppercase; }
+.hubnow {
+  font-size: 13px; color: var(--text); font-weight: 600;
+  font-variant-numeric: tabular-nums; letter-spacing: .02em;
+}
+.hubnow.off { color: var(--warn); font-weight: 400; }
+.hubnote { font-size: 11.5px; color: var(--faint); }
 
 /* ---------- 扫描按钮 ---------- */
 .sectrow {
@@ -281,87 +445,33 @@ h1 span { color: var(--accent-hi); font-weight: 300; }
 .sectrow .sect::after { display: none; }
 
 .scanbtn {
-  background: var(--accent-dim); color: var(--accent-hi);
-  border: 1px solid oklch(0.62 0.17 255 / .4); border-radius: 7px;
+  background: rgba(111, 224, 255, .1); color: var(--cyan-soft);
+  border: 1px solid rgba(120, 195, 255, .34); border-radius: 8px;
   padding: 5px 14px; font-size: 12px; letter-spacing: .06em;
   cursor: pointer; transition: all var(--fast) var(--ease);
   flex: 0 0 auto;
 }
-.scanbtn:hover { background: var(--accent-hi); color: oklch(0.18 0.03 255); }
+.scanbtn:hover { background: rgba(110, 220, 255, .2); border-color: rgba(150, 225, 255, .55); }
 .scanbtn:disabled { opacity: .55; cursor: default; }
 .scanbtn.busy { background: transparent; color: var(--dim); border-color: var(--line); }
 
 .hint {
   font-size: 12px; color: var(--dim); min-height: 16px;
-  margin: -2px 0 6px; letter-spacing: .02em;
+  margin: -2px 0 6px; letter-spacing: .02em; line-height: 1.5;
 }
-.hint.ok { color: var(--accent-hi); }
+.hint.ok { color: var(--cyan-soft); }
 .hint.warn { color: var(--warn); }
 
 .ipinput {
-  flex: 1; background: oklch(0.14 0.02 255 / .8);
-  border: 1px solid var(--line); border-radius: 7px;
-  padding: 8px 11px; color: var(--text);
+  flex: 1; background: rgba(5, 9, 20, .78);
+  border: 1px solid var(--line); border-radius: 9px;
+  padding: 9px 12px; color: var(--text);
   font-size: 13.5px; font-variant-numeric: tabular-nums;
   font-family: inherit; outline: none;
-  transition: border-color var(--fast) var(--ease);
+  transition: border-color var(--fast) var(--ease), box-shadow var(--fast) var(--ease);
 }
 .ipinput::placeholder { color: var(--faint); }
-.ipinput:focus { border-color: oklch(0.62 0.17 255 / .6); }
-
-/* ---------- 汇聚端信息条（连接后才出现；切换入口在图谱节点上） ---------- */
-.hubbar {
-  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-  background: var(--card); border: 1px solid var(--line);
-  border-radius: var(--radius-s); padding: 7px 12px; margin-top: 0;
-  flex: 0 0 auto;
-}
-.hublabel { font-size: 11px; color: var(--faint); letter-spacing: .14em; }
-.hubnow {
-  font-size: 13px; color: var(--text); font-weight: 600;
-  font-variant-numeric: tabular-nums; letter-spacing: .02em;
-}
-.hubnow.off { color: var(--warn); font-weight: 400; }
-.hubnote { font-size: 11.5px; color: var(--faint); }
-
-/* ---------- 节点右键菜单：左键只拖动，右键在节点上出菜单（切换汇聚端 / 音量 / 复位） ---------- */
-.ctxmenu {
-  position: fixed; z-index: 60;
-  min-width: 196px; max-width: 264px;
-  background: oklch(0.21 0.02 255 / .97);
-  border: 1px solid oklch(0.62 0.17 255 / .38);
-  border-radius: var(--radius-s); padding: 5px;
-  box-shadow: 0 16px 38px oklch(0 0 0 / .55);
-  backdrop-filter: blur(10px);
-  display: flex; flex-direction: column; gap: 2px;
-  animation: menu-in var(--fast) var(--ease);
-}
-@keyframes menu-in { from { opacity: 0; transform: translateY(-4px); } }
-.ctxmenu .ctxtitle {
-  font-size: 11px; color: var(--faint); letter-spacing: .08em;
-  padding: 5px 9px 7px; margin-bottom: 3px;
-  border-bottom: 1px solid var(--line);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.ctxmenu button {
-  display: flex; flex-direction: column; gap: 1px;
-  background: transparent; border: 0; border-radius: 6px;
-  color: var(--text); font: inherit; font-size: 13px;
-  text-align: left; padding: 7px 9px; cursor: pointer;
-  transition: background var(--fast) var(--ease);
-}
-.ctxmenu button:hover:not(:disabled) { background: oklch(0.62 0.17 255 / .18); }
-.ctxmenu button:disabled { color: var(--faint); cursor: default; }
-.ctxmenu button .h { font-size: 11px; color: var(--faint); line-height: 1.35; }
-
-/* 切换后的同步状态 */
-.graphstatus {
-  font-size: 12px; color: var(--dim); letter-spacing: .02em;
-  margin: 0; min-height: 14px;
-  flex: 0 0 auto;
-}
-.graphstatus.ok { color: oklch(0.84 0.1 155); }
-.graphstatus.warn { color: var(--warn); }
+.ipinput:focus { border-color: rgba(130, 210, 255, .55); box-shadow: 0 0 20px rgba(90, 190, 255, .12); }
 
 /* ---------- 自动同意开关 ---------- */
 .autochk {
@@ -370,15 +480,24 @@ h1 span { color: var(--accent-hi); font-weight: 300; }
   cursor: pointer; user-select: none;
 }
 .autochk input {
-  width: 14px; height: 14px; accent-color: var(--accent); cursor: pointer;
+  width: 14px; height: 14px; accent-color: var(--cyan); cursor: pointer;
 }
 .autochk:hover { color: var(--text); }
 
-/* ---------- 瞬时通知（新设备接入） ---------- */
-.banner.ok {
-  background: oklch(0.42 0.12 155 / .18);
-  border-color: oklch(0.62 0.14 155 / .45);
-  color: oklch(0.88 0.08 155);
+/* ---------- 连接页底部：星座装饰（只解释星图语义，不是功能入口） ---------- */
+.decspacer { flex: 1 1 auto; min-height: 14px; }
+.deco {
+  flex: 0 0 auto;
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  padding: 2px 0 12px;
+  opacity: .92;
+  pointer-events: none;
+}
+.deco-const { width: 320px; max-width: 62%; height: auto; }
+.deco-hint {
+  font-size: 12px; letter-spacing: .05em;
+  color: rgba(163, 179, 209, .8);
+  text-shadow: 0 1px 10px rgba(3, 5, 12, .9);
 }
 
 /* ---------- 窄屏 / 小窗口：图谱与菜单不挤爆 ---------- */
@@ -390,6 +509,7 @@ h1 span { color: var(--accent-hi); font-weight: 300; }
   .autochk { margin-left: 0; }
   .stats { gap: 14px; }
   .graphwrap { min-height: 120px; }
+  .graph-hint { display: none; }
 }
 @media (max-height: 640px) {
   body { padding: 8px 12px 6px; }
@@ -398,4 +518,5 @@ h1 span { color: var(--accent-hi); font-weight: 300; }
   .addr .k { display: none; }
   .graphwrap { min-height: 90px; }
   .sect, .sectrow { margin: 9px 0 6px; }
+  .deco { display: none; }
 }

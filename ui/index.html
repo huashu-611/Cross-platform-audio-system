@@ -7,6 +7,9 @@
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+<!-- 整页星野背景（v1.8 星空主题）：由 ui/starfield.js 绘制，只在窗口尺寸变化时重画；
+     页面内容浮在它上面（.wrap z-index:2）。纯装饰，读屏忽略。 -->
+<canvas id="sky" aria-hidden="true"></canvas>
 <div class="wrap">
 
   <header>
@@ -55,6 +58,22 @@
       </div>
     </div>
 
+    <!-- 连接页底部的星座装饰（v1.8）：只解释"连接后星图长什么样"，不是功能入口 -->
+  <div class="decspacer" aria-hidden="true"></div>
+  <div class="deco" aria-hidden="true">
+    <svg class="deco-const" viewBox="0 0 320 96" fill="none">
+      <path d="M28 62 L86 30 L146 54 L206 24 L268 46 L300 34" stroke="rgba(160,190,255,.28)" stroke-width="1"/>
+      <path d="M86 30 L108 66 L146 54" stroke="rgba(160,190,255,.16)" stroke-width="1"/>
+      <circle cx="28" cy="62" r="2.2" fill="#a9ecff" opacity=".85"/>
+      <circle cx="86" cy="30" r="1.8" fill="#eaf1ff" opacity=".8"/>
+      <circle cx="146" cy="54" r="2.6" fill="#ffd27a"/>
+      <circle cx="206" cy="24" r="1.8" fill="#b7a4ff" opacity=".85"/>
+      <circle cx="268" cy="46" r="2" fill="#a9ecff" opacity=".75"/>
+      <circle cx="300" cy="34" r="1.6" fill="#eaf1ff" opacity=".6"/>
+    </svg>
+    <div class="deco-hint">连接后：汇聚端会亮成恒星，设备成为它周围静止的行星</div>
+  </div>
+
   </div>
 
   <!-- ============ 控制界面：全网图谱 ============ -->
@@ -63,7 +82,19 @@
          画布撑满 .graphwrap（逻辑视口恒 920x460，按容器等比缩放并居中，见 scene3d.fitInfo），
          hub 投影仍是 (460,208)；role/aria 保留，读屏体验不倒退。 -->
     <div class="graphwrap">
-      <canvas id="graph" width="920" height="460" role="img" aria-label="全网设备图谱（3D）"></canvas>
+      <canvas id="graph" width="920" height="460" role="img" aria-label="全网设备图谱（星图：恒星为汇聚端，行星为设备）"></canvas>
+    </div>
+
+    <!-- 图例 + 操作提示（v1.8）：放在星图下方，而不是压在图里 —— 节点标签/角标可能落在
+         画面任意角落，和图内浮层抢位置会互相遮挡。只做可读性说明，没有交互。 -->
+    <div class="graph-meta" aria-hidden="true">
+      <div class="legend">
+        <span class="lg"><i class="star-dot">✦</i>恒星 · 汇聚端</span>
+        <span class="lg"><i class="planet-dot">●</i>行星 · 设备</span>
+        <span class="lg"><i class="beam-dot">—</i>音频流</span>
+        <span class="lg"><i class="off-dot">┄</i>离线</span>
+      </div>
+      <div class="graph-hint">左键拖动摆位（距离即音量） · 空白拖动旋转视角 · 滚轮缩放 · 右键星球菜单</div>
     </div>
 
     <!-- 切换后的同步状态：已切换，正在同步… / 已同步（vN） -->
@@ -109,6 +140,8 @@
 </div>
 
 <script src="scene3d.js"></script>
+<!-- v1.8 星空材质层：整页星野 + 星图里的恒星/行星/光束（scene3d.js 会调用它，必须在 renderer 之前） -->
+<script src="starfield.js"></script>
 <script src="renderer.js"></script>
 </body>
 </html>

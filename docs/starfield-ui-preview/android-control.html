@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>AudioHub · 星空主题预览（Android 控制界面）</title>
+<link rel="stylesheet" href="shared.css">
+<style>
+  .phone .screen #phsky {
+    position: absolute; inset: 0; z-index: 0;
+    display: block; width: 100%; height: 100%; pointer-events: none;
+  }
+  .phone .screen .veil2 {
+    position: absolute; inset: 0; z-index: 1; pointer-events: none;
+    background:
+      radial-gradient(420px 640px at 50% 38%, transparent 38%, rgba(2, 4, 11, .5) 100%),
+      linear-gradient(180deg, rgba(3, 5, 12, .26), transparent 20%, transparent 80%, rgba(2, 3, 9, .44));
+  }
+  .agwrap { flex: 1 1 auto; min-height: 300px; }
+  .volline { display: flex; align-items: center; gap: 10px; }
+  .hubdot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto;
+    background: radial-gradient(circle at 34% 30%, #fff8e2, #ffd27a 46%, #ff9b45 100%);
+    box-shadow: 0 0 12px rgba(255, 200, 110, .9); }
+</style>
+</head>
+<body>
+<canvas id="sky" data-seed="21"></canvas>
+<div class="veil"></div>
+
+<div class="phonepage">
+  <div class="phone">
+    <div class="punch"></div>
+    <div class="screen">
+      <canvas id="phsky" data-seed="21"></canvas>
+      <div class="veil2"></div>
+
+      <div class="statusbar">
+        <span>21:49</span>
+        <span class="sicons">
+          <svg width="14" height="10" viewBox="0 0 14 10" fill="none" stroke="#cfe0ff" stroke-width="1.3" stroke-linecap="round">
+            <path d="M1 3.4a9 9 0 0 1 12 0"/><path d="M3.2 5.6a6 6 0 0 1 7.6 0"/><path d="M5.5 7.8a2.8 2.8 0 0 1 3 0"/>
+            <circle cx="7" cy="9" r=".7" fill="#cfe0ff" stroke="none"/>
+          </svg>
+          <svg width="19" height="10" viewBox="0 0 19 10">
+            <rect x=".6" y=".6" width="15" height="8.8" rx="2.4" fill="none" stroke="#cfe0ff" stroke-opacity=".72"/>
+            <rect x="2.2" y="2.2" width="10.6" height="5.6" rx="1.2" fill="#cfe0ff" fill-opacity=".82"/>
+            <path d="M17 .9v8.2" stroke="#cfe0ff" stroke-opacity=".55" stroke-width="1.6" stroke-linecap="round"/>
+          </svg>
+        </span>
+      </div>
+
+      <div class="app control">
+        <!-- ================= 星图（只读俯视） ================= -->
+        <div class="agwrap">
+          <canvas id="ag"></canvas>
+          <div class="agstatus"><span class="spark">✦</span>已同步（v7）</div>
+          <div class="aghint">点星球可切换汇聚端</div>
+        </div>
+
+        <!-- ================= 音量面板（点选行星后展开） ================= -->
+        <div class="volpanel glass">
+          <div class="voltop">
+            <div class="volname">卧室平板</div>
+            <div class="voldb tabnum">−18.2 dBFS</div>
+          </div>
+          <div class="volline">
+            <input class="volslider" type="range" min="0" max="150" value="100">
+            <div class="volpct tabnum">100%</div>
+            <button class="mute">静音</button>
+          </div>
+        </div>
+
+        <div class="asect">新设备</div>
+        <div class="acard">
+          <div class="amain">
+            <div class="atitle2">新设备</div>
+            <div class="asub2">扫描附近设备并邀请它接入</div>
+          </div>
+          <button class="abtn">添加设备</button>
+        </div>
+
+        <div class="asect">汇聚端</div>
+        <div class="acard">
+          <div class="hubdot"></div>
+          <div class="amain">
+            <div class="atitle2">客厅PC</div>
+            <div class="asub2">图谱 v7 · 3 台设备 · 已接收 2 路 · 已发送 1 路</div>
+          </div>
+        </div>
+
+        <button class="aleave">断开所有连接</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="starfield.js"></script>
+<script>
+  (function () {
+    var skyCanvas = document.getElementById('phsky')
+    var graphCanvas = document.getElementById('ag')
+    var raf = 0
+
+    function paint () {
+      StarUI.paintSky(skyCanvas, { seed: 21 })
+    }
+
+    function graph () {
+      StarUI.drawPhoneGraph(graphCanvas, {
+        seed: 21,
+        hub: { name: '客厅PC', level: -9.2 },
+        nodes: [
+          { id: 'self', name: 'Pixel 8', x: -1.3, z: -1.0, level: -12.4, palette: 'cyan',
+            streaming: true, badge: '本机' },
+          { id: 'b', name: '卧室平板', x: 1.25, z: -0.9, level: -18.2, palette: 'violet',
+            streaming: true, selected: true },
+          { id: 'c', name: '备用手机', x: -1.35, z: 1.0, level: null, online: false,
+            palette: 'ice', rings: true, badge: '离线', badgeSide: 'left' }
+        ]
+      })
+    }
+
+    function drawAll () {
+      try { paint() } catch (e) { /* 预览页容错 */ }
+      try { graph() } catch (e) { console.error(e) }
+    }
+    function redraw () { cancelAnimationFrame(raf); raf = requestAnimationFrame(drawAll) }
+
+    window.addEventListener('load', drawAll)
+    window.addEventListener('resize', redraw)
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(redraw)
+  })()
+</script>
+</body>
+</html>

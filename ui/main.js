@@ -359,7 +359,10 @@ function createWindow () {
     height: 760,
     minWidth: 720,
     minHeight: 560,
-    backgroundColor: '#0b1015',
+    backgroundColor: '#04060f',
+    // 窗口/任务栏图标：打包后 exe 自带图标，这里管的是开发态与任务栏小图标，
+    // 不指定的话 Windows 会退回 Electron 默认图标（用户反馈的"桌面图标显示问题"之一）。
+    icon: path.join(__dirname, 'icon.ico'),
     title: 'AudioHub 汇聚端',
     // 安全底线：渲染进程是"没牙的老虎"，所有能力都从 preload 窄接口出
     webPreferences: {

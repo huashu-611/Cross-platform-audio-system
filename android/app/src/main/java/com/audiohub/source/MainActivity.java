@@ -7,8 +7,11 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.GradientDrawable;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -33,8 +36,11 @@ import java.util.List;
  *
  * 两屏流程：
  *   连接界面 —— 选汇聚端、连设备；连接建立后自动进控制界面
- *   控制界面 —— 可视化网络图：球 = 设备，线 = 连接，汇聚端的球更大；
- *               点任意球调它的音量，实时生效。
+ *   控制界面 —— 星空图谱：汇聚端是中心恒星，其他设备是围绕它的行星，光束 = 音频流；
+ *               点任意星球调它的音量，实时生效。
+ *
+ * v1.7 视觉：整页深空星野（{@link StarSkyView} 在最底层画星点/星云/银河带），
+ * 卡片改成半透明玻璃 + 蓝紫描边，按钮改胶囊描边，字号与层级不变。
  *
  * 架构上两端能力完全一致：都能采音、都能放音、都能发起或接受连接。
  * 唯一的差别是用户选了哪台设备当汇聚端，默认是电脑。
@@ -105,13 +111,37 @@ public class MainActivity extends Activity {
     private int hubPort;
     private String hubName;
 
-    private static final int COLOR_BG = 0xFF0F1420;
-    private static final int COLOR_CARD = 0xFF1A2130;
-    private static final int COLOR_TEXT = 0xFFEEF2F7;
-    private static final int COLOR_DIM = 0xFF8B98A8;
-    private static final int COLOR_LINE = 0xFF2A3348;
-    private static final int COLOR_ACCENT = 0xFF3B82F6;
-    private static final int COLOR_WARN = 0xFFFBBF24;
+    // ---- 星空色板（docs/starfield-ui-preview/shared.css 设计令牌）----
+    /** 深空底色：整页星野的兜底色（真正背景由 StarSkyView 画）。 */
+    private static final int COLOR_BG = 0xFF04060F;
+    /** 卡片兜底底色（对话框 / 输入框 / 不透明场景）。 */
+    private static final int COLOR_CARD = 0xFF0B1224;
+    /** 主文字 #eaf1ff。 */
+    private static final int COLOR_TEXT = 0xFFEAF1FF;
+    /** 次文字 #a3b3d1。 */
+    private static final int COLOR_DIM = 0xFFA3B3D1;
+    /** 弱文字 #6e7d9d。 */
+    private static final int COLOR_FAINT = 0xFF6E7D9D;
+    /** 线：rgba(120,150,200,.18)。 */
+    private static final int COLOR_LINE = 0x2E7896C8;
+    /** 主强调色：青 #6fe0ff。 */
+    private static final int COLOR_ACCENT = 0xFF6FE0FF;
+    /** 告警：琥珀 #ffd166。 */
+    private static final int COLOR_WARN = 0xFFFFD166;
+    /** 危险 / 断开：红 #ff8a99。 */
+    private static final int COLOR_BAD = 0xFFFF8A99;
+    /** 同步成功：绿 #7df0b3。 */
+    private static final int COLOR_GREEN = 0xFF7DF0B3;
+    /** 恒星金 #ffd27a。 */
+    private static final int COLOR_GOLD = 0xFFFFD27A;
+    /** 玻璃卡片底色（半透明，能透出后面的星野）。 */
+    private static final int COLOR_GLASS_1 = 0xBD18244A;
+    private static final int COLOR_GLASS_2 = 0xAD0B1226;
+    private static final int COLOR_GLASS_3 = 0xA30F162E;
+    /** 玻璃描边：rgba(126,163,255,.17)。 */
+    private static final int COLOR_GLASS_STROKE = 0x2B7EA3FF;
+    /** 文字光晕（星空底上直接写字时的深空色描边）。 */
+    private static final int COLOR_TEXT_HALO = 0xCC04060F;
 
     /** 构建标记：与 APK versionName 保持一致，用于在手机上确认装的是哪一版。 */
     private static final String BUILD_TAG = "1.7-bye";
@@ -256,7 +286,7 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             return;
         }
-        new AlertDialog.Builder(this)
+        dialog()
                 .setTitle("上次运行时崩溃了")
                 .setMessage(text.length() > 1200 ? text.substring(0, 1200) + "…" : text)
                 .setPositiveButton("复制并清除", new android.content.DialogInterface.OnClickListener() {
@@ -288,6 +318,7 @@ public class MainActivity extends Activity {
         tv.setLetterSpacing(0.14f);
         tv.setAllCaps(true);
         tv.setTextColor(COLOR_DIM);
+        haloText(tv, 0.55f);
         return tv;
     }
 
@@ -297,7 +328,23 @@ public class MainActivity extends Activity {
         tv.setTextSize(11.5f);
         tv.setTextColor(COLOR_DIM);
         tv.setPadding(0, dp(2), 0, 0);
+        haloText(tv, 0.55f);
         return tv;
+    }
+
+    /** 星空底上直接写字的兜底：给文字加深空色柔光描边，避免压在亮星上读不清。 */
+    private void haloText(TextView tv, float strength) {
+        tv.setShadowLayer(dp(4), 0f, dp(1), withAlpha(0xFF04060F, (int) (255 * strength)));
+    }
+
+    /** 半透明玻璃卡片：深蓝渐变 + 蓝紫细描边 + 12dp 圆角（星野能透出来）。 */
+    private Drawable glassCard() {
+        GradientDrawable d = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                new int[]{COLOR_GLASS_1, COLOR_GLASS_2, COLOR_GLASS_3});
+        d.setShape(GradientDrawable.RECTANGLE);
+        d.setCornerRadius(dp(12));
+        d.setStroke(dp(1), COLOR_GLASS_STROKE);
+        return d;
     }
 
     private LinearLayout card() {
@@ -308,19 +355,42 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         p.setMargins(0, 0, 0, dp(6));
         card.setLayoutParams(p);
-        card.setBackgroundColor(COLOR_CARD);
+        card.setBackground(glassCard());
         return card;
     }
 
+    /** 胶囊按钮：透明底 + 同色描边（颜色决定按钮语义：青=主操作 / 琥珀=提醒 / 红=断开）。 */
     private Button textButton(String text, int color) {
         Button b = new Button(this);
         b.setText(text);
         b.setTextSize(12.5f);
         b.setAllCaps(false);
         b.setTextColor(color);
-        b.getBackground().setAlpha(0);
+        b.setBackground(pillButton(color));
+        // 尺寸/内边距保持改造前不变（只换外观，不动布局）
         b.setPadding(dp(7), dp(5), dp(7), dp(5));
+        b.setStateListAnimator(null);
         return b;
+    }
+
+    private Drawable pillButton(int color) {
+        final int rgb = color & 0x00FFFFFF;
+        GradientDrawable d = new GradientDrawable();
+        d.setShape(GradientDrawable.RECTANGLE);
+        d.setCornerRadius(dp(16));
+        d.setColor(rgb | 0x17000000);       // 内部极淡同色填充
+        d.setStroke(dp(1), rgb | 0x66000000); // 半透明同色描边
+        return d;
+    }
+
+    /** 给颜色换透明度（COLOR_* 都是不透明 ARGB）。 */
+    private static int withAlpha(int color, int alpha) {
+        return (color & 0x00FFFFFF) | ((alpha & 0xFF) << 24);
+    }
+
+    /** 深色对话框：和星空夜配色一致，避免设备浅色主题下白底 + 青字看不清。 */
+    private AlertDialog.Builder dialog() {
+        return new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert);
     }
 
     private View buildUi() {
@@ -328,6 +398,10 @@ public class MainActivity extends Activity {
         // 不再用滚动容器：没有滚动条，也不会两屏共用一个滚动位置。
         final FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(COLOR_BG);
+        // 最底层：整页星空（固定种子的星点/星云/银河带，静态缓存位图）。
+        // 两屏都不再画不透明底色，星野从卡片半透明玻璃后面透出来。
+        root.addView(new StarSkyView(this), new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
         // 标题区（放进连接屏；控制屏顶部用 hubValue 那一行）
         final LinearLayout header = new LinearLayout(this);
@@ -337,6 +411,7 @@ public class MainActivity extends Activity {
         title.setTextSize(22);
         title.setLetterSpacing(0.02f);
         title.setTextColor(COLOR_TEXT);
+        haloText(title, 0.75f);
         header.addView(title);
 
         TextView subT = new TextView(this);
@@ -344,21 +419,23 @@ public class MainActivity extends Activity {
         subT.setTextSize(12f);
         subT.setTextColor(COLOR_DIM);
         subT.setPadding(0, dp(2), 0, dp(6));
+        haloText(subT, 0.55f);
         header.addView(subT);
 
         // 版本/特性标记：手机上装的是哪一版一眼可辨（排查“装了新版还是旧界面”类问题）
         TextView buildTag = new TextView(this);
-        buildTag.setText("俯视平面图 · v" + BUILD_TAG);
+        buildTag.setText("星图 · v" + BUILD_TAG);
         buildTag.setTextSize(11f);
-        buildTag.setTextColor(COLOR_DIM);
+        buildTag.setTextColor(COLOR_FAINT);
         buildTag.setPadding(0, 0, 0, dp(6));
+        haloText(buildTag, 0.55f);
         header.addView(buildTag);
 
         // ================= 连接界面 =================
         screenConnect = new LinearLayout(this);
         screenConnect.setOrientation(LinearLayout.VERTICAL);
         screenConnect.setPadding(dp(16), dp(12), dp(16), dp(10));
-        screenConnect.setBackgroundColor(COLOR_BG);
+        screenConnect.setBackground(null);   // 透明：星空由底层 StarSkyView 提供
         screenConnect.addView(header);
         root.addView(screenConnect, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -437,7 +514,7 @@ public class MainActivity extends Activity {
         screenControl = new LinearLayout(this);
         screenControl.setOrientation(LinearLayout.VERTICAL);
         screenControl.setPadding(dp(14), dp(8), dp(14), dp(6));
-        screenControl.setBackgroundColor(COLOR_BG);
+        screenControl.setBackground(null);   // 透明：露出星空
         screenControl.setVisibility(View.GONE);
 
         graph = new HubGraphView(this, null);
@@ -466,7 +543,7 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         vp.setMargins(0, dp(4), 0, dp(4));
         volPanel.setLayoutParams(vp);
-        volPanel.setBackgroundColor(COLOR_CARD);
+        volPanel.setBackground(glassCard());
         // 默认收起：点节点才展开，主界面尽量一屏装完
         volPanel.setVisibility(View.GONE);
         volName = new TextView(this);
@@ -481,6 +558,10 @@ public class MainActivity extends Activity {
         volSlider = new SeekBar(this);
         volSlider.setMax(150);
         volSlider.setProgress(100);
+        // 星空风上色：青进度条 + 亮色滑块 + 半透明深色轨道
+        volSlider.setProgressTintList(ColorStateList.valueOf(COLOR_ACCENT));
+        volSlider.setThumbTintList(ColorStateList.valueOf(0xFFEAF1FF));
+        volSlider.setProgressBackgroundTintList(ColorStateList.valueOf(0x5980A0C8));
         volSlider.setLayoutParams(new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         volSlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
@@ -543,13 +624,13 @@ public class MainActivity extends Activity {
         hubValue.setTextSize(15);
         hubValue.setTextColor(COLOR_TEXT);
         hubInfoC.addView(hubValue);
-        hubSub = sub("点图谱里的球可切换汇聚端");
+        hubSub = sub("点星球可切换汇聚端");
         hubInfoC.addView(hubSub);
         hubRowC.addView(hubInfoC);
         hubBar.addView(hubRowC);
         screenControl.addView(hubBar);
 
-        Button leave = textButton("断开所有连接", COLOR_WARN);
+        Button leave = textButton("断开所有连接", COLOR_BAD);
         leave.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -732,6 +813,7 @@ public class MainActivity extends Activity {
                         Toast.LENGTH_SHORT).show();
             } else {
                 sourceIntent = true;
+                userLeft = false;   // 用户主动「送入」= 明确发起新连接
                 ensurePermissionsThenStart();
             }
         }
@@ -794,6 +876,7 @@ public class MainActivity extends Activity {
         projectionResultCode = resultCode;
         projectionResultData = data;
         sourceIntent = true;
+        userLeft = false;   // 用户授权采集 = 明确发起新连接
 
         final GraphStore.Snapshot g = GraphStore.snapshot();
         final GraphStore.Node hub = g.hubNode();
@@ -865,8 +948,9 @@ public class MainActivity extends Activity {
                          : (hub != null ? "尚未开始发送" : "未连接")));
 
         // 控制界面显示条件：图谱里至少两台设备，或本机正在采集 / 接收。
-        // 不再用粘滞会话标志——图谱本身就是会话状态的权威来源。
-        if (userLeft && !hubRunning && !srcRunning) userLeft = false;
+        // userLeft 只在「用户明确发起新连接」时清除（本机声音送入 / 接受待确认请求 /
+        // 设备列表或手动 IP 发起连接）；不因服务停止或远端残留图谱自动清除，
+        // 否则断开后旧图谱（10s 才转离线）会把界面又拉回控制屏。
         final boolean showControl = !userLeft
                 && (g.nodes.size() >= 2 || hubRunning || srcRunning);
         showScreen(showControl ? "control" : "connect");
@@ -995,7 +1079,7 @@ public class MainActivity extends Activity {
             final String ip = InviteListener.sInviteIp;
             final int port = InviteListener.sInvitePort > 0 ? InviteListener.sInvitePort : 47000;
 
-            new AlertDialog.Builder(this)
+            dialog()
                     .setTitle("连接请求")
                     .setMessage(name + "（" + ip + "）希望本机把声音送过去")
                     .setPositiveButton("同意", new android.content.DialogInterface.OnClickListener() {
@@ -1169,7 +1253,7 @@ public class MainActivity extends Activity {
         final String msg = "把汇聚端切到「" + target.displayName() + "」？"
                 + (online ? "\n其它设备的声音会改送到它那里播放。"
                           : "\n它当前离线，切换后会等它恢复在线。");
-        new AlertDialog.Builder(this)
+        dialog()
                 .setTitle("切换汇聚端")
                 .setMessage(msg)
                 .setPositiveButton("切换", new android.content.DialogInterface.OnClickListener() {
@@ -1228,7 +1312,7 @@ public class MainActivity extends Activity {
         input.setText(hubIp != null ? hubIp : "");
         input.setInputType(android.text.InputType.TYPE_CLASS_TEXT);
         input.setTextColor(COLOR_TEXT);
-        new AlertDialog.Builder(this)
+        dialog()
                 .setTitle("手动添加设备")
                 .setMessage("填电脑上显示的地址（可只填 IP，端口默认 47000）")
                 .setView(input)
@@ -1282,7 +1366,18 @@ public class MainActivity extends Activity {
         final TextView tv = new TextView(this);
         tv.setTextSize(12.5f);
         tv.setTextColor(COLOR_WARN);
-        tv.setPadding(dp(2), dp(4), 0, dp(2));
+        tv.setPadding(dp(10), dp(7), dp(10), dp(7));
+        // 琥珀玻璃条：rgba(255,209,102,.10) 填充 + .38 描边 + 10dp 圆角
+        GradientDrawable bg = new GradientDrawable();
+        bg.setShape(GradientDrawable.RECTANGLE);
+        bg.setCornerRadius(dp(10));
+        bg.setColor(0x1AFFD166);
+        bg.setStroke(dp(1), 0x61FFD166);
+        tv.setBackground(bg);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(0, dp(2), 0, dp(6));
+        tv.setLayoutParams(lp);
         tv.setVisibility(View.GONE);
         tv.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -1355,7 +1450,7 @@ public class MainActivity extends Activity {
             list.addView(row);
         }
 
-        new AlertDialog.Builder(this)
+        dialog()
                 .setTitle("接入请求")
                 .setView(list)
                 .setNegativeButton("关闭", null)
@@ -1368,6 +1463,7 @@ public class MainActivity extends Activity {
      */
     private void acceptPending(int streamId) {
         InviteListener.accept(streamId);
+        userLeft = false;   // 用户同意接入 = 明确发起新连接
         if (!GraphStore.isHub()) {
             final String sid = GraphStore.selfId();
             if (!sid.isEmpty() && GraphStore.switchHub(sid)) {
@@ -1429,7 +1525,7 @@ public class MainActivity extends Activity {
                 list.addView(buildPeerRow(d));
             }
         }
-        new AlertDialog.Builder(this)
+        dialog()
                 .setTitle("设备列表")
                 .setView(list)
                 .setNegativeButton("关闭", null)

@@ -25,8 +25,8 @@
 | WASAPI 系统音频采集 | ✅ | loopback + AUTOCONVERTPCM |
 | 进程回环 `--include/--exclude` | ✅ | Win10 2004+，只抓/排除指定进程树 |
 | Android 源端（采集） | ✅ 已真机验证 | `android/`，APK ≈ 337 KB |
-| Android 接收端（播放/混音） | ✅ 已实现 | `ReceiverService`：AudioTrack 混音输出；图谱改为**俯视平面图**（只读，不能拖） |
-| Windows 图形界面 | ✅ | `ui/` Electron 壳，**3D 房间视图**（俯仰/轨道/滚轮缩放）+ **距离即音量**（无音量滑杆） |
+| Android 接收端（播放/混音） | ✅ 已实现 | `ReceiverService`：AudioTrack 混音输出；图谱为**俯视星图**（恒星=汇聚端、行星=设备，只读，不能拖） |
+| Windows 图形界面 | ✅ | `ui/` Electron 壳，**3D 星空房间视图**（恒星=汇聚端、行星=设备；俯仰/轨道/滚轮缩放）+ **距离即音量**（无音量滑杆） |
 | PC 自己当音源 | ✅ | 非汇聚端时界面自动拉起 `audiohub-source`，连接后自动静音本机输出 |
 | 本地 HTTP 控制接口 | ✅ | `--http-port 4780`；含 `/api/state.graph`、`/api/graph/switch`、`/api/graph/placement` |
 | 共享网络图谱（双端） | ✅ | 设备图谱 + 图上右键菜单切换汇聚端（左键只拖动），全网同步（[协议](docs/GRAPH-PROTOCOL.md)） |
@@ -183,7 +183,7 @@ cd ui && npm start
 图谱是**物理房间**的俯视投影（1 格 = 1 m）：听者固定在原点，球在地面上自由摆位，
 球的屏幕大小随距离缩放（近大远小，与音量衰减同向）；左键拖动摆位、右键菜单里
 「位置复位」回到自动槽位。**拖完的位置是全网一份**：写进本机内核后由 POS 帧同步给所有
-电脑和手机（[协议 §13](docs/GRAPH-PROTOCOL.md)）；手机端用同一个坐标系画俯视平面图，
+电脑和手机（[协议 §13](docs/GRAPH-PROTOCOL.md)）；手机端用同一个坐标系画俯视星图，
 但只读。滚轮向上=凑近放大、向下=拉远；整个界面随窗口自适应，不出现滚动条。
 
 窗口顶部直接显示**手机上该填的 IP**，点「复制」即可。

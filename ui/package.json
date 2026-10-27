@@ -26,8 +26,10 @@
       "preload.js",
       "renderer.js",
       "scene3d.js",
+      "starfield.js",
       "index.html",
       "styles.css",
+      "icon.ico",
       "bin/**/*"
     ],
     "asar": true,

@@ -84,8 +84,8 @@
     pitchDefault: 40,         // 默认俯角（D1 修订：16.07° → 40°，避免前排节点被 hub 球遮挡）
     pitchMin: 6,              // 俯仰下限，避免视线与地面平行（unproject 退化）
     pitchMax: 74,
-    distMin: 1.2,             // 滚轮缩放下限
-    distMax: 6.0,
+    distMin: 0.85,            // 滚轮缩放下限（凑近看单颗行星）
+    distMax: 12.0,            // 上限：拉到 12m 也能看清整张房间图
     VW: VW, VH: VH, CX: CX, CY: CY,
     near: 0.05,
     focalPx: FOCAL,
@@ -96,23 +96,26 @@
     animMs: 250               // 切 hub / 节点增删的位置插值时长
   }
 
-  // 颜色与 styles.css :12-33 的令牌一致（canvas 不能直接吃 CSS 变量，这里抄一份字面值；
+  // 颜色与 styles.css :12-40 的令牌一致（canvas 不能直接吃 CSS 变量，这里抄一份字面值；
   // --text/--dim/--faint/--accent/--accent-hi 由 create() 在运行时从 getComputedStyle 读取覆盖）。
+  //
+  // v1.8 星空主题：球体材质改由 ui/starfield.js 直绘（恒星 / 行星 / 光束），这里的 COLOR
+  // 只服务地面参考环、文字、角标与 starfield.js 加载失败时的回退球体。
   const COLOR = {
-    line: 'oklch(0.35 0.03 255 / .6)',
-    flow: 'oklch(0.72 0.15 255 / .9)',
-    text: 'oklch(0.94 0.01 255)',
-    dim: 'oklch(0.68 0.02 255)',
-    faint: 'oklch(0.52 0.02 255)',
-    accent: 'oklch(0.62 0.17 255)',
-    accentHi: 'oklch(0.72 0.15 255)',
-    stroke: 'oklch(0.55 0.1 255)',
-    strokeOff: 'oklch(0.42 0.02 255)',
-    fillNode: 'oklch(0.4 0.06 255)',
-    fillOff: 'oklch(0.3 0.03 255)',
-    fillGhost: 'oklch(0.26 0.02 255)',
-    ground: 'oklch(0.42 0.03 255 / .42)',
-    groundDim: 'oklch(0.42 0.03 255 / .22)'
+    line: 'rgba(150,180,235,.30)',
+    flow: 'rgba(111,224,255,.95)',
+    text: '#eaf1ff',
+    dim: '#a3b3d1',
+    faint: '#6e7d9d',
+    accent: '#ffd27a',
+    accentHi: '#a9ecff',
+    stroke: 'rgba(150,200,255,.55)',
+    strokeOff: 'rgba(140,155,180,.45)',
+    fillNode: '#3f5a86',
+    fillOff: '#2a3348',
+    fillGhost: '#232a3c',
+    ground: 'rgba(150,180,235,.20)',
+    groundDim: 'rgba(150,180,235,.11)'
   }
 
   const STORE_KEY = 'audiohub.scene3d.v1'
@@ -441,6 +444,10 @@
     const store = loadStore()
     let view = camera(store.cam.yawDeg, store.cam.dist,
       store.cam.pitchDeg == null ? CFG.pitchDefault : store.cam.pitchDeg)
+    // 无级缩放：滚轮只改「目标距离」，渲染距离在 tick 里逐帧追过去（缓动收尾）。
+    // view 始终是"当前渲染值"，所以命中测试 / 投影 / 调试读数永远自洽；
+    // camTarget 为 null 表示已收敛。
+    let camTarget = null
     let nodes = []
     let byId = new Map()
     let worldPos = new Map()
@@ -494,7 +501,8 @@
         if (!ls) return
         ls.setItem(STORE_KEY, JSON.stringify({
           v: STORE_VERSION,
-          cam: { yawDeg: view.phiDeg, pitchDeg: view.pitchDeg, dist: view.dist },
+          // 缩放还在缓动时存"目标值"，否则下次启动会回到中途状态
+          cam: { yawDeg: view.phiDeg, pitchDeg: view.pitchDeg, dist: camTarget == null ? view.dist : camTarget },
           slots: store.slots
         }))
       } catch (e) { /* localStorage 不可用（隐私模式/文件协议）时静默 */ }
@@ -944,92 +952,103 @@
       }
     }
 
+    // 光束 = 音频流（恒星 ↔ 行星）：v1.8 起由 starfield.js 直绘 —
+    // 在线亮线、出声更亮并带星尘、离线灰暗虚线；选中加亮。
     function drawLinks (items) {
       let hubItem = null
       for (let i = 0; i < items.length; i++) if (items[i].rec.isHub) { hubItem = items[i]; break }
       if (!hubItem || !hubItem.visible) return
+      const sf = root.Starfield
+      if (!sf || typeof sf.drawBeam !== 'function') return
+      const star = { x: hubItem.sx, y: hubItem.sy, r: hubItem.rPx }
       for (let i = 0; i < items.length; i++) {
         const it = items[i]
-        if (it.rec.isHub || it.rec.ghost || !it.visible) continue
         const rec = it.rec
-        const selected = rec.id === selectedId
-        const boost = rec.flow && typeof rec.level === 'number' ? levelPct(rec.level) / 26 : 0
-        const width = selected ? Math.max(3, 2 + boost) : (rec.flow ? 2 + boost : 2)
-        ctx.beginPath()
-        ctx.moveTo(hubItem.sx, hubItem.sy)
-        ctx.lineTo(it.sx, it.sy)
-        ctx.strokeStyle = selected ? (theme ? theme.accentHi : COLOR.accentHi)
-          : (rec.flow ? COLOR.flow : COLOR.line)
-        ctx.lineWidth = Math.round(width * 10) / 10
-        ctx.globalAlpha = selected ? 1 : (rec.flow ? 0.95 : 0.7)
-        ctx.stroke()
-        ctx.globalAlpha = 1
+        if (rec.isHub || rec.ghost || !it.visible) continue
+        sf.drawBeam(ctx, star, {
+          x: it.sx,
+          y: it.sy,
+          r: it.rPx,
+          online: rec.online,
+          streaming: !!rec.flow,
+          selected: rec.id === selectedId,
+          level: rec.level
+        })
       }
     }
 
+    // v1.8 星空主题：星体本身由 ui/starfield.js 直绘（恒星 = 汇聚端 / 行星 = 设备），
+    // 这里只保留角标、名称、电平、距离这些"信息层"，以及 starfield.js 加载失败时的回退球体。
+    // 语义没变：hub 恒在原点、距离即音量、离线灰暗、本机/汇聚端有角标。
     function drawNode (it, showLabels) {
       const rec = it.rec
       if (!it.visible) return
       const selected = rec.id === selectedId
       const hovered = rec.id === hoverId
       const rPx = it.rPx
-      const alpha = rec.ghost ? 0.9 : (!rec.online ? 0.55 : (it.depth > 3.4 ? 0.78 : 1))
+      const alpha = rec.ghost ? 0.9 : (!rec.online ? 0.8 : (it.depth > 3.4 ? 0.84 : 1))
+      const sf = root.Starfield
+      const hubP = project(view, [0, 0, 0])
 
       ctx.save()
       ctx.globalAlpha = alpha
 
-      // 汇聚端光晕（沿用旧版两层半透明圆：r+15 / r+7）
-      if (rec.isHub && !rec.ghost) {
-        const accent = theme ? theme.accent : COLOR.accent
-        ctx.beginPath()
-        ctx.arc(it.sx, it.sy, rPx * (1 + 15 / 46), 0, Math.PI * 2)
-        ctx.fillStyle = accent
-        ctx.globalAlpha = alpha * 0.10
-        ctx.fill()
-        ctx.beginPath()
-        ctx.arc(it.sx, it.sy, rPx * (1 + 7 / 46), 0, Math.PI * 2)
-        ctx.globalAlpha = alpha * 0.14
-        ctx.fill()
-        ctx.globalAlpha = alpha
-      }
-
-      // 球体
-      const spr = getSprite(rec, rPx, selected, Math.max(canvasSize.dpr, 1))
-      if (spr.img) {
-        const s = spr.size
-        ctx.drawImage(spr.img, it.sx - s / 2, it.sy - s / 2, s, s)
-      } else {
+      if (rec.ghost) {
+        // 等待图谱：灰暗虚线圆 + ?
         ctx.beginPath()
         ctx.arc(it.sx, it.sy, rPx, 0, Math.PI * 2)
-        ctx.fillStyle = ballColor(rec)
+        ctx.fillStyle = COLOR.fillGhost
         ctx.fill()
-      }
-
-      // 电平弧（球外一圈，二级编码；旧版是一行文字，这里两者都保留）
-      if (typeof rec.level === 'number' && !rec.ghost) {
-        const pct = levelPct(rec.level) / 100
-        ctx.beginPath()
-        ctx.arc(it.sx, it.sy, rPx + 5, -Math.PI / 2, -Math.PI / 2 + pct * Math.PI * 2)
-        ctx.strokeStyle = theme ? theme.accentHi : COLOR.accentHi
-        ctx.globalAlpha = alpha * 0.85
-        ctx.lineWidth = 2
+        ctx.setLineDash([4, 5])
+        ctx.strokeStyle = COLOR.strokeOff
+        ctx.lineWidth = 1.5
         ctx.stroke()
-        ctx.globalAlpha = alpha
+        ctx.setLineDash([])
+      } else if (sf) {
+        if (rec.isHub) {
+          // 恒星 = 汇聚端：日冕 + 四向星芒 + 日珥 + 白热核心 + 总线电平弧
+          sf.drawStar(ctx, it.sx, it.sy, rPx, { level: rec.level })
+        } else {
+          // 行星 = 设备：朝恒星受光；离线灰暗 + 虚线外圈 + 行星环（环只给离线/特殊设备）
+          sf.drawPlanet(ctx, it.sx, it.sy, rPx, {
+            starX: hubP.sx,
+            starY: hubP.sy,
+            online: rec.online,
+            streaming: !!rec.flow,
+            palette: sf.paletteForId(rec.id),
+            level: rec.level,
+            selected: selected,
+            rings: !rec.online
+          })
+        }
+      } else {
+        // starfield.js 缺失时的回退：旧版圆形球体（不白屏、信息不丢）
+        const spr = getSprite(rec, rPx, selected, Math.max(canvasSize.dpr, 1))
+        if (spr.img) {
+          const s = spr.size
+          ctx.drawImage(spr.img, it.sx - s / 2, it.sy - s / 2, s, s)
+        } else {
+          ctx.beginPath()
+          ctx.arc(it.sx, it.sy, rPx, 0, Math.PI * 2)
+          ctx.fillStyle = ballColor(rec)
+          ctx.fill()
+        }
+        if (typeof rec.level === 'number') {
+          const pct = levelPct(rec.level) / 100
+          ctx.beginPath()
+          ctx.arc(it.sx, it.sy, rPx + 5, -Math.PI / 2, -Math.PI / 2 + pct * Math.PI * 2)
+          ctx.strokeStyle = theme ? theme.accentHi : COLOR.accentHi
+          ctx.globalAlpha = alpha * 0.85
+          ctx.lineWidth = 2
+          ctx.stroke()
+          ctx.globalAlpha = alpha
+        }
       }
 
-      // 球内文字：本机 / 短名 / ?
-      const insideFont = clamp(rPx * 0.34, 11, 15)
-      ctx.font = '600 ' + insideFont + 'px "Bahnschrift", "Segoe UI", sans-serif'
-      ctx.textAlign = 'center'
-      ctx.textBaseline = 'middle'
-      ctx.fillStyle = theme ? theme.text : COLOR.text
-      const inside = rec.ghost ? '?' : (rec.isSelf ? '本机' : shortName(rec.name, rec.isHub ? 6 : 4))
-      ctx.fillText(inside, it.sx, it.sy + 0.5)
-
-      // 角标：本机 · 汇聚端 · 离线（旧版在球正上方，这里贴球右上；靠近右边界时翻到左侧）
+      // 角标：本机 · 汇聚端 · 离线（贴球右上；靠近右边界时翻到左侧）
       const badge = badgeOf(rec)
       if (badge) {
-        ctx.font = '10.5px "Bahnschrift", "Segoe UI", sans-serif'
+        ctx.font = '10.5px "Bahnschrift", "Segoe UI", "Microsoft YaHei", sans-serif'
         try { ctx.letterSpacing = '1px' } catch (e) { /* 老内核没有 letterSpacing */ }
         const w = ctx.measureText(badge).width
         let bx = it.sx + rPx + 6
@@ -1037,41 +1056,64 @@
         if (bx < 4) bx = 4
         const by = clamp(it.sy - rPx + 2, 10, VH - 6)
         ctx.textAlign = 'left'
-        ctx.fillStyle = theme ? theme.accentHi : COLOR.accentHi
+        ctx.textBaseline = 'middle'
+        ctx.fillStyle = rec.isHub ? 'rgba(255,210,122,.95)' : (theme ? theme.accentHi : COLOR.accentHi)
+        ctx.shadowColor = 'rgba(2,4,12,.9)'
+        ctx.shadowBlur = 6
         ctx.fillText(badge, bx, by)
+        ctx.shadowBlur = 0
         try { ctx.letterSpacing = '0px' } catch (e) { /* noop */ }
       }
 
-      // 名称 / 电平：按节点在 hub 屏幕中心的上/下半区放球上或球下（与旧版信息位一致）
+      // 名称 / 电平 / 距离：按节点在 hub 屏幕中心的上/下半区放球上或球下（与旧版信息位一致）
       const isAbove = it.sy < CY
       const showName = showLabels || selected || hovered
-      const nameFont = rec.isHub ? 13 : 12.5
       ctx.textAlign = 'center'
+      ctx.textBaseline = 'alphabetic'
       if (rec.isHub) {
-        ctx.font = '600 ' + nameFont + 'px "Bahnschrift", "Segoe UI", sans-serif'
-        ctx.fillStyle = theme ? theme.dim : COLOR.dim
-        const hubName = rec.ghost ? '等待图谱…' : rec.name
-        ctx.fillText(clampText(hubName, 22), it.sx, it.sy + rPx + 18)
+        // 恒星下方：名称 + 汇聚总线电平（留出纵向星芒的空间）
+        const nameY = clamp(it.sy + rPx + 22, 12, VH - 26)
+        ctx.font = '600 13.5px "Bahnschrift", "Segoe UI", "Microsoft YaHei", sans-serif'
+        ctx.fillStyle = theme ? theme.text : COLOR.text
+        ctx.shadowColor = 'rgba(2,4,12,.95)'
+        ctx.shadowBlur = 8
+        ctx.fillText(clampText(rec.name, 22), it.sx, nameY)
+        ctx.shadowBlur = 0
         if (typeof rec.level === 'number') {
-          ctx.font = '11.5px "Bahnschrift", "Segoe UI", sans-serif'
-          ctx.fillStyle = theme ? theme.faint : COLOR.faint
-          ctx.fillText(dbText(rec.level), it.sx, it.sy + rPx + 33)
+          ctx.font = '11.5px "Bahnschrift", "Segoe UI", "Microsoft YaHei", sans-serif'
+          ctx.fillStyle = theme ? theme.dim : COLOR.dim
+          ctx.shadowColor = 'rgba(2,4,12,.95)'
+          ctx.shadowBlur = 7
+          ctx.fillText('汇聚总线 ' + dbText(rec.level), it.sx, nameY + 16)
+          ctx.shadowBlur = 0
         }
       } else if (showName) {
-        const nameY = isAbove ? it.sy - rPx - 9 : it.sy + rPx + 18
-        const lvlY = isAbove ? nameY - 14 : nameY + 14
-        ctx.font = nameFont + 'px "Bahnschrift", "Segoe UI", sans-serif'
-        ctx.fillStyle = theme ? theme.dim : COLOR.dim
-        ctx.fillText(clampText(rec.name, 18), it.sx, clamp(nameY, 10, VH - 6))
+        const nameY = isAbove ? it.sy - rPx - 10 : it.sy + rPx + 20
+        const lvlY = isAbove ? nameY - 14 : nameY + 15
+        ctx.font = '12.5px "Bahnschrift", "Segoe UI", "Microsoft YaHei", sans-serif'
+        ctx.fillStyle = rec.online ? (theme ? theme.text : COLOR.text) : (theme ? theme.faint : COLOR.faint)
+        ctx.shadowColor = 'rgba(2,4,12,.95)'
+        ctx.shadowBlur = 7
+        ctx.fillText(clampText(rec.name, 18), it.sx, clamp(nameY, 12, VH - 10))
         // 距离直接写在球下：球大小 + 数字双编码，别让用户猜远近
-        const info = (typeof rec.level === 'number' ? dbText(rec.level) + ' · ' : '') + it.dist.toFixed(2) + ' m'
-        ctx.font = '11.5px "Bahnschrift", "Segoe UI", sans-serif'
+        const info = (typeof rec.level === 'number' && rec.online ? dbText(rec.level) + ' · ' : '') +
+          it.dist.toFixed(2) + ' m'
+        ctx.font = '11.5px "Bahnschrift", "Segoe UI", "Microsoft YaHei", sans-serif'
         ctx.fillStyle = theme ? theme.faint : COLOR.faint
-        ctx.fillText(info, it.sx, clamp(lvlY, 10, VH - 6))
+        ctx.fillText(info, it.sx, clamp(lvlY, 12, VH - 8))
+        ctx.shadowBlur = 0
+      } else {
+        // 设备多、标签关闭时：行星里留一个短名，信息不丢（旧版球内文字的等价物）
+        const insideFont = clamp(rPx * 0.34, 10, 13)
+        ctx.font = '600 ' + insideFont + 'px "Bahnschrift", "Segoe UI", "Microsoft YaHei", sans-serif'
+        ctx.fillStyle = 'rgba(4,8,18,.72)'
+        ctx.textBaseline = 'middle'
+        ctx.fillText(shortName(rec.name, 4), it.sx, it.sy + 0.5)
+        ctx.textBaseline = 'alphabetic'
       }
 
-      // 选中态：球外再套一圈（旧版是加粗描边，canvas 里 sprite 已处理，这里补一圈光）
-      if (selected) {
+      // 选中态（当前没有"选中"交互，保留给以后 / e2e 注入 selectedId；行星已由 starfield 绘制）
+      if (selected && !sf) {
         ctx.beginPath()
         ctx.arc(it.sx, it.sy, rPx + 3, 0, Math.PI * 2)
         ctx.strokeStyle = theme ? theme.text : COLOR.text
@@ -1107,6 +1149,10 @@
 
       const items = projectAll()
       lastItems = items
+      // 图谱内局部星野：恒星周围的金色星云 + 固定种子尘埃（页面 #sky 在画布透明处透出）
+      if (root.Starfield && typeof root.Starfield.drawGraphBackdrop === 'function') {
+        root.Starfield.drawGraphBackdrop(ctx, { x: CX, y: CY })
+      }
       drawGround(size)
       drawLinks(items)
       const others = nodes.length - 1
@@ -1143,6 +1189,19 @@
         }
         dirty = true
         if (k >= 1) { anim.active = false; anim.from = new Map() }
+      }
+      // 无级缩放的缓动：每帧把渲染距离向目标追 28%，约 250ms 内视觉收敛；
+      // 低于 2mm 的残差直接吸附，避免永远差一点导致一直重绘。
+      if (camTarget != null) {
+        const gap = camTarget - view.dist
+        if (Math.abs(gap) < 0.002) {
+          view = camera(view.phiDeg, camTarget, view.pitchDeg)
+          camTarget = null
+          saveStore()
+        } else {
+          view = camera(view.phiDeg, view.dist + gap * 0.28, view.pitchDeg)
+        }
+        dirty = true
       }
       if (!active || !dirty) return
       dirty = false
@@ -1259,8 +1318,11 @@
       const unit = ev.deltaMode === 1 ? 33 : (ev.deltaMode === 2 ? VH : 1)
       const delta = (Number.isFinite(ev.deltaY) ? ev.deltaY : 0) * unit
       // 方向：滚轮向上（deltaY<0）= 凑近放大，向下 = 拉远看全景。
-      const dist = clamp(view.dist * Math.exp(delta * 0.0012), CFG.distMin, CFG.distMax)
-      view = camera(view.phiDeg, dist, view.pitchDeg)
+      // 无级缩放：每格步长比旧版更细（0.0011），并在当前目标距离上继续累加，
+      // 连滚多格时不会因为"还没追到"而丢步。
+      const base = camTarget == null ? view.dist : camTarget
+      const dist = clamp(base * Math.exp(delta * 0.0011), CFG.distMin, CFG.distMax)
+      camTarget = dist
       saveStore()
       dirty = true
     }

@@ -10,6 +10,10 @@
 // 本文件必须容忍 graph 缺失 / 字段缺失（旧后端、启动瞬间）：退化成用 sources 拼图，不白屏。
 
 let screen = 'connect'          // 'connect' | 'control'
+// 用户点了「全部断开」之后的黏着锁：远端 hub 的图谱可能还残留 1~10s（节点≥2 但已无会话），
+// 若只看图谱就会把界面又弹回控制台。锁住直到出现「新的会话」证据（可信来源 / 本机重新供声）。
+let leftLock = false
+let leftAt = 0
 let lastState = null
 let autoTouched = false
 let menuNodeId = null           // 右键菜单当前指向的节点（图谱里消失时收起菜单）
@@ -889,8 +893,22 @@ function render (state) {
   const localFlow = confirmedCount > 0 || !!state.pcSource
   const anyConnection = networkUp || localFlow
 
+  // 断开锁：只有出现「新会话」的证据才解锁。这里刻意不把"图谱变空"当成解锁条件 ——
+  // 本机作为客户端时，远端 hub 的图谱可能先空一下又回灌旧节点（最长 10s 才转离线），
+  // 一解锁就会被残留图谱弹回控制台，这正是用户反馈的那个 bug。
+  //  - confirmed 来源 > 0：本机确实在收流。清空会话后 sources 会立即清空，所以连续 0.8s 之后
+  //    仍存在的 confirmed 只可能来自新连接（0.8s 是等 disconnect 的异步回调落地）。
+  //  - 本机重新供声（pcSource）持续 > 1.5s：停止采集同样是异步的，刚断开时会短暂仍为 true。
+  // 兜底：用户重新邀请设备 / 接受待确认请求，都会先落到上面两种证据上。
+  if (leftLock) {
+    const settled = Date.now() - leftAt
+    if ((confirmedCount > 0 && settled > 800) || (state.pcSource && settled > 1500)) {
+      leftLock = false
+    }
+  }
+
   // 自动切换屏幕：有图谱网络 / 本机有流 → 控制；否则 → 连接
-  const next = anyConnection ? 'control' : 'connect'
+  const next = anyConnection && !leftLock ? 'control' : 'connect'
   if (next !== screen) {
     hideNodeMenu()
     graphBuiltSig = ''
@@ -1045,6 +1063,9 @@ $('ctrlInviteBtn').addEventListener('click', async () => {
 })
 
 $('leaveBtn').addEventListener('click', async () => {
+  // 一按下就上锁：clearSession 是异步的，期间轮询可能先拿到「图谱还没重置」的旧状态。
+  leftLock = true
+  leftAt = Date.now()
   const s = await window.hub.getState()
   const sources = s && Array.isArray(s.sources) ? s.sources : []
   for (const src of sources) {
@@ -1055,6 +1076,31 @@ $('leaveBtn').addEventListener('click', async () => {
   hideNodeMenu()
   setSync('', '')
 })
+
+// ============================================================ 整页星野背景（v1.8）
+
+// #sky 是页面最底层 canvas（ui/starfield.js 的 paintSky）：固定随机种子 → 每次刷新星点
+// 位置一致（不闪、不随机跳）；只在窗口尺寸变化时重画一次，不进 200ms 轮询，也不跟随
+// 图谱相机旋转（星野是"天"，相机只是换个角度看房间）。纯装饰：失败不影响任何功能。
+let skyPaintTimer = 0
+
+function paintSkyLayer () {
+  const canvas = $('sky')
+  if (!canvas || !window.Starfield || typeof window.Starfield.paintSky !== 'function') return
+  try {
+    window.Starfield.paintSky(canvas)
+  } catch (err) {
+    console.error('[sky] 星野背景绘制失败: ' + (err && err.message))
+  }
+}
+
+function scheduleSkyPaint () {
+  if (skyPaintTimer) clearTimeout(skyPaintTimer)
+  skyPaintTimer = setTimeout(() => { skyPaintTimer = 0; paintSkyLayer() }, 120)
+}
+
+paintSkyLayer()
+window.addEventListener('resize', scheduleSkyPaint)
 
 // ============================================================ 订阅
 
