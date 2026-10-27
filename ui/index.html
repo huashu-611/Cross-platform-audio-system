@@ -69,18 +69,11 @@
     <!-- 切换后的同步状态：已切换，正在同步… / 已同步（vN） -->
     <div id="graphStatus" class="graphstatus" style="display:none"></div>
 
-    <!-- 节点右键菜单（左键只拖动；切换汇聚端 / 音量与静音 / 位置复位都在这里）。
+    <!-- 节点右键菜单（左键只拖动；切换汇聚端 / 位置复位 / 所有设备位置复位都在这里；
+         v1.6 起音量滑块已删除 —— 距离即音量，拖远即变轻）。
          内容由 renderer.js 动态生成，位置 fixed 跟随鼠标并夹在视口内。 -->
     <div id="ctxMenu" class="ctxmenu" style="display:none"></div>
 
-    <div id="volumePanel" class="volpanel" style="display:none">
-      <div class="volname" id="volName">—</div>
-      <div class="row">
-        <input type="range" id="volSlider" min="0" max="150" value="100">
-        <span class="pct" id="volPct">100%</span>
-        <button class="mute" id="volMute">静音</button>
-      </div>
-    </div>
     <!-- 会话进行中也可能有新设备接入 -->
     <div id="ctrlReq"></div>
 

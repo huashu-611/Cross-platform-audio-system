@@ -11,6 +11,7 @@ import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
 import android.media.AudioPlaybackCaptureConfiguration;
 import android.media.AudioFormat;
+import android.media.AudioManager;
 import android.media.AudioRecord;
 import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
@@ -66,6 +67,20 @@ public class CaptureService extends Service {
     public static volatile String sHost = "";
     public static volatile int sPort = 0;
     public static volatile int sStreamId = 0;
+
+    // ---- 连接后静音（用户 2026-10-27 定稿）：手机作音源时静音媒体音量，只让汇聚端出声。
+    // 停止/异常/线程退出都恢复。另带自愈：若这台机器上"静音"真的把采集掐了，自动取消静音。
+    // 阈值与时长：电平 >-60 dBFS 视为有信号，<-100 dBFS 视为静音，持续 3 s 触发自愈。----
+    private static final int MUTE_SIGNAL_DBFS = -60;
+    private static final int MUTE_SILENT_DBFS = -100;
+    private static final long MUTE_HEAL_SILENCE_MS = 3000L;
+
+    private AudioManager audioManager;
+    private int savedMusicVolume = -1;          // -1 = 没有保存（当前音量不是我们静音的）
+    private volatile boolean mutedByUs = false;
+    private boolean healWarned = false;         // 自愈告警只打一次（采集线程读写）
+    private boolean hadSignalLevel = false;     // 静音后是否见过信号（采集线程读写）
+    private long silentSinceElapsed = -1;       // 连续静音的起点（elapsedRealtime）
 
     private MediaProjection projection;
     private MediaProjection.Callback projectionCallback;
@@ -172,6 +187,9 @@ public class CaptureService extends Service {
         if (!startRecording()) {
             return START_NOT_STICKY;
         }
+
+        // 开始采集后立刻静音媒体音量：声音只从汇聚端耳机出（用户定稿）。
+        muteMediaVolume();
 
         acquireLocks();
         sRunning = true;
@@ -317,18 +335,135 @@ public class CaptureService extends Service {
                 sLevelDbfs = mean > 0 ? (int) Math.round(10 * Math.log10(mean)) : -120;
                 sKbps = sPackets * PacketProtocol.PACKET_BYTES * 8.0 / 1000.0
                         / ((now - t0) / 1000.0);
+                // 静音自愈：静音后若采集电平持续静音，说明静音掐掉了采集，自动取消静音。
+                maybeHealMute(sLevelDbfs);
                 levelSum = 0;
                 levelPackets = 0;
                 levelWindowStart = now;
             }
         }
 
+        // 采集线程自己退出（AudioRecord 错误等）：也要恢复音量，不能把用户手机留在静音。
         sRunning = false;
+        restoreMediaVolume();
+    }
+
+    // ------------------------------------------------------------ 静音与自愈
+
+    /**
+     * 开始采集后静音媒体音量（用户定稿：连接后直接静音，只有汇聚端的耳机出声）。
+     *
+     * 只接管"当前不是静音"的情况：本来就是 0，说明用户自己静音了，不接管，停止时也不弹回来。
+     * 部分机型/勿扰模式会拒绝改音量（SecurityException），失败只记日志，绝不影响采集。
+     */
+    private synchronized void muteMediaVolume() {
+        if (mutedByUs) return;
+        healWarned = false;
+        hadSignalLevel = false;
+        silentSinceElapsed = -1;
+        try {
+            if (audioManager == null) {
+                audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+            }
+            if (audioManager == null) return;
+            final int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+            if (current <= 0) {
+                Log.i(TAG, "媒体音量本来就是 0，不接管（停止采集时不恢复）");
+                return;
+            }
+            savedMusicVolume = current;
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0);
+            mutedByUs = true;
+            Log.i(TAG, "已静音媒体音量（原音量 " + current + "/"
+                    + audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                    + "，声音只从汇聚端播放）");
+        } catch (Exception e) {
+            mutedByUs = false;
+            savedMusicVolume = -1;
+            Log.w(TAG, "静音媒体音量失败（不影响采集）: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 恢复采集前的媒体音量。停止采集/服务销毁/异常退出/采集线程结束/自愈都走这里。
+     * 若用户在静音期间自己把音量调回去了，保留用户的值，不再覆盖（"只在采集起停时动"）。
+     */
+    private synchronized void restoreMediaVolume() {
+        if (!mutedByUs) return;
+        mutedByUs = false;
+        final int restore = savedMusicVolume;
+        savedMusicVolume = -1;
+        if (restore <= 0) return;
+        try {
+            if (audioManager == null) {
+                audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+            }
+            if (audioManager == null) return;
+            if (audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) > 0) {
+                Log.i(TAG, "媒体音量已被用户改动，保留当前值");
+                return;
+            }
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, restore, 0);
+            Log.i(TAG, "已恢复媒体音量 " + restore);
+        } catch (Exception e) {
+            Log.w(TAG, "恢复媒体音量失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 静音自愈（采集线程每个 1 秒电平窗口调用一次）。
+     *
+     * Windows 上验证过"端点静音不影响 WASAPI 回环采集"；Android 的 AudioPlaybackCapture
+     * 理论上也不受媒体音量影响，但没实测。所以留一个安全阀：静音后若采集电平持续静音，
+     * 自动取消静音并 log 一次警告，避免把整个流变成静音。
+     *
+     * 触发条件：静音电平持续 ≥3 秒 **且** 系统确实在放声音（isMusicActive，说明有内容要被采集
+     * 却抓不到信号）。额外用 isMusicActive 做闸门是必要的：只看"由有信号变为静音"的话，
+     * 用户暂停播放 3 秒就会把音量弹回来，之后恢复播放手机又出声，违背"连接后保持静音"；
+     * 这个闸门也顺带兜住了"静音从一开始就掐断采集"（启动路径上永远见不到"有信号"）。
+     */
+    private void maybeHealMute(int levelDbfs) {
+        if (!mutedByUs) return;
+        if (levelDbfs > MUTE_SILENT_DBFS) {
+            if (levelDbfs > MUTE_SIGNAL_DBFS) hadSignalLevel = true;
+            silentSinceElapsed = -1;   // 不静音了，清掉计时
+            return;
+        }
+        final boolean musicActive = isMusicActive();
+        if (!musicActive) return;      // 系统没在放声音：静音是正常状态，不要弹回音量
+        final long now = SystemClock.elapsedRealtime();
+        if (silentSinceElapsed < 0) {
+            silentSinceElapsed = now;
+            return;
+        }
+        if (now - silentSinceElapsed < MUTE_HEAL_SILENCE_MS) return;
+        if (!healWarned) {
+            healWarned = true;
+            Log.w(TAG, "静音自愈：静音后采集电平持续 " + MUTE_HEAL_SILENCE_MS + " ms 静音（"
+                    + levelDbfs + " dBFS，musicActive=" + musicActive
+                    + "，hadSignal=" + hadSignalLevel
+                    + "），自动取消静音，避免把流变成静音");
+        }
+        restoreMediaVolume();
+    }
+
+    /** 系统当前是否有音乐类播放（自愈用：有播放却抓不到信号 = 采集可能被静音掐了）。 */
+    private boolean isMusicActive() {
+        try {
+            if (audioManager == null) {
+                audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+            }
+            return audioManager != null && audioManager.isMusicActive();
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     // ------------------------------------------------------------ 收尾
 
     private void stopCapture() {
+        // 先恢复音量：任何结束路径（停止/失败/销毁/授权被系统撤销）都走这里。
+        restoreMediaVolume();
         running = false;
         sRunning = false;
         sHost = "";

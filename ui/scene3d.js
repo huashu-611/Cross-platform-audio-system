@@ -15,15 +15,19 @@
 //   - 听者固定在房间中心 (0,0,0)、朝向固定 -Z（yaw=0）。相机 orbit 只改"从哪看"，
 //     不转听者、不转声场 —— 左右/前后只由节点在房间地面的位置决定；
 //   - 节点不再等距排圆环：默认落在预计算的 32 个散点上（0.85–2.2 m，前方 ≥1.35 m、
-//     后方 ≤1.5 m），按设备 id 持久化（store.slots）；拖动可在 0.45–2.3 m 地面自由摆位；
+//     后方 ≤1.5 m），按设备 id 持久化（store.slots）；拖动可从 0.45 m 起落到地面任意位置，
+//     没有半径上限（v1.6：距离即音量，拖多远衰减多少）；
 //   - 摆位跨设备同步（v1.4，GRAPH-PROTOCOL §13）：拖完的位置写进内核图谱，用 POS 帧
 //     广播给所有电脑/手机 —— 谁拖都算数，位置在全网只有一份（本机 store 只留相机与槽位）；
 //   - 球的屏幕大小 = 透视 × 距离缩放（近大远小），与音量衰减同向；名称行显示 "x.xx m"。
 //
 // v1.5 交互（用户定案，2026-10-27）：
 //   左键只负责拖动 —— 节点上拖=摆位，空白处拖=轨道旋转，单击不选中、不弹条；
-//   右键节点弹菜单（切换汇聚端 / 音量与静音 / 位置复位，菜单 UI 在 renderer.js）；
+//   右键节点弹菜单（切换汇聚端 / 位置复位 / hub 上多一项"所有设备位置复位"，菜单 UI 在 renderer.js）；
 //   双击不再触发任何动作（旧"双击切汇聚端"随操作条一起废除）。
+//
+// v1.6（用户定案，2026-10-27）：取消音量调节 —— 距离就是音量，拖拽不再有半径上限
+//   （内核 DistanceGain 同步去掉远场下限；坐标上限提到 ±320 m := POS 帧 ±32000 cm）。
 //
 // 相机：绕原点球坐标 (φ, dist, pitch)，默认 φ=0、dist=3.4、pitch=40°，
 // 看向原点；fovY=47.5° → 焦距 focalPx=(460/2)/tan(23.75°)=522.71（与旧 920x460 视口对齐）。
@@ -66,7 +70,8 @@
     slotGap: 0.42,            // 槽位间最小平面距离（米），保证球不叠
     // —— 拖动 / 相机 ——
     dragRMin: 0.45,           // 拖节点离听者太近会"穿过头"
-    dragRMax: 2.3,            // 房间边界（地面 R=2 环外侧留一点余量）
+    // 拖拽没有半径上限（v1.6 定稿：距离即音量，拖多远就轻多少）；
+    // 落点只受画布可视区域与 ROOM_COORD_MAX（POS 帧绝对坐标上限）约束。
     // —— 球体尺寸：屏幕半径 = 透视投影 × 距离缩放（近大远小，与音量衰减同向）——
     hubBallR: 0.23,           // 旧 HUB_R=46px 反解：46*2.6/522.71≈0.229
     nodeBallR: 0.145,         // 旧 NODE_R=29px 反解：29*2.6/522.71≈0.144
@@ -112,9 +117,10 @@
 
   const STORE_KEY = 'audiohub.scene3d.v1'
 
-  // 摆位坐标上限（米）：与内核 POS 帧的 ±20 m 上限一致（拖拽交互另受 CFG.dragRMax 约束）。
+  // 摆位坐标绝对上限（米）：与内核 POS 帧的 ±320 m（±32000 cm）上限一致。
+  // 拖拽本身不再有半径上限 —— 距离就是音量（v1.6 定稿）；这里只是脏数据闸门。
   // 位置真相在内核图谱里（跨电脑/手机同步），本机只存相机与自动槽位。
-  const ROOM_COORD_MAX = 20
+  const ROOM_COORD_MAX = 320
   const STORE_VERSION = 3
 
   // ============================================================ 向量与数值工具
@@ -217,8 +223,8 @@
   // 有真实位置，离听者越远声音越小、球也越小。默认位置用预计算的 32 个散点槽位：
   // 距离 0.85–2.2 m（前方 ≥1.35 m 防叠 hub 球，后方 ≤1.5 m 防投到屏幕外），
   // 相邻槽位平面距离 ≥0.42 m；按设备 id 持久化（store.slots），增删其他设备不重排。
-  // 拖动 = 地面自由摆位（0.45–2.3 m），落点同步进内核图谱（全设备一致）；
-  // 位置复位 = 右键菜单里的一项，清掉全网摆位后退回本机槽位。
+  // 拖动 = 地面自由摆位（最小 0.45 m，无半径上限：v1.6 距离即音量），落点同步进内核图谱；
+  // 位置复位 = 右键菜单里的一项，清掉全网摆位后退回本机槽位（hub 菜单里还有"所有设备复位"）。
   const SLOT_COUNT = 32
 
   // 候选点是否与已占槽位保持 slotGap（米）
@@ -703,7 +709,7 @@
           radius: CFG.roomR,
           rings: [1, 2],
           dragRMin: CFG.dragRMin,
-          dragRMax: CFG.dragRMax,
+          dragRMax: ROOM_COORD_MAX,   // 拖拽半径无上限，这里回报 POS 帧的绝对坐标上限（米）
           sizePow: CFG.sizePow
         },
         pcSource: pcSource,
@@ -1199,16 +1205,21 @@
         return
       }
 
-      // 拖节点：屏幕点 → y=0 平面 → 半径夹紧（拖到听者左/右侧即改变声像）
+      // 拖节点：屏幕点 → y=0 平面 → 只做绝对坐标夹紧与"别穿过头"的最小半径。
+      // 没有最大半径：距离就是音量（v1.6 定稿），拖多远衰减多少。
       if (!drag.moved) return
       const p = toLogical(ev.clientX, ev.clientY)
       const world = unproject(view, p.sx, p.sy, 0)
       if (!world) return
-      const maxR = CFG.dragRMax    // 房间边界固定：相机拉近时也不该缩成半米活动范围
-      let x = world[0]
-      let z = world[2]
+      let x = clamp(world[0], -ROOM_COORD_MAX, ROOM_COORD_MAX)
+      let z = clamp(world[2], -ROOM_COORD_MAX, ROOM_COORD_MAX)
       const rr = Math.hypot(x, z)
-      if (rr < 1e-6) { x = 0; z = -CFG.dragRMin } else if (rr > maxR) { x *= maxR / rr; z *= maxR / rr } else if (rr < CFG.dragRMin) { x *= CFG.dragRMin / rr; z *= CFG.dragRMin / rr }
+      if (rr < 1e-6) {
+        x = 0; z = -CFG.dragRMin
+      } else if (rr < CFG.dragRMin) {
+        x *= CFG.dragRMin / rr
+        z *= CFG.dragRMin / rr
+      }
       const pos = [x, 0, z]
       worldPos.set(drag.id, pos)
       targetPos.set(drag.id, pos)

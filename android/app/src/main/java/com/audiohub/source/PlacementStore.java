@@ -19,7 +19,7 @@ import java.util.TreeMap;
  * </pre>
  * <ul>
  *   <li>nodeId / origin 与 GRAPH 一致：{@code ip:port}；items 可以为空（= 没有任何人工摆位）。</li>
- *   <li>坐标是厘米、有符号十进制整数，范围 ±2000（±20 m）；越界或非法 = 整帧丢弃。</li>
+ *   <li>坐标是厘米、有符号十进制整数，范围 ±32000（±320 m）；越界或非法 = 整帧丢弃。</li>
  *   <li>整布局 LWW（不是逐节点）：version 大者胜；version 相等时 origin 字典序大者胜。</li>
  *   <li>帧上限 1000 字节、节点上限 32 个，超出整帧丢弃。</li>
  * </ul>
@@ -28,8 +28,8 @@ import java.util.TreeMap;
  */
 public final class PlacementStore {
 
-    /** 坐标上限（厘米）：±2000 cm = ±20 m，与 PC 端 kPlacementCoordLimitCm 一致。 */
-    public static final int COORD_LIMIT_CM = 2000;
+    /** 坐标上限（厘米）：±32000 cm = ±320 m，与 PC 端 kPlacementCoordLimitCm 一致。 */
+    public static final int COORD_LIMIT_CM = 32000;
     /** 单帧字节上限，与 PC 端 kMaxPlacementFrameBytes 一致。 */
     public static final int MAX_FRAME_BYTES = 1000;
     /** 单帧节点上限，与 PC 端 kMaxGraphNodes 一致。 */
@@ -247,12 +247,12 @@ public final class PlacementStore {
     }
 
     /**
-     * 有符号厘米整数：可选前导 '-'、其余全数字、绝对值 ≤ 2000（对应 C++ ParseSignedCm）。
-     * 注意：-32768 这类"清除哨兵"不在协议里（PC 端也不支持），会被判非法并整帧丢弃；
-     * 清除某个摆位的正确方式是下一帧里直接不包含该 nodeId。
+     * 有符号厘米整数：可选前导 '-'、其余全数字、绝对值 ≤ 32000（±320 m，对应 C++ ParseSignedCm）。
+     * 注意：最长 "-32000"（6 字符）；-32768 这类"清除哨兵"不在协议里（PC 端也不支持），
+     * 会被判非法并整帧丢弃；清除某个摆位的正确方式是下一帧里直接不包含该 nodeId。
      */
     private static Integer parseSignedCm(String s) {
-        if (s == null || s.isEmpty() || s.length() > 5) return null;
+        if (s == null || s.isEmpty() || s.length() > 6) return null;
         int i = 0;
         boolean negative = false;
         if (s.charAt(0) == '-') {

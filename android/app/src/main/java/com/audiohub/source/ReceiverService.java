@@ -428,7 +428,7 @@ public class ReceiverService extends Service {
     public static void setStreamPosition(int streamId, float x, float y, float z) {
         if (streamId <= 0) return;   // 还没有流的节点：等有流了再报，别留无主条目
         if (!isFinite(x) || !isFinite(y) || !isFinite(z)) return;   // NaN/Inf 直接拒绝
-        // 与内核/协议同一上限（kSpatialCoordLimit=20 m）：越界截断而不是丢弃，
+        // 与内核/协议同一上限（kSpatialCoordLimit=±320 m）：越界截断而不是丢弃，
         // 免得 UI 一时算出的离群值把这一路永久变成"无位置"。
         final float lim = Spatial.kSpatialCoordLimit;
         sStreamPositions.put(streamId, new float[]{

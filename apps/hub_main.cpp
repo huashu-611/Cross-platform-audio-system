@@ -531,7 +531,10 @@ int main(int argc, char** argv) {
                               return "{\"ok\":false,\"error\":\"need x/z\"}";
                             }
                             if (!(std::isfinite(x) && std::isfinite(z)) ||
-                                !(x >= -20.0 && x <= 20.0) || !(z >= -20.0 && z <= 20.0)) {
+                                !(x >= -audiohub::kSpatialCoordLimit &&
+                                  x <= audiohub::kSpatialCoordLimit) ||
+                                !(z >= -audiohub::kSpatialCoordLimit &&
+                                  z <= audiohub::kSpatialCoordLimit)) {
                               return "{\"ok\":false,\"error\":\"coord out of range\"}";
                             }
                             // 坐标与现有值相同 → 内核不造新版本（避免两端互相回发）
@@ -558,9 +561,9 @@ int main(int argc, char** argv) {
                           if (!has_pos) return "{\"ok\":false,\"error\":\"need x/y/z\"}";
                           audiohub::ListenerPose pose;
                           pose.position = audiohub::Vec3{
-                              static_cast<float>(std::clamp(x, -20.0, 20.0)),
-                              static_cast<float>(std::clamp(y, -20.0, 20.0)),
-                              static_cast<float>(std::clamp(z, -20.0, 20.0))};
+                              static_cast<float>(std::clamp(x, -static_cast<double>(audiohub::kSpatialCoordLimit), static_cast<double>(audiohub::kSpatialCoordLimit))),
+                              static_cast<float>(std::clamp(y, -static_cast<double>(audiohub::kSpatialCoordLimit), static_cast<double>(audiohub::kSpatialCoordLimit))),
+                              static_cast<float>(std::clamp(z, -static_cast<double>(audiohub::kSpatialCoordLimit), static_cast<double>(audiohub::kSpatialCoordLimit)))};
                           pose.yaw_deg = static_cast<float>(std::clamp(yaw, -180.0, 180.0));
                           pose.pitch_deg = static_cast<float>(std::clamp(pitch, -90.0, 90.0));
                           hub.SetListenerPose(pose, true);
@@ -580,7 +583,7 @@ int main(int argc, char** argv) {
                           }
                           bool enabled = true;
                           audiohub::JsonFindBool(body, "enabled", &enabled);
-                          // 范围按报告 §2.4.1：每个分量 ∈[-20,20]（单位≈米）。
+                          // 范围与内核/协议一致：每个分量 ∈[-kSpatialCoordLimit, kSpatialCoordLimit]。
                           // 用 !(x>=lo && x<=hi) 让 NaN 也走拒绝分支。
                           const double lim = audiohub::kSpatialCoordLimit;
                           if (!(x >= -lim && x <= lim) || !(y >= -lim && y <= lim) ||

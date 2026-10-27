@@ -159,9 +159,8 @@ public final class SpatialCheck {
         eq("kSpatialHistoryFrames", Spatial.kSpatialHistoryFrames, 64);
         eq("kSpatialHistoryChannels", Spatial.kSpatialHistoryChannels, 2);
         exact("kMinDistanceM", Spatial.kMinDistanceM, 0.25f);
-        exact("kMinDistanceGain", Spatial.kMinDistanceGain, 0.5f);
         exact("kMaxDistanceGain", Spatial.kMaxDistanceGain, 2.0f);
-        exact("kSpatialCoordLimit", Spatial.kSpatialCoordLimit, 20.0f);
+        exact("kSpatialCoordLimit", Spatial.kSpatialCoordLimit, 320.0f);
         eq("kSampleRate", Spatial.kSampleRate, 48000);
         end("SpatialConstantsMatchCpp", f);
     }
@@ -214,7 +213,10 @@ public final class SpatialCheck {
         near("d=2", Spatial.distanceGain(2.0f), 0.5f, kTol);     // -6.02 dB
         near("d=0.5", Spatial.distanceGain(0.5f), 2.0f, kTol);   // +6.02 dB
         near("d=0.25", Spatial.distanceGain(0.25f), 2.0f, kTol); // 近场封顶
-        near("d=4", Spatial.distanceGain(4.0f), 0.5f, kTol);     // 远场下限
+        // 用户 2026-10-27 定稿「距离即音量」：取消远场下限，一直按 1/d 衰减。
+        near("d=4", Spatial.distanceGain(4.0f), 0.25f, kTol);    // -12.04 dB
+        near("d=10", Spatial.distanceGain(10.0f), 0.1f, kTol);   // -20 dB
+        near("d=40", Spatial.distanceGain(40.0f), 0.025f, kTol); // -32 dB
         near("d=0", Spatial.distanceGain(0.0f), 2.0f, kTol);     // 除零保护
         near("20log10(g(2))", (float) (20.0 * Math.log10(Spatial.distanceGain(2.0f))),
                 -6.0206f, 0.01f);

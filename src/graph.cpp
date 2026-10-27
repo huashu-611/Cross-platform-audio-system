@@ -147,7 +147,7 @@ std::string BuildPlacementBody(const PlacementState& p) {
 
 // 严格解析有符号厘米坐标：可选 '-'，十进制，绝对值不超过 ±kPlacementCoordLimitCm。
 bool ParseSignedCm(const std::string& s, int16_t* out) {
-  if (s.empty() || s.size() > 5) return false;  // 最长 "-2000"
+  if (s.empty() || s.size() > 6) return false;  // 最长 "-32000"
   size_t i = 0;
   bool neg = false;
   if (s[0] == '-') {

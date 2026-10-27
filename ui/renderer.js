@@ -2,18 +2,16 @@
 //
 //   连接界面 —— 建立连接（设备列表 / 待确认请求）
 //   控制界面 —— 全网图谱（协议 §9）：节点 = 图谱里的所有设备；
-//               汇聚端大球在中心，本机/离线有角标；拖动摆位（左键），
-//               右键节点弹菜单：切换汇聚端 / 音量与静音 / 位置复位。
+//               汇聚端大球在中心，本机/离线有角标；左键拖动摆位（距离即音量），
+//               右键节点弹菜单：切换汇聚端 / 位置复位（hub 上还有"所有设备位置复位"）。
 //
 // 界面切换：图谱节点数 >= 2（网络已形成）或本机有音频流 → 控制界面。
 // 角色不在这里"猜"：state.graph 说了算，本层不调 setRole（旧接口已废弃）。
 // 本文件必须容忍 graph 缺失 / 字段缺失（旧后端、启动瞬间）：退化成用 sources 拼图，不白屏。
 
 let screen = 'connect'          // 'connect' | 'control'
-let selected = null             // 展开音量面板的节点 { nodeId } 或 null
 let lastState = null
 let autoTouched = false
-let volDragging = false
 let menuNodeId = null           // 右键菜单当前指向的节点（图谱里消失时收起菜单）
 
 // 切换汇聚端的交互状态
@@ -253,8 +251,11 @@ function hasFlow (state, node) {
 //   - v1.4 摆位全网同步：拖完的落点写进本机内核图谱，由 POS 帧广播给所有电脑/手机
 //     （GRAPH-PROTOCOL §13）；别的电脑拖动时本机轮询到新坐标后会平滑跟过去。
 //   - hub 永远在原点 → 投影恒为屏幕 (460,208)，与旧中心完全一致；
-//   - v1.5 交互：左键只拖动（摆位 / 轨道旋转）；右键节点弹菜单（切换汇聚端 / 音量与静音 /
-//     位置复位），菜单 UI 与同步状态都在本文件，scene 只负责绘制与"右键 → onMenu"回调。
+//   - v1.5 交互：左键只拖动（摆位 / 轨道旋转）；右键节点弹菜单（切换汇聚端 / 位置复位；
+//     hub 上多一项"所有设备位置复位"），菜单 UI 与同步状态都在本文件，scene 只负责
+//     绘制与"右键 → onMenu"回调。
+//   - v1.6 距离即音量（用户定稿）：删掉音量滑块与静音入口，远近即响度，拖多远衰减多少
+//     （内核 DistanceGain 不再有远场下限，拖拽半径也不再夹在 2.3 m）。
 // scene3d.js 缺失（旧包 / 加载失败）时静默降级：图谱区空白，其他界面照常可用。
 
 let scene = null
@@ -285,7 +286,7 @@ function ensureScene () {
   try {
     scene = api.create({
       canvas: canvas,
-      // 右键节点 → 菜单（切换汇聚端 / 音量与静音 / 位置复位）；点空白收起菜单。
+      // 右键节点 → 菜单（切换汇聚端 / 位置复位 / 所有设备位置复位）；点空白收起菜单。
       onMenu: (nodeId, clientX, clientY) => openNodeMenu(nodeId, clientX, clientY),
       // 拖完：先写内核图谱（跨设备同步），再推一次空间音频（不等 50 ms tick）
       onDragEnd: (nodeId, pos) => { applyPlacement(nodeId, pos); pumpSpatial() }
@@ -309,7 +310,7 @@ function sceneDynamic (state, graph) {
   return {
     levels: levels,
     flows: flows,
-    selectedId: selected ? selected.nodeId : null,
+    selectedId: null,
     pcSource: !!(state && state.pcSource)
   }
 }
@@ -453,10 +454,10 @@ function renderGraph (state, graph) {
 // ============================================================ 图谱交互：左键拖动 / 右键菜单
 //
 // 用户定案（2026-10-27）：左键只负责拖动 —— 节点上拖=摆位，空白处拖=轨道旋转；
-// 单击不选中、不弹条，双击不再有任何动作。切换汇聚端 / 音量 / 位置复位都在右键菜单：
+// 单击不选中、不弹条，双击不再有任何动作。右键菜单（v1.6：音量滑块已删除，距离即音量）：
 //   ① 切换汇聚端到此设备（非汇聚端节点；离线也可切换，与旧操作条语义一致）
-//   ② 音量与静音（有音频流的源 / 本机 PC 音源 / 本机 hub 的总音量）
-//   ③ 位置复位（只在该节点被显式摆位过时出现；清掉全网摆位后回到自动槽位）
+//   ② 位置复位（只在该节点被显式摆位过时出现；清掉全网摆位后回到自动槽位）
+//   ③ 所有设备位置复位（只在汇聚端节点上出现：把整张图的显式摆位一次清空）
 // 菜单是 fixed 浮层，跟随鼠标并夹在视口内；Esc / 点菜单外 / 节点消失都会收起。
 
 function menuItem (label, hint, disabled, onClick) {
@@ -526,23 +527,7 @@ function openNodeMenu (nodeId, clientX, clientY) {
     el.appendChild(menuItem('切换汇聚端到此设备', hint, false, () => doSwitchTo(node, graph)))
   }
 
-  // ② 音量与静音（只在真有音频流时出现：图谱里没在流的离线设备没有可调的流）
-  const liveStream = liveStreamId(node, state)
-  const hasAudio = node.isHub
-    ? !!graph.isHubSelf
-    : (liveStream > 0 || (node.isSelf && !!state.pcSource))
-  if (hasAudio) {
-    let hint = ''
-    if (node.isHub) hint = '汇聚端总音量'
-    else if (!liveStream) hint = '音量由汇聚端调节'
-    el.appendChild(menuItem('音量与静音', hint, false, () => {
-      selected = { nodeId: node.id }
-      refreshScene(state, graph)
-      showVolumePanel(state, graph, node)
-    }))
-  }
-
-  // ③ 位置复位（只对显式摆位过的节点出现）
+  // ② 位置复位（只对显式摆位过的节点出现）
   if (node.posSet) {
     el.appendChild(menuItem('位置复位', '回到自动排位（全网同步）', false, () => {
       clearPlacement(node.id)
@@ -550,21 +535,27 @@ function openNodeMenu (nodeId, clientX, clientY) {
     }))
   }
 
+  // ③ 所有设备位置复位（只在汇聚端节点上出现：一次清完整张图的显式摆位）
+  if (node.isHub) {
+    const placed = graph.nodes.filter((n) => n.posSet).map((n) => n.id)
+    el.appendChild(menuItem('所有设备位置复位',
+      placed.length ? ('清掉 ' + placed.length + ' 台设备的摆位') : '当前都是自动排位',
+      placed.length === 0,
+      () => {
+        for (const nodeId of placed) clearPlacement(nodeId)
+        pumpSpatial()
+      }))
+  }
+
   el.style.display = ''
   placeNodeMenu(el, clientX, clientY)
 }
 
-// 收起菜单。quiet=true 用于"切屏/清会话"等状态路径：只关菜单，不重复重绘。
-function hideNodeMenu (opts) {
+// 收起菜单。
+function hideNodeMenu () {
   const el = $('ctxMenu')
   if (el) el.style.display = 'none'
   menuNodeId = null
-  const had = !!selected
-  selected = null
-  if (!had) return
-  if (opts && opts.quiet) return
-  hideVolumePanel()
-  if (lastState) refreshScene(lastState, collectGraph(lastState))
 }
 
 // 切换后的同步状态提示
@@ -627,123 +618,15 @@ async function doSwitchTo (node, graph) {
   }
 }
 
-// ============================================================ 音量面板
+// ============================================================ 菜单的全局收起
 
-function hideVolumePanel () {
-  const panel = $('volumePanel')
-  if (panel) panel.style.display = 'none'
-}
-
-function showVolumePanel (state, graph, node) {
-  const panel = $('volumePanel')
-  const slider = $('volSlider')
-  const nameEl = $('volName')
-  const pctEl = $('volPct')
-  const muteBtn = $('volMute')
-  if (!panel || !slider || !nameEl || !pctEl) return
-  const hubName = graph.hubNode && !graph.hubNode.ghost ? graph.hubNode.name : '汇聚端'
-
-  // 汇聚端节点：本机是 hub 时调总音量；远端 hub 的音量由它自己控制
-  if (node.isHub) {
-    if (graph.isHubSelf) {
-      nameEl.textContent = '汇聚端总音量'
-      slider.disabled = false
-      if (!volDragging) {
-        slider.value = Math.round((typeof state.master === 'number' ? state.master : 1) * 100)
-      }
-      slider.oninput = () => {
-        const g = slider.value / 100
-        pctEl.textContent = pct(g)
-        slider.style.setProperty('--p', (g * 100 / 1.5) + '%')
-        window.hub.setMaster(g)
-      }
-    } else {
-      nameEl.textContent = '当前汇聚端：' + node.name + ' · 音量由该设备控制'
-      slider.disabled = true
-    }
-    if (muteBtn) muteBtn.style.display = 'none'
-    pctEl.textContent = slider.disabled ? '—' : pct(slider.value / 100)
-    if (!slider.disabled) slider.style.setProperty('--p', (slider.value / 1.5) + '%')
-    panel.style.display = ''
-    return
-  }
-
-  // 本机是音源：音量由远端汇聚端调，本机只显示状态
-  if (node.isSelf && state.pcSource) {
-    nameEl.textContent = '本机是音源 · 音量由 ' + hubName + ' 调节'
-    slider.disabled = true
-    slider.value = 100
-    pctEl.textContent = '—'
-    if (muteBtn) muteBtn.style.display = 'none'
-    panel.style.display = ''
-    return
-  }
-
-  const streamId = streamIdForNode(node, state)
-  if (!streamId) {
-    hideVolumePanel()
-    return
-  }
-  nameEl.textContent = node.name || ('设备 ' + streamId)
-  slider.disabled = false
-  // 正在拖的时候不回写，否则滑杆会被状态推回去，手感像"抓不住"
-  if (!volDragging) slider.value = Math.round(node.gain * 100)
-  slider.oninput = () => {
-    const g = slider.value / 100
-    pctEl.textContent = pct(g)
-    slider.style.setProperty('--p', (g * 100 / 1.5) + '%')
-    window.hub.setSource(streamId, { gain: g })
-  }
-  pctEl.textContent = pct(slider.value / 100)
-  slider.style.setProperty('--p', (slider.value / 1.5) + '%')
-  if (muteBtn) {
-    muteBtn.style.display = ''
-    muteBtn.textContent = node.muted ? '已静音' : '静音'
-    muteBtn.classList.toggle('on', !!node.muted)
-  }
-  panel.style.display = ''
-}
-
-// 每次状态刷新时同步面板内容（选中节点可能已失效）
-function refreshVolumePanel (state, graph) {
-  if (!selected) return
-  const node = graph.nodes.find((n) => n.id === selected.nodeId)
-  if (!node) {
-    hideVolumePanel()
-    return
-  }
-  const streamId = streamIdForNode(node, state)
-  if (node.isHub) {
-    if (graph.isHubSelf) showVolumePanel(state, graph, node)
-    else hideVolumePanel()
-    return
-  }
-  if (streamId || (node.isSelf && state.pcSource)) showVolumePanel(state, graph, node)
-  else hideVolumePanel()
-}
-
-// 拖动状态：按下到松开之间不回写滑杆
-$('volSlider').addEventListener('pointerdown', () => { volDragging = true })
-window.addEventListener('pointerup', () => { volDragging = false })
-
-$('volMute').addEventListener('click', () => {
-  if (!lastState || !selected) return
-  const graph = collectGraph(lastState)
-  const node = graph.nodes.find((n) => n.id === selected.nodeId)
-  if (!node || node.isHub) return
-  const streamId = streamIdForNode(node, lastState)
-  if (!streamId) return
-  window.hub.setSource(streamId, { muted: !node.muted })
-})
-
-// 菜单的全局收起：Esc，或点到菜单/音量面板以外的任何地方
+// Esc，或点到菜单以外的任何地方，都收起右键菜单。
 document.addEventListener('keydown', (ev) => {
   if (ev.key === 'Escape') hideNodeMenu()
 })
 document.addEventListener('mousedown', (ev) => {
   const menu = $('ctxMenu')
-  const panel = $('volumePanel')
-  if ((menu && menu.contains(ev.target)) || (panel && panel.contains(ev.target))) return
+  if (menu && menu.contains(ev.target)) return
   hideNodeMenu()
 }, true)
 
@@ -955,8 +838,7 @@ function render (state) {
   // 自动切换屏幕：有图谱网络 / 本机有流 → 控制；否则 → 连接
   const next = anyConnection ? 'control' : 'connect'
   if (next !== screen) {
-    hideNodeMenu({ quiet: true })
-    hideVolumePanel()
+    hideNodeMenu()
     graphBuiltSig = ''
     showScreen(next)
     // 连接界面时停画（canvas 也 display:none），省掉后台 rAF 重绘
@@ -969,16 +851,11 @@ function render (state) {
     renderControlDevices(state)
     renderGraph(state, graph)
     renderHubBar(state, graph)
-    refreshVolumePanel(state, graph)
   }
 
-  // 回到连接屏 / 选中的节点已从图谱里消失 / 菜单指向的节点没了 → 收起菜单与音量面板
-  const selectionGone = !!selected && !graph.nodes.some((n) => n.id === selected.nodeId)
-  if (menuNodeId && !graph.nodes.some((n) => n.id === menuNodeId)) hideNodeMenu({ quiet: true })
-  if (screen === 'connect' || selectionGone) {
-    hideNodeMenu({ quiet: true })
-    hideVolumePanel()
-    if (scene) scene.setDynamic(sceneDynamic(state, graph))
+  // 回到连接屏 / 菜单指向的节点已经不在图谱里 → 收起菜单
+  if (screen === 'connect' || (menuNodeId && !graph.nodes.some((n) => n.id === menuNodeId))) {
+    hideNodeMenu()
   }
 
   renderSyncLine()
@@ -1101,8 +978,7 @@ $('leaveBtn').addEventListener('click', async () => {
   }
   // 用户主动"断开所有"：连关系表一起清掉；后端同时把图谱重置为只有本机
   await window.hub.clearSession()
-  hideNodeMenu({ quiet: true })
-  hideVolumePanel()
+  hideNodeMenu()
   setSync('', '')
 })
 
@@ -1120,7 +996,7 @@ window.__hubDebug = () => {
     selfId: graph ? graph.selfId : '',
     nodes: graph ? graph.nodes.length : 0,
     hubOnline: !!(graph && graph.hubNode && graph.hubNode.online),
-    selected: selected ? selected.nodeId : null,
+    selected: null,
     pendingSwitch: pendingSwitch ? pendingSwitch.nodeId : null,
     pcSource: !!(lastState && lastState.pcSource),
     controlShown: !!$('screenControl') && $('screenControl').style.display !== 'none',

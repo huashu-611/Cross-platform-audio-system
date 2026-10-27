@@ -59,9 +59,16 @@ TEST(SpatialDistanceGainClamps) {
   CHECK_NEAR(DistanceGain(2.0f), 0.5f, kTol);    // -6.02 dB
   CHECK_NEAR(DistanceGain(0.5f), 2.0f, kTol);    // +6.02 dB
   CHECK_NEAR(DistanceGain(0.25f), 2.0f, kTol);   // 近场封顶
-  CHECK_NEAR(DistanceGain(4.0f), 0.5f, kTol);    // 远场下限
+  CHECK_NEAR(DistanceGain(4.0f), 0.25f, kTol);   // 距离即音量：远场不再有下限
+  CHECK_NEAR(DistanceGain(10.0f), 0.1f, kTol);   // -20 dB
+  CHECK_NEAR(DistanceGain(40.0f), 0.025f, kTol); // -32 dB
   CHECK_NEAR(DistanceGain(0.0f), 2.0f, kTol);    // 除零保护
   CHECK_NEAR(20.0f * std::log10(DistanceGain(2.0f)), -6.0206f, 0.01f);
+  // 单调不增，且永远不会是 0（拉得再远也不至于全哑）。
+  for (float d = 0.3f; d < 300.0f; d *= 1.7f) {
+    CHECK_TRUE(DistanceGain(d) > 0.0f);
+    CHECK_TRUE(DistanceGain(d) <= DistanceGain(d / 1.7f) + 1e-6f);
+  }
 }
 
 TEST(SpatialItdFullCircle) {

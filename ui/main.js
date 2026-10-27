@@ -71,6 +71,9 @@ function startPcSource (ip, port, streamId) {
   const proc = spawn(exe, [
     '--hub', ip + ':' + port,
     '--handshake',
+    // 本机作音源时先把自己静音（用户 2026-10-27 定稿：连接后只让汇聚端出声），
+    // 退出/被杀时由 restoreMute() 兜底恢复（见 stopPcSource / before-quit）。
+    '--mute-local',
     '--device-name', os.hostname(),
     '--stream-id', String(sid)
   ], { windowsHide: true, stdio: 'ignore' })

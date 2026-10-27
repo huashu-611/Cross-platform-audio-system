@@ -77,12 +77,10 @@ public final class Spatial {
     public static final int kSpatialHistoryChannels = 2;
     /** 距离下限，防除零。 */
     public static final float kMinDistanceM = 0.25f;
-    /** -6 dB（远场下限）。 */
-    public static final float kMinDistanceGain = 0.5f;
-    /** +6 dB，近场封顶。 */
+    /** +6 dB，近场封顶（远场不再截断：距离就是音量，用户 2026-10-27 定稿）。 */
     public static final float kMaxDistanceGain = 2.0f;
-    /** 世界坐标绝对值上限（与内核/协议双重校验一致）。 */
-    public static final float kSpatialCoordLimit = 20.0f;
+    /** 世界坐标绝对值上限 ±320 m（= POS 帧 ±32000 cm；与内核/协议双重校验一致）。 */
+    public static final float kSpatialCoordLimit = 320.0f;
     /** 内部采样率（与 C++ kSampleRate、PacketProtocol.SAMPLE_RATE 一致）。 */
     public static final int kSampleRate = 48000;
 
@@ -262,13 +260,14 @@ public final class Spatial {
 
     /**
      * 距离衰减：线性反比振幅，参考距离 r0 = kSceneRadius（1 unit = 1 m）。
-     *   g = clamp(r0 / max(d, kMinDistanceM), 0.5, 2.0)
-     *   d=1 -> 0 dB；d=2 -> -6 dB；d=0.5 -> +6 dB；d=4 -> 理论 -12 dB，被下限截到 0.5(-6 dB)；
-     *   d<0.5 -> 上限 2.0 (+6 dB)，近场封顶。
+     *   g = min(r0 / max(d, kMinDistanceM), kMaxDistanceGain)
+     *   d=1 -> 0 dB；d=2 -> -6 dB；d=4 -> -12 dB；d=10 -> -20 dB；d=40 -> -32 dB
+     *   （远场不再截断："距离就是音量"，用户 2026-10-27 定稿）；d<0.25 -> 上限 +6 dB，近场封顶。
      */
     public static float distanceGain(float distance) {
         final float d = Math.max(distance, kMinDistanceM);
-        return clamp(kSceneRadius / d, kMinDistanceGain, kMaxDistanceGain);
+        // 距离即音量：只有近场封顶，没有远场下限（用户定稿，见 C++ spatial.hpp）。
+        return Math.min(kSceneRadius / d, kMaxDistanceGain);
     }
 
     /**

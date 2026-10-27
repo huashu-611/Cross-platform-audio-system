@@ -105,8 +105,9 @@ struct PlacementMergeResult {
   bool items_changed = false; // 具体坐标表是否有变化（用于日志/测试）
 };
 
-// 坐标上限 ±20 m：房间摆设够用，同时挡住脏数（16 位厘米最大 ±327 m）。
-constexpr int kPlacementCoordLimitCm = 2000;
+// 坐标上限 ±320 m（=±32000 cm）：距离就是音量（用户定稿），要能把声源甩得很远；
+// 仍是 int16 厘米能表示的范围（最大 ±327 m），同时挡住脏数。
+constexpr int kPlacementCoordLimitCm = 32000;
 // 与 GRAPH 帧同一量级的上限；超长帧两端都不合法。
 constexpr size_t kMaxPlacementFrameBytes = 1000;
 

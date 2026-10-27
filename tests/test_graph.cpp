@@ -525,15 +525,22 @@ TEST(Placement_DecodeRejectsBadFrames) {
   CHECK_FALSE(audiohub::DecodePlacementFrame(frame("no-colon,1,2"), &out));
   CHECK_FALSE(audiohub::DecodePlacementFrame(frame(id + ",,2"), &out));
   CHECK_FALSE(audiohub::DecodePlacementFrame(frame(id + ",1,2;git"), &out));
-  CHECK_FALSE(audiohub::DecodePlacementFrame(frame(id + ",2001,0"), &out));   // 超 ±20m
-  CHECK_FALSE(audiohub::DecodePlacementFrame(frame(id + ",-2001,0"), &out));
   CHECK_FALSE(audiohub::DecodePlacementFrame(frame(id + ",1.5,0"), &out));    // 只收厘米整数
+  // 坐标上限提升到 ±320 m（距离就是音量，见 graph.hpp）
+  CHECK_FALSE(audiohub::DecodePlacementFrame(frame(id + ",32001,0"), &out));
+  CHECK_FALSE(audiohub::DecodePlacementFrame(frame(id + ",-32001,0"), &out));
   // 正常值边界
   CHECK_TRUE(audiohub::DecodePlacementFrame(frame(id + ",2000,-2000"), &out));
   CHECK_EQ(out.items.size(), 1);
   if (out.items.size() == 1) {
     CHECK_EQ(out.items[0].x_cm, 2000);
     CHECK_EQ(out.items[0].z_cm, -2000);
+  }
+  CHECK_TRUE(audiohub::DecodePlacementFrame(frame(id + ",32000,-32000"), &out));
+  CHECK_EQ(out.items.size(), 1);
+  if (out.items.size() == 1) {
+    CHECK_EQ(out.items[0].x_cm, 32000);
+    CHECK_EQ(out.items[0].z_cm, -32000);
   }
   // 重复 id 保留第一个
   CHECK_TRUE(audiohub::DecodePlacementFrame(frame(id + ",1,2;" + id + ",3,4"), &out));
@@ -644,8 +651,9 @@ TEST(Placement_SetAndRemoveBumpsVersion) {
   CHECK_EQ(audiohub::FindPlacement(p, kNodeB)->x_cm, 200);
 
   // 越界 / 非法 id / 空 origin：拒绝且不改状态
+  // （上限 ±320 m = ±32000 cm；32001 才是越界）
   const auto before = p;
-  CHECK_FALSE(audiohub::SetPlacementItem(&p, kNodeB, 2001, 0, kSelfA));
+  CHECK_FALSE(audiohub::SetPlacementItem(&p, kNodeB, 32001, 0, kSelfA));
   CHECK_FALSE(audiohub::SetPlacementItem(&p, "no-colon", 0, 0, kSelfA));
   CHECK_FALSE(audiohub::SetPlacementItem(&p, kNodeB, 0, 0, ""));
   CHECK_EQ(p.version, before.version);

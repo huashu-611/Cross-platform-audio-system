@@ -74,9 +74,11 @@ constexpr float kMaxDelaySlewFrames = 2.0f;   // ITD 每块（5 ms）最多变 2
 constexpr int kSpatialHistoryFrames = 64;     // 每源历史 ≥ 最大延时 30 帧 + 插值余量
 constexpr int kSpatialHistoryChannels = 2;    // P0 只用 [0]（单声道化后）；P1 保留 side 用 [1]
 constexpr float kMinDistanceM = 0.25f;        // 距离下限，防除零
-constexpr float kMinDistanceGain = 0.5f;      // -6 dB（远场下限）
+// 距离就是音量（用户 2026-10-27 定稿）：取消远场下限，拖多远就衰减多少。
+//   g = min(r0 / max(d, kMinDistanceM), kMaxDistanceGain)
+//   近场仍封顶 +6 dB（防凑到脸上炸耳），远场不再截断（10 m ≈ -20 dB）。
 constexpr float kMaxDistanceGain = 2.0f;      // +6 dB，近场封顶
-constexpr float kSpatialCoordLimit = 20.0f;   // 世界坐标绝对值上限（HTTP 与内核双重校验）
+constexpr float kSpatialCoordLimit = 320.0f;  // 世界坐标绝对值上限 ±320 m（= POS 帧 ±32000 cm；HTTP 与内核双重校验）
 
 // ------------------------------------------------ 纯函数（全部可单测，不碰 DSP 状态）
 
@@ -97,8 +99,8 @@ float PanValue(float azimuth_deg, float azimuth_boost);
 void PanGains(float azimuth_deg, float azimuth_boost, float* gain_l, float* gain_r);
 
 // 距离衰减：线性反比振幅，参考距离 r0 = kSceneRadius（1 unit = 1 m）。
-//   g = clamp(r0 / max(d, kMinDistanceM), 0.5, 2.0)
-//   d=1 -> 0 dB；d=2 -> -6 dB；d=0.5 -> +6 dB；d=4 -> 理论 -12 dB，被下限截到 0.5(-6 dB)；
+//   g = min(r0 / max(d, kMinDistanceM), kMaxDistanceGain)
+//   d=1 -> 0 dB；d=2 -> -6 dB；d=4 -> -12 dB；d=10 -> -20 dB（远场不再截断，距离就是音量）；
 //   d<0.5 -> 上限 2.0 (+6 dB)，近场封顶。
 float DistanceGain(float distance);
 
