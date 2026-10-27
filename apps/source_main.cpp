@@ -67,6 +67,9 @@ bool RedirectStdioToFile(const std::string& utf8_path) {
 struct Options {
   std::string hub_ip = "127.0.0.1";
   uint16_t hub_port = 47000;
+  // 直连中继（小熊派 Hi3861 / ESP32）：跳过控制口与时钟同步，只往对端发音频包。
+  // 对端是 audio_relay_kit 里的固件，没有 CONN-ACK/PING-PONG 这类控制协议。
+  bool relay = false;
   int capture_buffer_ms = 20;
   int stream_id = 1;
   int tone_hz = 0;        // >0 时用内置正弦代替采集
@@ -91,6 +94,7 @@ void PrintUsage() {
       "用法: audiohub-source --hub <ip>[:port] [选项]\n"
       "\n"
       "  --hub <ip[:port]>   汇聚端地址，默认端口 %u（控制口自动用 port+1）\n"
+      "  --relay <ip[:port]> 直连中继（小熊派/ESP32），默认端口 5004；不开控制口、不做时钟同步\n"
       "  --stream-id <n>     流编号，一台设备可跑多路，默认 1\n"
       "  --cap-ms <n>        采集缓冲毫秒数，默认 20。越小延迟越低、越容易断\n"
       "  --tone <hz>         不发采集，改发内置正弦波。用于单机测多源混音\n"
@@ -118,6 +122,20 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
     if (a == "--hub") {
       const std::string v = next("--hub");
       if (v.empty()) return false;
+      const size_t colon = v.find(':');
+      if (colon == std::string::npos) {
+        opt->hub_ip = v;
+      } else {
+        opt->hub_ip = v.substr(0, colon);
+        opt->hub_port = static_cast<uint16_t>(std::stoi(v.substr(colon + 1)));
+      }
+    } else if (a == "--relay") {
+      // 直连中继：目标是小熊派 WiFi->UART 中继或 ESP32 的 UDP 源。
+      // 默认端口 5004（audio_relay_kit 的约定）；可以写成 ip:port 覆盖。
+      const std::string v = next("--relay");
+      if (v.empty()) return false;
+      opt->relay = true;
+      opt->hub_port = 5004;
       const size_t colon = v.find(':');
       if (colon == std::string::npos) {
         opt->hub_ip = v;
@@ -197,6 +215,12 @@ int main(int argc, char** argv) {
 
   Options opt;
   if (!ParseArgs(argc, argv, &opt)) return 1;
+  // 中继对端没有控制协议：CONN-ACK / PING-PONG 一律没有应答，
+  // 开着握手只会白等 10 秒然后退出。这里直接关掉并说明。
+  if (opt.relay && opt.handshake) {
+    std::printf("--relay 模式没有控制通道，忽略 --handshake\n");
+    opt.handshake = false;
+  }
 
   // --log：把输出写进文件。后台运行（无控制台）时只能靠这个看统计。
   if (!opt.log_path.empty()) {
@@ -220,16 +244,19 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  // 直连中继模式没有控制通道：对端是 audio_relay_kit 的固件，只认音频包。
   audiohub::UdpSocket ctrl_socket;
-  if (!ctrl_socket.Open(0) ||
-      !ctrl_socket.SetPeer(opt.hub_ip, static_cast<uint16_t>(opt.hub_port + 1))) {
-    std::printf("无法连接控制口 %s:%u -- %s\n", opt.hub_ip.c_str(), opt.hub_port + 1,
-                ctrl_socket.last_error().c_str());
-    return 2;
+  if (!opt.relay) {
+    if (!ctrl_socket.Open(0) ||
+        !ctrl_socket.SetPeer(opt.hub_ip, static_cast<uint16_t>(opt.hub_port + 1))) {
+      std::printf("无法连接控制口 %s:%u -- %s\n", opt.hub_ip.c_str(), opt.hub_port + 1,
+                  ctrl_socket.last_error().c_str());
+      return 2;
+    }
+    // 控制口用"阻塞读 + 30 ms 超时"，而不是非阻塞轮询：
+    // 轮询的粒度受系统定时器精度限制，会把 RTT 抬到十几毫秒。
+    ctrl_socket.SetReceiveTimeoutMs(30);
   }
-  // 控制口用"阻塞读 + 30 ms 超时"，而不是非阻塞轮询：
-  // 轮询的粒度受系统定时器精度限制，会把 RTT 抬到十几毫秒。
-  ctrl_socket.SetReceiveTimeoutMs(30);
 
   // 1 秒的环足够吸收发送线程被调度走的抖动。
   audiohub::SpscRing<int16_t> ring(static_cast<size_t>(audiohub::kSampleRate) *
@@ -310,6 +337,12 @@ int main(int argc, char** argv) {
   std::printf("\n");
   std::printf("  audiohub-source 已启动\n");
   std::printf("  目标       : %s:%u\n", opt.hub_ip.c_str(), opt.hub_port);
+  if (opt.relay) {
+    std::printf("  模式       : 直连中继（小熊派/ESP32 中继固件），无控制口、无时钟同步\n");
+    std::printf("  对端提醒   : 源端固定 48 kHz 双声道 int16；小熊派链路可直接用这个模式。\n");
+    std::printf("               ESP32 直收 UDP 时要求两端采样率一致（默认 16 kHz），\n");
+    std::printf("               那种场景请用 audio_relay_kit/tools/pc_udp_sender.py --rate 16000。\n");
+  }
   std::printf("  流编号     : %d\n", opt.stream_id);
   if (tone_mode) {
     std::printf("  信号源     : 内置正弦 %d Hz\n", opt.tone_hz);
@@ -459,13 +492,15 @@ int main(int argc, char** argv) {
     }
   });
 
-  // ---- 时钟同步线程 ----
+  // ---- 时钟同步线程（仅汇聚端模式）----
+  // 中继对端不回应 PING，留着这个线程只会每 470 ms 往对端扔一个无效包。
   audiohub::ClockSync clock_sync;
   std::atomic<double> measured_offset_ms{0.0};
   std::atomic<double> measured_rtt_ms{0.0};
   std::atomic<bool> clock_ready{false};
 
-  std::thread clock_thread([&] {
+  std::thread clock_thread;
+  if (!opt.relay) clock_thread = std::thread([&] {
     uint8_t ping[5];
     uint8_t pong[64];
     ping[0] = 1;  // type=1(PING)
@@ -520,13 +555,21 @@ int main(int argc, char** argv) {
 
     double capture_level = -120.0;
     const bool has_level = send_meter.Take(&capture_level);
-    std::printf(
-        "采集 %5.1f kfps 发送电平 %6.1f dBFS | 发送 %4llu pkt/s | 约 %6.1f kbps | RTT %5.1f ms "
-        "| 单程 %5.1f ms | 丢 %llu\n",
-        (f - last_frames) / 1000.0, has_level ? capture_level : -120.0,
-        static_cast<unsigned long long>(p - last_packets),
-                (p - last_packets) * (packet_samples * 2 + audiohub::kHeaderSize) * 8.0 / 1000.0,
-                rtt, rtt * 0.5, static_cast<unsigned long long>(dropped_samples.load()));
+    const unsigned long long pkts = static_cast<unsigned long long>(p - last_packets);
+    const double kbps = pkts * (packet_samples * 2 + audiohub::kHeaderSize) * 8.0 / 1000.0;
+    const unsigned long long dropped = static_cast<unsigned long long>(dropped_samples.load());
+    if (opt.relay) {
+      // 中继模式没有控制通道，RTT/单程没有意义，省掉这两列免得被当成 0 ms 正常。
+      std::printf("采集 %5.1f kfps 发送电平 %6.1f dBFS | 发送 %4llu pkt/s | 约 %6.1f kbps | 丢 %llu\n",
+                  (f - last_frames) / 1000.0, has_level ? capture_level : -120.0, pkts, kbps,
+                  dropped);
+    } else {
+      std::printf(
+          "采集 %5.1f kfps 发送电平 %6.1f dBFS | 发送 %4llu pkt/s | 约 %6.1f kbps | RTT %5.1f ms "
+          "| 单程 %5.1f ms | 丢 %llu\n",
+          (f - last_frames) / 1000.0, has_level ? capture_level : -120.0, pkts, kbps, rtt,
+          rtt * 0.5, dropped);
+    }
     last_frames = f;
     last_packets = p;
     std::fflush(stdout);  // 理由同 hub：--log 时保证每秒落盘

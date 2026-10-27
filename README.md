@@ -35,7 +35,7 @@
 | 内置信号源 `--tone` | ✅ | 无音频设备也能测；两路正弦叠加可数值验证混音 |
 | 抖动注入 `--jitter` | ✅ | 模拟 WiFi，验抖动缓冲 |
 | 电平表 | ✅ | 每路 + 混音总线 dBFS |
-| 单元测试 | ✅ | **86 个用例**（含图谱协议 23 个、房间摆位 7 个），无需声卡 |
+| 单元测试 | ✅ | **85 个用例**（含图谱协议 23 个、房间摆位 7 个），无需声卡 |
 | Opus 编码 | ⬜ | 接口已预留，P0 用 int16 PCM |
 | Android 低延迟输出 | ⬜ | 现用 AudioTrack，未上 AAudio |
 | 设备发现 / 配对 | ✅ | UDP 广播发现 + 手工邀请 + 自动同意；未上 mDNS |
@@ -218,6 +218,25 @@ build/audiohub-source.exe --hub 127.0.0.1:47000 --tone 660 --stream-id 2
 耳机里会同时听到 440 + 660。Hub 应当显示：单路 −9.0 dBFS、总线 −6.0 dBFS
 （**差值 3.01 dB 就是混音正确的硬指标**）。
 
+### 送进蓝牙耳机（audio_relay_kit 中继）
+
+主项目自身没有蓝牙输出通路：Windows 不把这套 A2DP 发送能力开放给普通应用。
+要接蓝牙耳机得走外挂中继（小熊派 Hi3861 收 WiFi → UART → ESP32 A2DP Source），
+也就是 `audio_relay_kit`。`audiohub-source` 的 `--relay` 就是给这条链路准备的：
+跳过控制口与时钟同步，直接往中继的 5004 端口发同样的「16 字节头 + 960 字节 int16 PCM」。
+
+```bash
+# 先用内置正弦验证链路（不碰声卡、也不需要汇聚端）
+build/audiohub-source.exe --relay 192.168.1.50:5004 --tone 440
+
+# 真实使用：采集本机系统声音，发到小熊派
+build/audiohub-source.exe --relay 192.168.1.50:5004
+```
+
+对端要求：小熊派默认 `DOWN_FACTOR=3` + `UART_BAUDRATE=921600`（48 kHz → 16 kHz → ESP32 A2DP）；
+ESP32 直接收 UDP 时两端采样率必须一致（默认 16 kHz），那种场景用 kit 自带的
+`tools/pc_udp_sender.py --rate 16000`，不要用 `--relay`。
+
 完整的判定标准和排错见表见 [docs/测试指南.md](docs/测试指南.md)。
 
 ### 参数
@@ -237,6 +256,7 @@ build/audiohub-source.exe --hub 127.0.0.1:47000 --tone 660 --stream-id 2
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--hub` | 127.0.0.1 | 支持 `ip:port` |
+| `--relay <ip[:port]>` | 关 | 直连中继（小熊派/ESP32），默认端口 5004，无控制口/时钟同步 |
 | `--stream-id` | 1 | 一台设备跑多路时区分 |
 | `--cap-ms` | 20 | 采集缓冲，越小越激进 |
 | `--tone <hz>` | 关 | 不发采集，改发内置正弦波 |

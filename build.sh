@@ -12,7 +12,7 @@ CXX="${CXX:-g++}"
 OUT=build
 mkdir -p "$OUT"
 
-CORE="src/packet.cpp src/jitter_buffer.cpp src/clock_sync.cpp src/asrc.cpp src/mixer.cpp src/udp_socket.cpp src/graph.cpp src/hub_core.cpp src/http_api.cpp src/discovery.cpp"
+CORE="src/packet.cpp src/jitter_buffer.cpp src/clock_sync.cpp src/asrc.cpp src/mixer.cpp src/udp_socket.cpp src/graph.cpp src/spatial.cpp src/hub_core.cpp src/http_api.cpp src/discovery.cpp"
 # 静态链接 libstdc++/libgcc：否则 exe 依赖 MSYS2 的运行时 DLL，
 # 用户双击运行会报"找不到 libstdc++-6.dll"。多几百 KB，换免安装。
 STATIC="-static -static-libgcc -static-libstdc++"
@@ -25,10 +25,10 @@ echo "==> 单元测试"
 # 注释会吃掉换行，把一条命令切成两条（踩过两次）。
 $CXX $FLAGS \
   src/packet.cpp src/jitter_buffer.cpp src/clock_sync.cpp src/asrc.cpp src/mixer.cpp src/udp_socket.cpp \
-  src/graph.cpp \
+  src/graph.cpp src/spatial.cpp \
   tests/test_main.cpp tests/test_packet.cpp tests/test_ring.cpp tests/test_jitter.cpp \
   tests/test_clock.cpp tests/test_asrc.cpp tests/test_mixer.cpp tests/test_pipeline.cpp \
-  tests/test_graph.cpp \
+  tests/test_graph.cpp tests/test_spatial.cpp \
   -lws2_32 -liphlpapi -o "$OUT/audiohub_tests.exe"
 
 if [ "${WIN32:-1}" = "1" ]; then
