@@ -72,6 +72,9 @@ function showScreen (next) {
   const controlEl = $('screenControl')
   if (connectEl) connectEl.style.display = next === 'connect' ? '' : 'none'
   if (controlEl) controlEl.style.display = next === 'control' ? '' : 'none'
+  // 「全部断开」只在控制界面有意义（连接界面本来就没连任何东西）
+  const leaveEl = $('leaveBtn')
+  if (leaveEl) leaveEl.style.display = next === 'control' ? '' : 'none'
   const title = document.querySelector('h1 span')
   if (title) title.textContent = next === 'control' ? '控制台' : '连接设备'
 }

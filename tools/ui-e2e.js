@@ -266,6 +266,13 @@ async function main() {
     check(snap.hasGraph === true, 'renderer reads graph from /api/state.graph');
     check(snap.nodes === 1, 'graph starts with only this PC');
     await pageFit(cdp, 'connect screen');
+    // 「全部断开」只在控制界面出现：连接界面没有会话可断，而且它已经从底部"会话"卡片
+    // 挪到了头部右侧的小按钮（用户要求：卡片去掉，按钮单独放）。
+    const leaveHiddenOnConnect = await cdp.eval(
+      "document.querySelector('#leaveBtn') && document.querySelector('#leaveBtn').style.display === 'none'");
+    check(leaveHiddenOnConnect === true, '「全部断开」在连接界面隐藏');
+    const noSessionCard = await cdp.eval("document.body.textContent.indexOf('断开所有连接') < 0");
+    check(noSessionCard === true, '旧「会话」卡片已移除（只剩头部的小按钮）');
 
     const noSelect = await cdp.eval("document.querySelector('#hubSelect') === null");
     check(noSelect === true, 'legacy role <select id="hubSelect"> is gone');
@@ -275,6 +282,21 @@ async function main() {
     snap = await waitDebug(cdp, (s) => s.nodes >= 2, 5000, 'second node in graph');
     check(snap.nodes >= 2, 'second device appears in the shared graph');
     check(snap.controlShown === true, 'control screen with graph is shown');
+    const leaveShownInControl = await cdp.eval(
+      "document.querySelector('#leaveBtn') && document.querySelector('#leaveBtn').style.display !== 'none'");
+    check(leaveShownInControl === true, '「全部断开」在控制界面出现在头部右侧');
+    const leaveGeom = JSON.parse(await cdp.eval(`JSON.stringify((function () {
+      var b = document.querySelector('#leaveBtn');
+      var r = b.getBoundingClientRect();
+      var a = document.querySelector('.addr').getBoundingClientRect();
+      return { text: b.textContent.trim(), x: r.x, y: r.y, right: r.right, bottom: r.bottom,
+               addrRight: a.right, w: innerWidth, h: innerHeight,
+               hit: document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2) === b };
+    })())`));
+    check(leaveGeom.text === '全部断开' && leaveGeom.hit === true &&
+      leaveGeom.right <= leaveGeom.w && leaveGeom.bottom <= leaveGeom.h,
+      '「全部断开」按钮在视口内且可点（' + Math.round(leaveGeom.right) + '≤' + leaveGeom.w + '）');
+    check(leaveGeom.x > leaveGeom.addrRight, '「全部断开」排在地址框右侧，不挤占正文');
     await sleep(350);   // 等一帧布局与画布 resize
     await pageFit(cdp, 'control screen');
 
@@ -504,6 +526,13 @@ async function main() {
     check(barHidden === true, 'action bar hides after switching');
 
     // Cleanup: "断开全部" clears the session graph back to this node only.
+    // 「全部断开」从控制屏底部的"会话"卡片挪到了头部右侧：它必须只在控制界面出现。
+    await cdp.eval("document.querySelector('#leaveBtn').click(); 'clicked'");
+    snap = await waitDebug(cdp, (s) => s.screen === 'connect', 6000, 'back to connect screen after 全部断开');
+    check(snap.screen === 'connect' && snap.nodes === 1, '「全部断开」清除会话并回到连接界面');
+    const leaveHiddenAgain = await cdp.eval(
+      "document.querySelector('#leaveBtn') && document.querySelector('#leaveBtn').style.display === 'none'");
+    check(leaveHiddenAgain === true, '「全部断开」回到连接界面后重新隐藏');
     console.log('==> done');
   } catch (err) {
     check(false, 'e2e failed: ' + err.message);

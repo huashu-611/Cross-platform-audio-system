@@ -14,12 +14,17 @@
       <h1>AudioHub <span>连接设备</span></h1>
       <div class="sub">多台设备的声音，汇到这一副耳机里</div>
     </div>
-    <div class="addr">
-      <div>
-        <div class="k">手机上填</div>
-        <div class="v" id="addr">—</div>
+    <div class="hdr-right">
+      <div class="addr">
+        <div>
+          <div class="k">手机上填</div>
+          <div class="v" id="addr">—</div>
+        </div>
+        <button id="copyBtn">复制</button>
       </div>
-      <button id="copyBtn">复制</button>
+      <!-- 破坏性操作只放在头部右侧（不占控制屏的一整行）；只在控制界面出现 -->
+      <button id="leaveBtn" class="leavebtn" style="display:none"
+              title="断开所有连接，回到连接界面">全部断开</button>
     </div>
   </header>
 
@@ -106,16 +111,6 @@
         <input type="checkbox" id="autoAccept">
         <span>自动同意连接请求</span>
       </label>
-    </div>
-
-    <div class="sect">会话</div>
-    <div class="grid">
-      <div class="card" style="max-width:460px">
-        <div class="row">
-          <span class="ask" style="flex:1">断开所有连接，回到连接界面</span>
-          <button class="btn no" id="leaveBtn">全部断开</button>
-        </div>
-      </div>
     </div>
   </div>
 

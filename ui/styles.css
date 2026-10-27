@@ -101,6 +101,19 @@ h1 span { color: var(--accent-hi); font-weight: 300; }
 }
 .addr button:hover { background: var(--accent-hi); color: oklch(0.18 0.03 255); }
 
+/* ---------- 头部右侧：地址框 + 「全部断开」 ---------- */
+.hdr-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+/* 断开全部是破坏性操作：常驻头部右侧的一颗小按钮，不占控制屏的一整行卡片；
+   只在控制界面出现（connect 界面由 renderer.showScreen 隐藏）。 */
+.leavebtn {
+  background: transparent; color: var(--bad);
+  border: 1px solid oklch(0.66 0.19 25 / .4); border-radius: 7px;
+  padding: 6px 12px; font-size: 11.5px; letter-spacing: .06em;
+  cursor: pointer; transition: background var(--fast) var(--ease), color var(--fast) var(--ease);
+}
+.leavebtn:hover { background: var(--bad); color: oklch(0.16 0.02 25); }
+
 /* ---------- 警示条 ---------- */
 .banner {
   background: oklch(0.66 0.19 25 / .14);
@@ -405,7 +418,8 @@ input[type=range]::-moz-range-thumb { width: 12px; height: 12px; border-radius: 
 /* ---------- 窄屏 / 小窗口：图谱与操作条不挤爆 ---------- */
 @media (max-width: 760px) {
   body { padding: 10px 12px 8px; }
-  .addr { width: 100%; justify-content: space-between; }
+  .hdr-right { width: 100%; }
+  .addr { flex: 1 1 auto; justify-content: space-between; }
   .actionbar { padding: 8px 10px; gap: 9px; }
   .actionbar .acttext { min-width: 100%; font-size: 13px; }
   .hubbar { gap: 8px; padding: 7px 10px; }
