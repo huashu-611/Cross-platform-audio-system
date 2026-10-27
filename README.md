@@ -24,17 +24,18 @@
 | N 路混音 + 软限幅 | ✅ | float32 累加，阈值 0.85 |
 | WASAPI 系统音频采集 | ✅ | loopback + AUTOCONVERTPCM |
 | 进程回环 `--include/--exclude` | ✅ | Win10 2004+，只抓/排除指定进程树 |
-| Android 源端（采集） | ✅ 已真机验证 | `android/`，APK ≈ 293 KB |
-| Android 接收端（播放/混音） | ✅ 已实现 | `ReceiverService`：AudioTrack 混音输出 |
-| Windows 图形界面 | ✅ | `ui/` Electron 壳，每路音量/静音 + 总音量 |
+| Android 源端（采集） | ✅ 已真机验证 | `android/`，APK ≈ 334 KB |
+| Android 接收端（播放/混音） | ✅ 已实现 | `ReceiverService`：AudioTrack 混音输出；图谱改为**俯视平面图**（只读，不能拖） |
+| Windows 图形界面 | ✅ | `ui/` Electron 壳，**3D 房间视图**（俯仰/轨道/滚轮缩放）+ 每路音量/静音 + 总音量 |
 | PC 自己当音源 | ✅ | 非汇聚端时界面自动拉起 `audiohub-source`，音量/静音联动 |
-| 本地 HTTP 控制接口 | ✅ | `--http-port 4780`；含 `/api/state.graph`、`/api/graph/switch` |
+| 本地 HTTP 控制接口 | ✅ | `--http-port 4780`；含 `/api/state.graph`、`/api/graph/switch`、`/api/graph/placement` |
 | 共享网络图谱（双端） | ✅ | 设备图谱 + 图上点选切换汇聚端，全网同步（[协议](docs/GRAPH-PROTOCOL.md)） |
+| 房间摆位全网同步 | ✅ | 桌面拖完的落点经 POS 帧广播给所有电脑/手机；手机俯视图只读显示（[§13](docs/GRAPH-PROTOCOL.md)） |
 | WASAPI 低延迟输出 | ✅ | 事件驱动，默认 10 ms 缓冲 |
 | 内置信号源 `--tone` | ✅ | 无音频设备也能测；两路正弦叠加可数值验证混音 |
 | 抖动注入 `--jitter` | ✅ | 模拟 WiFi，验抖动缓冲 |
 | 电平表 | ✅ | 每路 + 混音总线 dBFS |
-| 单元测试 | ✅ | **65 个用例**（含图谱协议 23 个），无需声卡 |
+| 单元测试 | ✅ | **85 个用例**（含图谱协议 23 个、房间摆位 7 个），无需声卡 |
 | Opus 编码 | ⬜ | 接口已预留，P0 用 int16 PCM |
 | Android 低延迟输出 | ⬜ | 现用 AudioTrack，未上 AAudio |
 | 设备发现 / 配对 | ✅ | UDP 广播发现 + 手工邀请 + 自动同意；未上 mDNS |
@@ -173,6 +174,12 @@ cd ui && npm start
 汇聚端是大球。点任意小球 →「把汇聚端切到 <名字>？」→ 确认后本地立即生效，
 并把新图谱广播给所有设备；手机和另一台 PC 的界面会在 1~2 秒内自动跟着变，
 不用每台设备各点一遍。协议与合并规则见 [docs/GRAPH-PROTOCOL.md](docs/GRAPH-PROTOCOL.md)。
+
+图谱是**物理房间**的俯视投影（1 格 = 1 m）：听者固定在原点，球在地面上自由摆位，
+球的屏幕大小随距离缩放（近大远小，与音量衰减同向），双击切汇聚端、拖动摆位、
+右键复位到自动槽位。**拖完的位置是全网一份**：写进本机内核后由 POS 帧同步给所有
+电脑和手机（[协议 §13](docs/GRAPH-PROTOCOL.md)）；手机端用同一个坐标系画俯视平面图，
+但只读。滚轮向上=凑近放大、向下=拉远；整个界面随窗口自适应，不出现滚动条。
 
 窗口顶部直接显示**手机上该填的 IP**，点「复制」即可。
 

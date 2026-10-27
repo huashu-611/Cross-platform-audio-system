@@ -123,6 +123,60 @@ std::string BuildFrameBody(const GraphState& g) {
   return frame;
 }
 
+// 拼 POS 帧体（不含结尾 '\n'）。id 非法的项直接跳过，理由同 BuildFrameBody。
+std::string BuildPlacementBody(const PlacementState& p) {
+  std::string frame = "POS|";
+  frame += std::to_string(p.version);
+  frame += '|';
+  frame += p.origin;
+  frame += '|';
+  bool first = true;
+  for (const auto& it : p.items) {
+    uint16_t id_port = 0;
+    if (!ValidId(it.node_id, &id_port)) continue;
+    if (!first) frame += ';';
+    first = false;
+    frame += it.node_id;
+    frame += ',';
+    frame += std::to_string(it.x_cm);
+    frame += ',';
+    frame += std::to_string(it.z_cm);
+  }
+  return frame;
+}
+
+// 严格解析有符号厘米坐标：可选 '-'，十进制，绝对值不超过 ±kPlacementCoordLimitCm。
+bool ParseSignedCm(const std::string& s, int16_t* out) {
+  if (s.empty() || s.size() > 5) return false;  // 最长 "-2000"
+  size_t i = 0;
+  bool neg = false;
+  if (s[0] == '-') {
+    neg = true;
+    i = 1;
+    if (i >= s.size()) return false;
+  }
+  int32_t v = 0;
+  for (; i < s.size(); ++i) {
+    const char c = s[i];
+    if (c < '0' || c > '9') return false;
+    v = v * 10 + static_cast<int32_t>(c - '0');
+    if (v > kPlacementCoordLimitCm) return false;
+  }
+  *out = static_cast<int16_t>(neg ? -v : v);
+  return true;
+}
+
+bool SamePlacementItems(const std::vector<PlacementItem>& a,
+                        const std::vector<PlacementItem>& b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (a[i].node_id != b[i].node_id || a[i].x_cm != b[i].x_cm || a[i].z_cm != b[i].z_cm) {
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 std::string SanitizeName(const std::string& in) {
@@ -319,6 +373,133 @@ uint16_t StreamIdFor(const GraphState& g, const std::string& self_id) {
     if (n.id < self_id) ++rank;
   }
   return static_cast<uint16_t>(rank + 1);
+}
+
+// ------------------------------------------------------------------ 房间摆位（POS）
+
+void SortPlacementItems(PlacementState* p) {
+  if (p == nullptr) return;
+  std::sort(p->items.begin(), p->items.end(),
+            [](const PlacementItem& a, const PlacementItem& b) { return a.node_id < b.node_id; });
+}
+
+const PlacementItem* FindPlacement(const PlacementState& p, const std::string& node_id) {
+  for (const auto& it : p.items) {
+    if (it.node_id == node_id) return &it;
+  }
+  return nullptr;
+}
+
+std::string EncodePlacementFrame(const PlacementState& p) {
+  PlacementState sorted = p;
+  SortPlacementItems(&sorted);
+  // 超过上限：按 node_id 升序从尾部裁项（与 GRAPH 同一套确定性规则）。两个上限都要守：
+  // 帧长 1000 字节保证 UDP 一包发得下；项数 32 与节点上限一致，否则对端会整帧丢弃。
+  while (true) {
+    const std::string frame = BuildPlacementBody(sorted) + "\n";
+    const bool too_many = sorted.items.size() > kMaxGraphNodes;
+    if ((!too_many && frame.size() <= kMaxPlacementFrameBytes) || sorted.items.empty()) {
+      return frame;
+    }
+    sorted.items.pop_back();
+  }
+}
+
+bool DecodePlacementFrame(const std::string& frame, PlacementState* out) {
+  if (out == nullptr) return false;
+  const std::string text = TrimTrailing(frame);
+  if (text.empty() || text.size() > kMaxPlacementFrameBytes) return false;
+  const std::vector<std::string> parts = Split(text, '|');
+  if (parts.size() != 4 || parts[0] != "POS") return false;
+
+  PlacementState p;
+  if (!ParseU64(parts[1], &p.version)) return false;
+  p.origin = parts[2];
+  if (!ValidIdText(p.origin)) return false;
+  if (!parts[3].empty()) {
+    const std::vector<std::string> items = Split(parts[3], ';');
+    if (items.size() > kMaxGraphNodes) return false;  // 摆位项上限与节点上限一致
+    for (const auto& item : items) {
+      if (item.empty()) return false;  // "a;;b" 之类：格式坏了
+      const std::vector<std::string> f = Split(item, ',');
+      if (f.size() != 3) return false;
+      PlacementItem it;
+      it.node_id = f[0];
+      uint16_t id_port = 0;
+      if (!ValidId(it.node_id, &id_port)) return false;
+      if (!ParseSignedCm(f[1], &it.x_cm)) return false;
+      if (!ParseSignedCm(f[2], &it.z_cm)) return false;
+      if (FindPlacement(p, it.node_id) == nullptr) p.items.push_back(it);  // 重复 id 保留第一个
+    }
+  }
+  SortPlacementItems(&p);
+  *out = p;
+  return true;
+}
+
+bool IsPlacementRequestFrame(const std::string& frame) {
+  return TrimTrailing(frame) == "POS-REQ";
+}
+
+PlacementMergeResult MergePlacement(PlacementState* local, const PlacementState& remote) {
+  PlacementMergeResult r;
+  if (local == nullptr) return r;
+  // 整表 LWW（§13.2）：version 大者胜；同版本按 origin 字典序打破平局（与 MergeGraph 一致）。
+  const bool newer = remote.version > local->version;
+  const bool tie_break = remote.version == local->version && remote.origin > local->origin;
+  if (!newer && !tie_break) return r;
+
+  PlacementState next = remote;
+  SortPlacementItems(&next);
+  r.items_changed = !SamePlacementItems(next.items, local->items);
+  r.changed = r.items_changed || next.version != local->version;
+  if (!r.changed) return r;  // 防御：版本不同但表内容一致也视作已采纳过，不必回发
+  *local = next;
+  r.adopted = true;
+  return r;
+}
+
+bool SetPlacementItem(PlacementState* p, const std::string& node_id, int x_cm, int z_cm,
+                      const std::string& origin_id) {
+  if (p == nullptr || origin_id.empty()) return false;
+  uint16_t id_port = 0;
+  if (!ValidId(node_id, &id_port)) return false;
+  if (x_cm < -kPlacementCoordLimitCm || x_cm > kPlacementCoordLimitCm) return false;
+  if (z_cm < -kPlacementCoordLimitCm || z_cm > kPlacementCoordLimitCm) return false;
+
+  for (auto& it : p->items) {
+    if (it.node_id != node_id) continue;
+    // 同一位置重复提交（GUI 轮询 / 重试）不该制造新版本，否则两端会互相回发。
+    if (it.x_cm == x_cm && it.z_cm == z_cm) return false;
+    it.x_cm = static_cast<int16_t>(x_cm);
+    it.z_cm = static_cast<int16_t>(z_cm);
+    ++p->version;  // 本地改动：version = 见过的最大 version + 1（调用方负责先抬高）
+    p->origin = origin_id;
+    return true;
+  }
+
+  PlacementItem item;
+  item.node_id = node_id;
+  item.x_cm = static_cast<int16_t>(x_cm);
+  item.z_cm = static_cast<int16_t>(z_cm);
+  p->items.push_back(item);
+  SortPlacementItems(p);
+  ++p->version;
+  p->origin = origin_id;
+  return true;
+}
+
+bool RemovePlacementItem(PlacementState* p, const std::string& node_id,
+                         const std::string& origin_id) {
+  if (p == nullptr || origin_id.empty()) return false;
+  for (auto it = p->items.begin(); it != p->items.end(); ++it) {
+    if (it->node_id != node_id) continue;
+    p->items.erase(it);
+    ++p->version;
+    p->origin = origin_id;
+    return true;
+  }
+  return false;
 }
 
 }  // namespace audiohub

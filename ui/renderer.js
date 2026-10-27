@@ -99,6 +99,10 @@ function normalizeNode (raw, hubId, selfId) {
     isHub: !!isHub,
     isSelf: !!isSelf,
     streamId: Number.isInteger(raw.streamId) && raw.streamId > 0 ? raw.streamId : 0,
+    // 房间摆位（内核 POS 帧同步过来的坐标，米）。posSet=false 时由 scene3d 用本机槽位。
+    posSet: raw.posSet === true && Number.isFinite(raw.x) && Number.isFinite(raw.z),
+    x: Number.isFinite(raw.x) ? raw.x : 0,
+    z: Number.isFinite(raw.z) ? raw.z : 0,
     level: typeof raw.level === 'number' && Number.isFinite(raw.level) ? raw.level : -120,
     occupancy: typeof raw.occupancy === 'number' && Number.isFinite(raw.occupancy) ? raw.occupancy : 0,
     gain: typeof raw.gain === 'number' && Number.isFinite(raw.gain) ? raw.gain : 1,
@@ -230,9 +234,11 @@ function hasFlow (state, node) {
 //
 // 绘制层从 SVG 换成 <canvas id="graph"> + ui/scene3d.js（纯 Canvas 2D 手写透视投影，
 // 不引依赖；为什么不用 WebGL 见 docs/3D-...方案.md §2.1.1 与 ui/scene3d.js 头注释）。
-//   - v1.3 物理房间模型：听者固定在原点朝 -Z，声源在地面自由摆位（默认落在预计算散点槽位，
-//     距离 0.85–2.2 m，按设备 id 持久化）；球的屏幕大小随距离缩放（近大远小），
+//   - v1.3 物理房间模型：听者固定在原点朝 -Z，声源在地面自由摆位（没摆过的设备落在
+//     预计算散点槽位，距离 0.85–2.2 m，按设备 id 持久化）；球的屏幕大小随距离缩放（近大远小），
 //     与音量衰减同向；名称行同时显示 "x.xx m"，双击切换汇聚端、拖动自由摆位；
+//   - v1.4 摆位全网同步：拖完的落点写进本机内核图谱，由 POS 帧广播给所有电脑/手机
+//     （GRAPH-PROTOCOL §13）；别的电脑拖动时本机轮询到新坐标后会平滑跟过去。
 //   - hub 永远在原点 → 投影恒为屏幕 (460,208)，与旧中心完全一致；
 //   - 交互（点选 / 切换 / 音量面板 / 操作条 / 同步状态）全部留在本文件，
 //     scene 只负责绘制与"拾取后回调"，回调仍走 onNodeClick 旧路径。
@@ -240,6 +246,23 @@ function hasFlow (state, node) {
 
 let scene = null
 let sceneBroken = false
+
+// 拖拽落点 → 本机内核图谱（POS 帧广播，全设备同步）。旧内核没有该 IPC 时静默跳过，
+// 位置只在本次运行内有效（不至于报错打断交互）。
+function applyPlacement (nodeId, pos) {
+  if (!window.hub || typeof window.hub.setNodePlacement !== 'function') return
+  if (!nodeId || !Array.isArray(pos)) return
+  const x = Math.round((Number(pos[0]) || 0) * 100) / 100
+  const z = Math.round((Number(pos[2]) || 0) * 100) / 100
+  try { window.hub.setNodePlacement(nodeId, x, z).catch(function () {}) } catch (e) { /* noop */ }
+}
+
+// 右键清除：让该设备回到各端自己的自动槽位（内核删掉整表里的这一项）
+function clearPlacement (nodeId) {
+  if (!window.hub || typeof window.hub.clearNodePlacement !== 'function') return
+  if (!nodeId) return
+  try { window.hub.clearNodePlacement(nodeId).catch(function () {}) } catch (e) { /* noop */ }
+}
 
 function ensureScene () {
   if (scene || sceneBroken) return scene
@@ -251,7 +274,9 @@ function ensureScene () {
       canvas: canvas,
       onSelect: (nodeId) => onNodeClick(nodeId),
       onActivate: (nodeId) => onNodeActivate(nodeId),
-      onDragEnd: () => { pumpSpatial() }     // 拖完立即推一次位置，不等 50 ms tick
+      // 拖完：先写内核图谱（跨设备同步），再推一次空间音频（不等 50 ms tick）
+      onDragEnd: (nodeId, pos) => { applyPlacement(nodeId, pos); pumpSpatial() },
+      onClearPlacement: (nodeId) => { clearPlacement(nodeId); pumpSpatial() }
     })
   } catch (err) {
     sceneBroken = true
@@ -382,10 +407,12 @@ function pumpSpatial () {
 }
 
 function graphSignature (state, graph) {
-  const nodeSig = graph.nodes.map((n) =>
-    n.id + ':' + n.name + ':' + (n.online ? '1' : '0') + ':' +
-    (n.isHub ? 'h' : '') + (n.isSelf ? 's' : '') + ':' + n.streamId
-  ).join('|')
+  const nodeSig = graph.nodes.map((n) => {
+    // 摆位也纳入签名：别的电脑一拖，本机轮询到新位置后要触发一次轻量重排（不走结构重排）
+    const pos = n.posSet ? (Math.round(n.x * 100) / 100) + ',' + (Math.round(n.z * 100) / 100) : '-'
+    return n.id + ':' + n.name + ':' + (n.online ? '1' : '0') + ':' +
+      (n.isHub ? 'h' : '') + (n.isSelf ? 's' : '') + ':' + n.streamId + ':' + pos
+  }).join('|')
   return (graph.hasGraph ? 'g' + graph.version : 'legacy') +
     '|hub=' + graph.hubId + '|self=' + graph.selfId + '|' + nodeSig +
     '|src=' + (state && state.pcSource ? '1' : '0')

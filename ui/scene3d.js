@@ -16,6 +16,8 @@
 //     不转听者、不转声场 —— 左右/前后只由节点在房间地面的位置决定；
 //   - 节点不再等距排圆环：默认落在预计算的 32 个散点上（0.85–2.2 m，前方 ≥1.35 m、
 //     后方 ≤1.5 m），按设备 id 持久化（store.slots）；拖动可在 0.45–2.3 m 地面自由摆位；
+//   - 摆位跨设备同步（v1.4，GRAPH-PROTOCOL §13）：拖完的位置写进内核图谱，用 POS 帧
+//     广播给所有电脑/手机 —— 谁拖都算数，位置在全网只有一份（本机 store 只留相机与槽位）；
 //   - 球的屏幕大小 = 透视 × 距离缩放（近大远小），与音量衰减同向；名称行显示 "x.xx m"。
 //
 // 相机：绕原点球坐标 (φ, dist, pitch)，默认 φ=0、dist=3.4、pitch=40°，
@@ -104,6 +106,11 @@
   }
 
   const STORE_KEY = 'audiohub.scene3d.v1'
+
+  // 摆位坐标上限（米）：与内核 POS 帧的 ±20 m 上限一致（拖拽交互另受 CFG.dragRMax 约束）。
+  // 位置真相在内核图谱里（跨电脑/手机同步），本机只存相机与自动槽位。
+  const ROOM_COORD_MAX = 20
+  const STORE_VERSION = 3
 
   // ============================================================ 向量与数值工具
 
@@ -205,7 +212,8 @@
   // 有真实位置，离听者越远声音越小、球也越小。默认位置用预计算的 32 个散点槽位：
   // 距离 0.85–2.2 m（前方 ≥1.35 m 防叠 hub 球，后方 ≤1.5 m 防投到屏幕外），
   // 相邻槽位平面距离 ≥0.42 m；按设备 id 持久化（store.slots），增删其他设备不重排。
-  // 拖动 = 地面自由摆位（0.45–2.3 m）；右键取消固定 → 回到自己的槽位。
+  // 拖动 = 地面自由摆位（0.45–2.3 m），落点同步进内核图谱（全设备一致）；
+  // 右键 = 清除该设备的全网摆位，退回本机槽位。
   const SLOT_COUNT = 32
 
   // 候选点是否与已占槽位保持 slotGap（米）
@@ -291,16 +299,18 @@
     return SLOTS[((idx % SLOT_COUNT) + SLOT_COUNT) % SLOT_COUNT]
   }
 
-  // nodes: 非 hub 节点数组（已按 id 升序）；pins: { id: [x,y,z] }；slots: { id: idx }。
-  // 返回 Map(id → {pos, slot, pinned, azDeg})；槽位分配由 setGraph 负责，这里只查表。
-  function roomLayout (nodes, pins, slots) {
+  // nodes: 非 hub 节点数组（已按 id 升序，项可带 posSet/x/z）；slots: { id: idx }。
+  // 返回 Map(id → {pos, slot, pinned, azDeg})。位置来源优先级：
+  //   1) 图谱里的显式摆位（内核 POS 帧同步，全设备一致 / 可跨电脑）
+  //   2) 本机持久化的自动槽位（只影响没摆过的设备，避免位置跳变）
+  function roomLayout (nodes, slots) {
     const out = new Map()
     for (let i = 0; i < nodes.length; i++) {
-      const id = nodes[i].id
-      const pin = pins && pins[id]
-      if (Array.isArray(pin) && pin.length === 3 && pin.every(Number.isFinite)) {
-        const x = pin[0]
-        const z = pin[2]
+      const n = nodes[i]
+      const id = n.id
+      if (n.posSet === true && Number.isFinite(n.x) && Number.isFinite(n.z)) {
+        const x = clamp(n.x, -ROOM_COORD_MAX, ROOM_COORD_MAX)
+        const z = clamp(n.z, -ROOM_COORD_MAX, ROOM_COORD_MAX)
         out.set(id, { pos: [x, 0, z], slot: -1, pinned: true, azDeg: wrap360(Math.atan2(x, -z) / DEG) })
         continue
       }
@@ -344,6 +354,10 @@
       ghost: false,
       kind: typeof raw.kind === 'string' ? raw.kind : 'other',
       streamId: Number.isInteger(raw.streamId) ? raw.streamId : 0,
+      // 显式摆位（内核 POS 帧同步过来的房间坐标，米）；posSet=false 时用本机自动槽位。
+      posSet: raw.posSet === true && Number.isFinite(raw.x) && Number.isFinite(raw.z),
+      x: Number.isFinite(raw.x) ? raw.x : 0,
+      z: Number.isFinite(raw.z) ? raw.z : 0,
       level: null,
       flow: false,
       pinned: false
@@ -360,6 +374,9 @@
       ghost: true,
       kind: 'ghost',
       streamId: 0,
+      posSet: false,
+      x: 0,
+      z: 0,
       level: null,
       flow: false,
       pinned: false
@@ -367,29 +384,30 @@
   }
 
   function loadStore () {
-    const empty = { v: 2, cam: { yawDeg: 0, pitchDeg: CFG.pitchDefault, dist: CFG.camDist }, pins: {}, slots: {} }
+    // v3：摆位移到内核图谱（POS 帧同步），本机只留相机与自动槽位；v1/v2 的 pins 直接丢弃
+    // （旧的不跨设备摆位不再回放，避免同一个节点在两台电脑上位置不一致）。
+    const empty = { v: STORE_VERSION, cam: { yawDeg: 0, pitchDeg: CFG.pitchDefault, dist: CFG.camDist }, slots: {} }
     try {
       const ls = root.localStorage
       if (!ls) return empty
       const parsed = JSON.parse(ls.getItem(STORE_KEY) || 'null')
-      if (!parsed || (parsed.v !== 1 && parsed.v !== 2)) return empty
+      if (!parsed || (parsed.v !== 1 && parsed.v !== 2 && parsed.v !== STORE_VERSION)) return empty
       const cam = parsed.cam && typeof parsed.cam === 'object' ? parsed.cam : {}
       const slots = {}
-      if (parsed.v === 2 && parsed.slots && typeof parsed.slots === 'object') {
+      if (parsed.v >= 2 && parsed.slots && typeof parsed.slots === 'object') {
         for (const id of Object.keys(parsed.slots)) {
           const idx = parsed.slots[id]
           if (Number.isInteger(idx) && idx >= 0 && idx < SLOT_COUNT) slots[id] = idx
         }
       }
       return {
-        v: 2,
+        v: STORE_VERSION,
         cam: {
           yawDeg: Number.isFinite(cam.yawDeg) ? wrap180(cam.yawDeg) : 0,
           pitchDeg: Number.isFinite(cam.pitchDeg) ? clamp(cam.pitchDeg, CFG.pitchMin, CFG.pitchMax) : CFG.pitchDefault,
           // v1→v2：房间比旧圆环大一圈，旧默认距离 2.6 会切掉 R=2 环，迁移时统一回默认 3.4。
-          dist: parsed.v === 2 && Number.isFinite(cam.dist) ? clamp(cam.dist, CFG.distMin, CFG.distMax) : CFG.camDist
+          dist: parsed.v >= 2 && Number.isFinite(cam.dist) ? clamp(cam.dist, CFG.distMin, CFG.distMax) : CFG.camDist
         },
-        pins: parsed.pins && typeof parsed.pins === 'object' ? parsed.pins : {},
         slots: slots
       }
     } catch (e) {
@@ -407,6 +425,7 @@
     const onSelect = typeof opts.onSelect === 'function' ? opts.onSelect : function () {}
     const onActivate = typeof opts.onActivate === 'function' ? opts.onActivate : function () {}
     const onDragEnd = typeof opts.onDragEnd === 'function' ? opts.onDragEnd : function () {}
+    const onClearPlacement = typeof opts.onClearPlacement === 'function' ? opts.onClearPlacement : function () {}
 
     const store = loadStore()
     let view = camera(store.cam.yawDeg, store.cam.dist,
@@ -463,9 +482,8 @@
         const ls = root.localStorage
         if (!ls) return
         ls.setItem(STORE_KEY, JSON.stringify({
-          v: 2,
+          v: STORE_VERSION,
           cam: { yawDeg: view.phiDeg, pitchDeg: view.pitchDeg, dist: view.dist },
-          pins: store.pins,
           slots: store.slots
         }))
       } catch (e) { /* localStorage 不可用（隐私模式/文件协议）时静默 */ }
@@ -484,8 +502,7 @@
       lastGraph = g
       const hubRaw = g && g.hubNode && !g.hubNode.ghost ? g.hubNode : null
       const hub = hubRaw ? makeNode(hubRaw, true) : ghostHub()
-      hub.pinned = false
-      if (hubRaw && store.pins[hub.id]) hub.pinned = true
+      hub.pinned = false   // hub 恒在房间中心（听者位），不参与摆位
 
       const othersRaw = []
       const rawList = g && Array.isArray(g.nodes) ? g.nodes : []
@@ -501,9 +518,9 @@
       byId = new Map()
       byId.set(hub.id, hub)
 
-      // v1.3：房间槽位（store.slots 持久化）。先剪掉已不在图中的设备，避免 32 槽位耗尽；
-      // 新设备取最小空闲槽，按 id 升序分配 → 结果确定；pinned 设备也占一个槽，
-      // 右键取消固定时回到自己的位置。
+      // v1.3：房间槽位（store.slots 持久化，只服务“没摆过”的设备）。先剪掉已不在图中的
+      // 设备避免 32 槽位耗尽；新设备取最小空闲槽，按 id 升序分配 → 结果确定。
+      // 显式摆位（图谱 POS 帧）优先于槽位；右键清除摆位后回落到自己的槽位。
       const present = new Set()
       for (let i = 0; i < othersRaw.length; i++) present.add(othersRaw[i].id)
       let slotsDirty = false
@@ -526,7 +543,7 @@
         const id = othersRaw[i].id
         if (!Number.isInteger(store.slots[id])) store.slots[id] = allocate()
       }
-      const lay = roomLayout(othersRaw.map((n) => ({ id: n.id })), store.pins, store.slots)
+      const lay = roomLayout(othersRaw, store.slots)
       if (slotsDirty) saveStore()
       for (let i = 0; i < othersRaw.length; i++) {
         const raw = othersRaw[i]
@@ -675,7 +692,7 @@
         positions: positions,
         listener: spatialFrame().listener,
         fps: fps,
-        pins: Object.assign({}, store.pins),
+        placed: nodes.filter((n) => n.posSet).map((n) => n.id),
         slots: Object.assign({}, store.slots),
         room: {
           radius: CFG.roomR,
@@ -709,16 +726,24 @@
 
     function toLogical (clientX, clientY) {
       const r = rect()
-      const w = r.width || VW
-      const h = r.height || VH
-      return { sx: (clientX - r.left) * VW / w, sy: (clientY - r.top) * VH / h }
+      const fit = fitInfo()
+      return { sx: (clientX - r.left - fit.ox) / fit.s, sy: (clientY - r.top - fit.oy) / fit.s }
     }
 
     function toClient (sx, sy) {
       const r = rect()
-      const w = r.width || VW
-      const h = r.height || VH
-      return { clientX: r.left + sx * w / VW, clientY: r.top + sy * h / VH }
+      const fit = fitInfo()
+      return { clientX: r.left + fit.ox + sx * fit.s, clientY: r.top + fit.oy + sy * fit.s }
+    }
+
+    // 等比适配：逻辑视口恒 920x460，画布按容器大小等比缩放后在容器里居中；
+    // 容器宽高比与视口不一致时多出的部分留边（不拉伸、也不裁掉任何节点）。
+    function fitInfo () {
+      const r = rect()
+      const cssW = Math.max(1, r.width || VW)
+      const cssH = Math.max(1, r.height || (cssW * VH / VW))
+      const s = Math.min(cssW / VW, cssH / VH)
+      return { cssW: cssW, cssH: cssH, s: s, ox: (cssW - VW * s) / 2, oy: (cssH - VH * s) / 2 }
     }
 
     // ---------------------------------------------------------- 投影与绘制
@@ -759,18 +784,16 @@
     }
 
     function ensureSize () {
-      const r = rect()
+      const fit = fitInfo()
       const dpr = Math.min(root.devicePixelRatio || 1, CFG.dprMax)
-      const cssW = Math.max(1, Math.round(r.width || VW))
-      const cssH = Math.max(1, Math.round(r.height || (cssW * VH / VW)))
-      const w = Math.max(1, Math.round(cssW * dpr))
-      const h = Math.max(1, Math.round(cssH * dpr))
+      const w = Math.max(1, Math.round(fit.cssW * dpr))
+      const h = Math.max(1, Math.round(fit.cssH * dpr))
       if (canvas.width !== w) canvas.width = w
       if (canvas.height !== h) canvas.height = h
-      canvasSize.cssW = cssW
-      canvasSize.cssH = cssH
+      canvasSize.cssW = fit.cssW
+      canvasSize.cssH = fit.cssH
       canvasSize.dpr = dpr
-      return { sx: w / VW, sy: h / VH, dpr: dpr }
+      return { s: fit.s * dpr, ox: fit.ox * dpr, oy: fit.oy * dpr, dpr: dpr }
     }
 
     function ballColor (rec) {
@@ -1065,14 +1088,15 @@
     function draw (now) {
       const r = rect()
       if (!r.width || !r.height) return
-      const scale = ensureSize()
-      ctx.setTransform(scale.sx, 0, 0, scale.sy, 0, 0)
-      ctx.clearRect(0, 0, VW, VH)
+      const size = ensureSize()
+      ctx.setTransform(1, 0, 0, 1, 0, 0)
+      ctx.clearRect(0, 0, canvas.width, canvas.height)
+      ctx.setTransform(size.s, 0, 0, size.s, size.ox, size.oy)
       if (!theme) readTheme()
 
       const items = projectAll()
       lastItems = items
-      drawGround(scale)
+      drawGround(size)
       drawLinks(items)
       const others = nodes.length - 1
       const showLabels = others <= CFG.labelLOD || nodes.length < 2
@@ -1175,7 +1199,7 @@
       const p = toLogical(ev.clientX, ev.clientY)
       const world = unproject(view, p.sx, p.sy, 0)
       if (!world) return
-      const maxR = Math.max(CFG.dragRMin, Math.min(CFG.dragRMax, view.dist * 0.75))
+      const maxR = CFG.dragRMax    // 房间边界固定：相机拉近时也不该缩成半米活动范围
       let x = world[0]
       let z = world[2]
       const rr = Math.hypot(x, z)
@@ -1195,13 +1219,16 @@
       drag = null
       if (d.mode === 'node' && d.id) {
         if (d.moved) {
+          // 落点写回内核图谱（POS 帧 → 其他电脑 / 手机）。本机先定住位置，
+          // 等 200ms 轮询把内核回声带回来，避免先弹回槽位再跳过去。
           const pos = worldPos.get(d.id) || [0, 0, 0]
-          store.pins[d.id] = [r3(pos[0]), 0, r3(pos[2])]
-          saveStore()
+          const to = [r3(pos[0]), 0, r3(pos[2])]
+          worldPos.set(d.id, to)
+          targetPos.set(d.id, to)
           const rec = byId.get(d.id)
           if (rec) rec.pinned = true
           dirty = true
-          onDragEnd(d.id, [pos[0], pos[1], pos[2]])
+          onDragEnd(d.id, to)
         } else if (d.rec) {
           onSelect(d.rec.id)
         }
@@ -1214,8 +1241,11 @@
 
     function onWheel (ev) {
       ev.preventDefault()
-      const delta = Number.isFinite(ev.deltaY) ? ev.deltaY : 0
-      const dist = clamp(view.dist * Math.exp(-delta * 0.0012), CFG.distMin, CFG.distMax)
+      // deltaMode：0=像素、1=行（≈33px）、2=页（≈一屏）。归一化后再换算，触控板/行滚轮手感一致。
+      const unit = ev.deltaMode === 1 ? 33 : (ev.deltaMode === 2 ? VH : 1)
+      const delta = (Number.isFinite(ev.deltaY) ? ev.deltaY : 0) * unit
+      // 方向：滚轮向上（deltaY<0）= 凑近放大，向下 = 拉远看全景。
+      const dist = clamp(view.dist * Math.exp(delta * 0.0012), CFG.distMin, CFG.distMax)
       view = camera(view.phiDeg, dist, view.pitchDeg)
       saveStore()
       dirty = true
@@ -1232,12 +1262,15 @@
       const hit = pickAt(ev.clientX, ev.clientY)
       if (!hit) return
       const rec = hit.rec
-      if (!rec.pinned) return
+      if (rec.isHub || rec.ghost) return
       ev.preventDefault()
-      delete store.pins[rec.id]
-      saveStore()
+      // 右键 = 清除该设备的全网摆位，退回自动槽位（内核回声后其他设备同步回退）
+      const idx = Number.isInteger(store.slots[rec.id]) ? store.slots[rec.id] : 0
+      targetPos.set(rec.id, slotAt(idx).pos.slice())
       rec.pinned = false
-      if (lastGraph) setGraph(lastGraph)   // 清 pin → 回到派生环位
+      applyTargets(new Map(worldPos))
+      dirty = true
+      onClearPlacement(rec.id)
     }
 
     function onKeyDown (ev) {
@@ -1246,7 +1279,7 @@
         worldPos.set(drag.id, drag.startPos.slice())
         targetPos.set(drag.id, drag.startPos.slice())
         const rec = byId.get(drag.id)
-        if (rec) rec.pinned = Object.prototype.hasOwnProperty.call(store.pins, drag.id)
+        if (rec) rec.pinned = rec.posSet === true
         drag.moved = false
         dirty = true
       }
@@ -1259,6 +1292,12 @@
 
     // ---------------------------------------------------------- 生命周期
 
+    // 容器/窗口尺寸变化：逻辑视口恒定，重算等比缩放即可（Flex 布局下容器常变，用 RO 更及时）
+    function onResize () {
+      ensureSize()
+      dirty = true
+    }
+
     canvas.addEventListener('mousedown', onDown)
     canvas.addEventListener('dblclick', onDblClick)
     canvas.addEventListener('contextmenu', onContextMenu)
@@ -1266,6 +1305,14 @@
     root.addEventListener('mousemove', onMove)
     root.addEventListener('mouseup', onUp)
     root.addEventListener('keydown', onKeyDown)
+    root.addEventListener('resize', onResize)
+    let ro = null
+    if (root.ResizeObserver) {
+      try {
+        ro = new root.ResizeObserver(onResize)
+        ro.observe(canvas)
+      } catch (e) { ro = null }
+    }
     try { readTheme() } catch (e) { /* noop */ }
     if (root.requestAnimationFrame) rafId = root.requestAnimationFrame(tick)
 
@@ -1297,6 +1344,8 @@
         root.removeEventListener('mousemove', onMove)
         root.removeEventListener('mouseup', onUp)
         root.removeEventListener('keydown', onKeyDown)
+        root.removeEventListener('resize', onResize)
+        if (ro) { try { ro.disconnect() } catch (e) { /* noop */ } ro = null }
       },
       _view: function () { return view }
     }

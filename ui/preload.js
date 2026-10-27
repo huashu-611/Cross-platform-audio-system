@@ -58,5 +58,12 @@ contextBridge.exposeInMainWorld('hub', {
   // 单个节点的世界位置（nodeId = 图谱节点 id "ip:audioPort"；enabled=false = 旁路空间化）。
   // y 固定为 0：所有节点都在听者所在的水平面上，与 2D 图谱"同一平面"语义对应。
   setSourceSpatial: (nodeId, x, z, enabled) =>
-    ipcRenderer.invoke('hub:setSourceSpatial', { nodeId, x, y: 0, z, enabled })
+    ipcRenderer.invoke('hub:setSourceSpatial', { nodeId, x, y: 0, z, enabled }),
+
+  // 房间摆位（GRAPH-PROTOCOL §13）：拖动落点 → 本机内核 → 广播给全网所有设备。
+  // 位置是全网一份，不落本地存储；clearNodePlacement 让节点回到自动槽位。
+  setNodePlacement: (nodeId, x, z) =>
+    ipcRenderer.invoke('hub:setNodePlacement', { nodeId, x, z }),
+  clearNodePlacement: (nodeId) =>
+    ipcRenderer.invoke('hub:setNodePlacement', { nodeId, clear: true })
 })

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
@@ -119,13 +120,15 @@ std::string GraphStateJson(const audiohub::HubCore& hub,
                            const std::vector<audiohub::Peer>& discovered,
                            const std::vector<audiohub::Peer>& session_peers) {
   const audiohub::GraphState g = hub.Graph();
+  const audiohub::PlacementState placement = hub.Placements();
   const std::string self_id = hub.graph_self_id();
 
   std::ostringstream o;
   o << "{\"version\":" << g.version << ",\"origin\":\"" << audiohub::JsonEscape(g.origin)
     << "\",\"hubId\":\"" << audiohub::JsonEscape(g.hub_id) << "\",\"selfId\":\""
     << audiohub::JsonEscape(self_id) << "\",\"isHub\":"
-    << (hub.graph_is_hub() ? "true" : "false") << ",\"nodes\":[";
+    << (hub.graph_is_hub() ? "true" : "false")
+    << ",\"placementVersion\":" << placement.version << ",\"nodes\":[";
   for (size_t i = 0; i < g.nodes.size(); ++i) {
     const audiohub::GraphNode& n = g.nodes[i];
     // 节点 id 一定是 "ip:端口"；取最后一个冒号前的部分当 IP
@@ -175,6 +178,8 @@ std::string GraphStateJson(const audiohub::HubCore& hub,
     }
 
     if (i) o << ",";
+    // 摆位（§13）：posSet=false 时界面用确定性自动槽位排布；true 时用 x/z（米）。
+    const audiohub::PlacementItem* pos = audiohub::FindPlacement(placement, n.id);
     o << "{\"id\":\"" << audiohub::JsonEscape(n.id) << "\""
       << ",\"name\":\"" << audiohub::JsonEscape(n.name) << "\""
       << ",\"kind\":\"" << audiohub::JsonEscape(n.kind) << "\""
@@ -184,7 +189,12 @@ std::string GraphStateJson(const audiohub::HubCore& hub,
       << ",\"isSelf\":" << (n.id == self_id ? "true" : "false")
       << ",\"isHub\":" << (n.id == g.hub_id ? "true" : "false")
       << ",\"streamId\":" << stream_id
-      << ",\"level\":" << (src != nullptr ? src->level_dbfs : -120.0)
+      << ",\"posSet\":" << (pos != nullptr ? "true" : "false");
+    if (pos != nullptr) {
+      o << ",\"x\":" << (static_cast<double>(pos->x_cm) / 100.0)
+        << ",\"z\":" << (static_cast<double>(pos->z_cm) / 100.0);
+    }
+    o << ",\"level\":" << (src != nullptr ? src->level_dbfs : -120.0)
       << ",\"occupancy\":" << (src != nullptr ? src->occupancy_ms : 0)
       << ",\"gain\":" << (src != nullptr ? src->gain : 1.0)
       << ",\"muted\":" << ((src != nullptr && src->muted) ? "true" : "false") << "}";
@@ -494,6 +504,43 @@ int main(int argc, char** argv) {
                           const size_t sent = g.nodes.empty() ? 0 : g.nodes.size() - 1;
                           std::ostringstream o;
                           o << "{\"ok\":true,\"sent\":" << sent << "}";
+                          return o.str();
+                        }
+                        if (method == "POST" && path == "/api/graph/placement") {
+                          // 房间摆位（协议 §13）：桌面端拖拽落点 / 清除，由本机内核
+                          // version+1 后广播给图谱里所有节点（手机端只读显示）。
+                          std::string node_id;
+                          if (!audiohub::JsonGetString(body, "nodeId", &node_id) ||
+                              node_id.empty()) {
+                            return "{\"ok\":false,\"error\":\"nodeId missing\"}";
+                          }
+                          bool known = false;
+                          for (const auto& n : hub.Graph().nodes) {
+                            if (n.id == node_id) { known = true; break; }
+                          }
+                          if (!known) return "{\"ok\":false,\"error\":\"node not found\"}";
+                          bool clear = false;
+                          audiohub::JsonFindBool(body, "clear", &clear);
+                          if (clear) {
+                            // 没摆过 / 已经是自动槽位：当成功（幂等，GUI 重试不会报错）
+                            hub.ClearNodePlacement(node_id);
+                          } else {
+                            double x = 0, z = 0;
+                            if (!audiohub::JsonFindNumber(body, "x", &x) ||
+                                !audiohub::JsonFindNumber(body, "z", &z)) {
+                              return "{\"ok\":false,\"error\":\"need x/z\"}";
+                            }
+                            if (!(std::isfinite(x) && std::isfinite(z)) ||
+                                !(x >= -20.0 && x <= 20.0) || !(z >= -20.0 && z <= 20.0)) {
+                              return "{\"ok\":false,\"error\":\"coord out of range\"}";
+                            }
+                            // 坐标与现有值相同 → 内核不造新版本（避免两端互相回发）
+                            hub.SetNodePlacement(node_id, static_cast<float>(x),
+                                                 static_cast<float>(z));
+                          }
+                          std::ostringstream o;
+                          o << "{\"ok\":true,\"placementVersion\":" << hub.placement_version()
+                            << "}";
                           return o.str();
                         }
                         if (method == "POST" && path == "/api/session/clear") {

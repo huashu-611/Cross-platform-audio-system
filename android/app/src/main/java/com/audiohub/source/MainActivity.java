@@ -8,6 +8,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.graphics.drawable.ColorDrawable;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -18,16 +19,12 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.EditText;
+import android.util.TypedValue;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.SeekBar;
-import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
-
-import android.util.TypedValue;
-
-import org.json.JSONArray;
-import org.json.JSONObject;
 
 import java.util.List;
 
@@ -54,13 +51,15 @@ public class MainActivity extends Activity {
     private TextView hubSub;
     private TextView sourceState;
     private Button sourceToggle;
-    private LinearLayout peerList;
     private TextView scanHint;
+    // 主界面只放摘要；完整设备列表 / 待确认请求都在弹窗里（一屏装完、不滚动）
+    private TextView devSummary;
+    private TextView connectPending;
+    private TextView ctrlPending;
+    /** 当前合并后的设备列表（手动 + 自动发现），供「设备列表」弹窗使用。 */
+    private final java.util.List<Discovery.Device> currentPeers = new java.util.ArrayList<>();
     // 手动添加 / 上次连接的设备（广播被拦时靠它们）
     private final java.util.List<Discovery.Device> manualPeers = new java.util.ArrayList<>();
-    // 控制界面里的"新设备"区（会话进行中也得能接人）
-    private LinearLayout ctrlReqList;
-    private LinearLayout connectReqList;
 
     // 用户主动点了"断开"：服务真正停掉之前，不能被图谱/服务状态拉回控制界面
     private boolean userLeft = false;
@@ -81,22 +80,10 @@ public class MainActivity extends Activity {
     /** 一次性提示（只 toast 一次，避免每 400ms 刷屏）。 */
     private String hintText = "";
 
-    private LinearLayout ctrlPeerList;
-
     private HubGraphView graph;
 
-    // ---- 3D 房间场景（PC 端 v1.3 ui/scene3d.js 的持久化约定：SharedPreferences "audiohub" / key "scene3d"）----
-    private static final String PREF_SCENE3D = "scene3d";
-    private static final int SCENE_STORE_VERSION = 2;
-    /** 用户拖动 pin 住的节点：id → [x, 0, z]（米，与 PC 端 store.pins 同构）。 */
-    private final java.util.Map<String, double[]> scenePins = new java.util.LinkedHashMap<>();
-    /** 自动槽位分配：id → 0..31（与 PC 端 store.slots 同构）。 */
-    private final java.util.Map<String, Integer> sceneSlots = new java.util.LinkedHashMap<>();
-    /** 相机（绕原点 orbit）：yaw/pitch 度、dist 米；与 PC 端 store.cam 同构。 */
-    private double sceneYawDeg = 0;
-    private double scenePitchDeg = Scene3D.CFG.PITCH_DEFAULT;
-    private double sceneDist = Scene3D.CFG.CAM_DIST;
-    private long sceneSavedAtMs = 0;
+    // ---- 图谱布局：权威来自 hub 同步的 POS 帧（人工摆位），没摆位的节点用确定性自动槽位。
+    // 手机端只读：不再持久化相机 / pin（旧的 "scene3d" SharedPreferences 直接弃用）----
     private LinearLayout volPanel;
     private TextView volName;
     private SeekBar volSlider;
@@ -127,11 +114,13 @@ public class MainActivity extends Activity {
     private static final int COLOR_WARN = 0xFFFBBF24;
 
     /** 构建标记：与 APK versionName 保持一致，用于在手机上确认装的是哪一版。 */
-    private static final String BUILD_TAG = "1.4-3d-2";
+    private static final String BUILD_TAG = "1.5-topdown";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // 窗口底色：连接页内容短 / 系统栏区域都不能露白（AndroidManifest 没有指定 theme）
+        getWindow().setBackgroundDrawable(new ColorDrawable(COLOR_BG));
 
         // 兜底：任何未捕获异常都写进 logcat，并把堆栈落盘一份。
         // 用户报"闪退"时，没有堆栈就完全没法查。
@@ -157,9 +146,6 @@ public class MainActivity extends Activity {
         hubIp = prefs.getString("hub_ip", null);
         hubPort = prefs.getInt("hub_port", 47000);
         hubName = prefs.getString("hub_name", null);
-        // 3D 场景：相机/pin/槽位从 PC 端同一份 JSON 恢复；没有就用默认视角（φ=0、pitch 40°、dist 3.4 m）。
-        loadSceneStore(prefs);
-        if (graph != null) graph.setCamera(sceneYawDeg, scenePitchDeg, sceneDist);
 
         // 图谱：本机节点尽早就位；上次连过的设备先登记成占位节点
         // （kind 先 other，对端发来 GRAPH 后会被校正成它自己的名字/类型）
@@ -169,9 +155,6 @@ public class MainActivity extends Activity {
             GraphStore.upsertNode(hubIp, hubPort > 0 ? hubPort : GraphStore.AUDIO_PORT,
                     hubName != null ? hubName : hubIp, GraphStore.KIND_OTHER);
         }
-
-        // 上次如果崩过，把堆栈直接摆到眼前——用户不用连电脑也能发给我们
-        showLastCrashIfAny();
 
         // 上次如果崩过，把堆栈直接摆到眼前——用户不用连电脑也能发给我们
         showLastCrashIfAny();
@@ -240,7 +223,6 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        saveSceneStore();   // 相机/pin/槽位最后落盘一次
         poller.removeCallbacksAndMessages(null);
         if (discovery != null) discovery.stop();
         InviteListener.get().stop();
@@ -250,12 +232,6 @@ public class MainActivity extends Activity {
             multicastLock = null;
         }
         super.onDestroy();
-    }
-
-    @Override
-    protected void onPause() {
-        super.onPause();
-        saveSceneStore();
     }
 
     /** 上次运行留下的崩溃日志：有就弹出来，并告诉用户文件在哪。 */
@@ -312,17 +288,17 @@ public class MainActivity extends Activity {
         tv.setText(text);
         tv.setTextSize(11.5f);
         tv.setTextColor(COLOR_DIM);
-        tv.setPadding(0, dp(3), 0, 0);
+        tv.setPadding(0, dp(2), 0, 0);
         return tv;
     }
 
     private LinearLayout card() {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(14), dp(12), dp(14), dp(12));
+        card.setPadding(dp(11), dp(8), dp(11), dp(8));
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        p.setMargins(0, 0, 0, dp(10));
+        p.setMargins(0, 0, 0, dp(6));
         card.setLayoutParams(p);
         card.setBackgroundColor(COLOR_CARD);
         return card;
@@ -335,50 +311,56 @@ public class MainActivity extends Activity {
         b.setAllCaps(false);
         b.setTextColor(color);
         b.getBackground().setAlpha(0);
-        b.setPadding(dp(10), dp(8), dp(10), dp(8));
+        b.setPadding(dp(7), dp(5), dp(7), dp(5));
         return b;
     }
 
     private View buildUi() {
-        ScrollView scroll = new ScrollView(this);
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(18), dp(20), dp(18), dp(24));
+        // 根容器：FrameLayout。两屏都 MATCH_PARENT、靠 VISIBLE/GONE 切换 ——
+        // 不再用滚动容器：没有滚动条，也不会两屏共用一个滚动位置。
+        final FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(COLOR_BG);
-        scroll.addView(root);
 
+        // 标题区（放进连接屏；控制屏顶部用 hubValue 那一行）
+        final LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.VERTICAL);
         TextView title = new TextView(this);
         title.setText("AudioHub");
-        title.setTextSize(24);
+        title.setTextSize(22);
         title.setLetterSpacing(0.02f);
         title.setTextColor(COLOR_TEXT);
-        root.addView(title);
+        header.addView(title);
 
         TextView subT = new TextView(this);
         subT.setText("多台设备的声音，汇到一处");
-        subT.setTextSize(12.5f);
+        subT.setTextSize(12f);
         subT.setTextColor(COLOR_DIM);
-        subT.setPadding(0, dp(4), 0, dp(14));
-        root.addView(subT);
+        subT.setPadding(0, dp(2), 0, dp(6));
+        header.addView(subT);
 
         // 版本/特性标记：手机上装的是哪一版一眼可辨（排查“装了新版还是旧界面”类问题）
         TextView buildTag = new TextView(this);
-        buildTag.setText("3D 房间视图 · v" + BUILD_TAG);
+        buildTag.setText("俯视平面图 · v" + BUILD_TAG);
         buildTag.setTextSize(11f);
         buildTag.setTextColor(COLOR_DIM);
-        buildTag.setPadding(0, 0, 0, dp(10));
-        root.addView(buildTag);
+        buildTag.setPadding(0, 0, 0, dp(6));
+        header.addView(buildTag);
 
         // ================= 连接界面 =================
         screenConnect = new LinearLayout(this);
         screenConnect.setOrientation(LinearLayout.VERTICAL);
+        screenConnect.setPadding(dp(16), dp(12), dp(16), dp(10));
+        screenConnect.setBackgroundColor(COLOR_BG);
+        screenConnect.addView(header);
+        root.addView(screenConnect, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        connectReqList = new LinearLayout(this);
-        connectReqList.setOrientation(LinearLayout.VERTICAL);
-        screenConnect.addView(connectReqList);
+        // 待确认的接入请求：有才显示一行提示，点开对话框处理（不占主界面高度）
+        connectPending = pendingBanner();
+        screenConnect.addView(connectPending);
 
         TextView connectHint = sub("先建立连接，再在控制界面里指定谁当汇聚端");
-        connectHint.setPadding(0, 0, 0, dp(10));
+        connectHint.setPadding(0, 0, 0, dp(6));
         screenConnect.addView(connectHint);
 
         screenConnect.addView(sectLabel("本机声音"));
@@ -427,20 +409,27 @@ public class MainActivity extends Activity {
             public void onClick(View v) { showManualAddDialog(); }
         });
         devRow.addView(manualBtn);
+        Button peerBtn = textButton("设备列表", COLOR_DIM);
+        peerBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) { showPeersDialog(); }
+        });
+        devRow.addView(peerBtn);
         screenConnect.addView(devRow);
 
         scanHint = sub("");
-        scanHint.setPadding(0, 0, 0, dp(8));
+        scanHint.setPadding(0, 0, 0, dp(4));
         screenConnect.addView(scanHint);
 
-        peerList = new LinearLayout(this);
-        peerList.setOrientation(LinearLayout.VERTICAL);
-        screenConnect.addView(peerList);
-        root.addView(screenConnect);
+        devSummary = sub("");
+        devSummary.setPadding(0, 0, 0, 0);
+        screenConnect.addView(devSummary);
 
         // ================= 控制界面 =================
         screenControl = new LinearLayout(this);
         screenControl.setOrientation(LinearLayout.VERTICAL);
+        screenControl.setPadding(dp(14), dp(8), dp(14), dp(6));
+        screenControl.setBackgroundColor(COLOR_BG);
         screenControl.setVisibility(View.GONE);
 
         graph = new HubGraphView(this, null);
@@ -456,42 +445,31 @@ public class MainActivity extends Activity {
                 onSceneDoubleTap(node);
             }
         });
-        graph.setOnSceneChanged(new HubGraphView.OnSceneChanged() {
-            @Override
-            public void onCameraChanged(double yawDeg, double pitchDeg, double dist) {
-                onSceneCamera(yawDeg, pitchDeg, dist);
-            }
-
-            @Override
-            public void onPinChanged(String nodeId, double wx, double wz) {
-                onScenePin(nodeId, wx, wz);
-            }
-
-            @Override
-            public void onPinCleared(String nodeId) {
-                onSceneUnpin(nodeId);
-            }
-        });
+        // 图谱吃满剩余高度（权重 1），最小高度保证小屏也看得清俯视图；不再写死 300dp。
+        // 位置/缩放全由 View 自己按实际宽高等比算 ppu，禁止任何拖动/捏合/旋转手势。
+        graph.setMinimumHeight(dp(200));
         screenControl.addView(graph, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(300)));
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
         volPanel = new LinearLayout(this);
         volPanel.setOrientation(LinearLayout.VERTICAL);
-        volPanel.setPadding(dp(14), dp(12), dp(14), dp(12));
+        volPanel.setPadding(dp(12), dp(8), dp(12), dp(8));
         LinearLayout.LayoutParams vp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        vp.setMargins(0, dp(6), 0, dp(10));
+        vp.setMargins(0, dp(4), 0, dp(4));
         volPanel.setLayoutParams(vp);
         volPanel.setBackgroundColor(COLOR_CARD);
+        // 默认收起：点节点才展开，主界面尽量一屏装完
+        volPanel.setVisibility(View.GONE);
         volName = new TextView(this);
-        volName.setTextSize(14);
+        volName.setTextSize(13.5f);
         volName.setTextColor(COLOR_TEXT);
         volPanel.addView(volName);
 
         LinearLayout volRow = new LinearLayout(this);
         volRow.setOrientation(LinearLayout.HORIZONTAL);
         volRow.setGravity(Gravity.CENTER_VERTICAL);
-        volRow.setPadding(0, dp(8), 0, 0);
+        volRow.setPadding(0, dp(4), 0, 0);
         volSlider = new SeekBar(this);
         volSlider.setMax(150);
         volSlider.setProgress(100);
@@ -525,10 +503,9 @@ public class MainActivity extends Activity {
         volPanel.addView(volRow);
         screenControl.addView(volPanel);
 
-        // 会话进行中也可能有新设备接入：待确认请求 + 添加设备入口
-        ctrlReqList = new LinearLayout(this);
-        ctrlReqList.setOrientation(LinearLayout.VERTICAL);
-        screenControl.addView(ctrlReqList);
+        // 会话进行中也可能有新设备接入：待确认提示 + 设备列表弹窗入口
+        ctrlPending = pendingBanner();
+        screenControl.addView(ctrlPending);
 
         LinearLayout ctrlDevRow = new LinearLayout(this);
         ctrlDevRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -540,18 +517,10 @@ public class MainActivity extends Activity {
         Button ctrlAdd = textButton("添加设备", COLOR_ACCENT);
         ctrlAdd.setOnClickListener(new View.OnClickListener() {
             @Override
-            public void onClick(View v) {
-                ctrlPeerList.setVisibility(
-                        ctrlPeerList.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE);
-            }
+            public void onClick(View v) { showPeersDialog(); }
         });
         ctrlDevRow.addView(ctrlAdd);
         screenControl.addView(ctrlDevRow);
-
-        ctrlPeerList = new LinearLayout(this);
-        ctrlPeerList.setOrientation(LinearLayout.VERTICAL);
-        ctrlPeerList.setVisibility(View.GONE);
-        screenControl.addView(ctrlPeerList);
 
         // 汇聚端信息：切换靠点图谱里的球（协议 §9.3），不再有下拉/切换按钮
         LinearLayout hubBar = card();
@@ -578,6 +547,7 @@ public class MainActivity extends Activity {
             public void onClick(View v) {
                 // 协议 §4.6：清空图谱（不广播），两个服务都停，回连接界面
                 GraphStore.resetSession();
+                PlacementStore.reset();   // 人工摆位表一起清掉；重连后再向 hub 要 POS
                 startService(new Intent(MainActivity.this, ReceiverService.class)
                         .setAction(ReceiverService.ACTION_STOP));
                 sourceIntent = false;
@@ -594,15 +564,10 @@ public class MainActivity extends Activity {
             }
         });
         screenControl.addView(leave);
-        root.addView(screenControl);
+        root.addView(screenControl, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        statusViewPlaceholder();
-        return scroll;
-    }
-
-    private TextView statusViewPlaceholder() {
-        // 占位：状态文本并入各卡片，不再单独放
-        return null;
+        return root;
     }
 
     // ------------------------------------------------------------ 两屏切换
@@ -614,6 +579,8 @@ public class MainActivity extends Activity {
 
     /** 音量面板：streamId=0 表示这个节点当前没有音频流（只看状态）。 */
     private void showVolumePanelForStream(int streamId, String label) {
+        // 点节点才展开音量面板（默认 GONE，省主界面高度）
+        if (volPanel != null) volPanel.setVisibility(View.VISIBLE);
         selectedStreamId = streamId;
         if (streamId <= 0) {
             volName.setText(label + " · 暂无音频流");
@@ -896,19 +863,18 @@ public class MainActivity extends Activity {
                 && (g.nodes.size() >= 2 || hubRunning || srcRunning);
         showScreen(showControl ? "control" : "connect");
 
-        // 画全网图谱：每个节点一个球，汇聚端在中间（协议 §9.3）
-        // 3D 房间布局：非 hub 节点按 id 升序取最小空闲槽位（0..31），pin 过的用固定位置。
-        // roomLayout/allocateSlots 就是 PC 端 ui/scene3d.js 的同名函数；hub 固定在原点、听者固定在原点朝 -Z。
+        // 画全网图谱：每个节点一个球，汇聚端在中间（协议 §9.3）。
+        // 布局权威 = hub 同步的 POS 帧（人工摆位）；表里没有的节点用确定性自动槽位兜底
+        // （sceneIds 按 id 升序 → 各端对同一节点集算出一致布局）。
+        // 手机端只读：不产生摆位、不写回任何场景持久化；hub 固定在原点。
         final java.util.List<String> sceneIds = new java.util.ArrayList<>();
         for (GraphStore.Node n : g.nodes) {
             if (n.id.equals(g.hubId)) continue;
             sceneIds.add(n.id);
         }
         java.util.Collections.sort(sceneIds);
-        final boolean sceneDirty = Scene3D.allocateSlots(sceneIds, sceneIds, sceneSlots);
         final java.util.Map<String, Scene3D.Placement> sceneLayout =
-                Scene3D.roomLayout(sceneIds, scenePins, sceneSlots);
-        if (sceneDirty) saveSceneStore();
+                Scene3D.roomLayout(sceneIds, null, null);
 
         final java.util.List<HubGraphView.Node> viewNodes = new java.util.ArrayList<>();
         for (GraphStore.Node n : g.nodes) {
@@ -924,13 +890,23 @@ public class MainActivity extends Activity {
                 v.wz = 0;
                 v.slot = -1;
             } else {
-                final Scene3D.Placement placement = sceneLayout.get(n.id);
-                if (placement != null) {
-                    v.wx = placement.pos.x;
-                    v.wz = placement.pos.z;
-                    v.slot = placement.slot;
-                    v.pinned = placement.pinned;
-                    v.azDeg = placement.azDeg;
+                final int[] placedCm = PlacementStore.find(n.id);
+                if (placedCm != null) {
+                    // hub 同步来的人工摆位：厘米 → 米（x 右正；z 后正，屏幕上方 = -Z = 正前）
+                    v.wx = placedCm[0] / 100.0;
+                    v.wz = placedCm[1] / 100.0;
+                    v.slot = -1;
+                    v.pinned = true;
+                    v.azDeg = Scene3D.wrap360(Math.atan2(v.wx, -v.wz) / Scene3D.DEG);
+                } else {
+                    final Scene3D.Placement placement = sceneLayout.get(n.id);
+                    if (placement != null) {
+                        v.wx = placement.pos.x;
+                        v.wz = placement.pos.z;
+                        v.slot = placement.slot;
+                        v.pinned = placement.pinned;
+                        v.azDeg = placement.azDeg;
+                    }
                 }
             }
             if (v.self) {
@@ -996,13 +972,12 @@ public class MainActivity extends Activity {
             }
         }
 
-        // 待确认的接入请求：两块屏都渲染，会话进行中也能接人
+        // 待确认的接入请求：两屏各有一行提示（点开进对话框），数据源是同一份
         final java.util.List<InviteListener.Pending> pending;
         synchronized (InviteListener.sPending) {
             pending = new java.util.ArrayList<>(InviteListener.sPending);
         }
-        if (connectReqList != null) renderPending(connectReqList, pending);
-        if (ctrlReqList != null) renderPending(ctrlReqList, pending);
+        renderPending(pending);
 
         // 对端发来的邀请：弹窗确认（同意后要真的建立连接）
         if (InviteListener.sInvitePending && !inviteDialogShowing) {
@@ -1148,8 +1123,8 @@ public class MainActivity extends Activity {
                 .setAction(CaptureService.ACTION_STOP));
     }
 
-    /** 点图谱里的球：有流的节点展开音量面板；非汇聚端节点弹确认切换。 */
-    /** 双击节点 = PC 端 dblclick → onActivate：直接把汇聚端切过去（单击仍是音量面板+确认框，旧语义不变）。 */
+    /** 双击节点 = PC 端 dblclick → onActivate：直接把汇聚端切过去（单击仍是音量面板+确认框）。
+     *  （旧的相机复位/拖动 pin 入口随 3D 视图一起删除了，这里只剩角色切换。） */
     private void onSceneDoubleTap(final HubGraphView.Node viewNode) {
         if (viewNode == null || viewNode.id == null) return;
         final GraphStore.Snapshot g = GraphStore.snapshot();
@@ -1161,115 +1136,6 @@ public class MainActivity extends Activity {
         InviteListener.broadcastGraph();   // 本地变化：2 次 / 60ms（协议 §4.5）
         refresh();
         Toast.makeText(this, "已切换汇聚端", Toast.LENGTH_SHORT).show();
-    }
-
-    /** 相机变化：拖动时高频回调，落盘节流 500ms（app 退到后台/退出时还会强制存一次）。 */
-    private void onSceneCamera(double yawDeg, double pitchDeg, double dist) {
-        sceneYawDeg = yawDeg;
-        scenePitchDeg = pitchDeg;
-        sceneDist = dist;
-        final long now = System.currentTimeMillis();
-        if (now - sceneSavedAtMs >= 500) saveSceneStore();
-    }
-
-    /** 拖动节点结束：pin 到新位置、落盘、立刻上报空间位置（不等 400ms 轮询）。 */
-    private void onScenePin(String nodeId, double wx, double wz) {
-        if (nodeId == null || nodeId.isEmpty()) return;
-        scenePins.put(nodeId, new double[]{wx, 0, wz});
-        saveSceneStore();
-        final GraphStore.Snapshot g = GraphStore.snapshot();
-        final GraphStore.Node n = g.find(nodeId);
-        if (n != null) {
-            final int sid = ReceiverService.streamIdForIp(n.ip);
-            if (sid > 0) ReceiverService.setStreamPosition(sid, (float) wx, 0f, (float) wz);
-        }
-        refresh();
-    }
-
-    /** 长按取消 pin：节点回到自动槽位。 */
-    private void onSceneUnpin(String nodeId) {
-        if (nodeId == null || nodeId.isEmpty()) return;
-        scenePins.remove(nodeId);
-        saveSceneStore();
-        refresh();
-    }
-
-    /** 读 PC 端同一份场景 JSON（v2 优先；v1 只有 cam/pins 也能读）。坏 JSON 不能拦住启动。 */
-    private void loadSceneStore(SharedPreferences prefs) {
-        if (prefs == null) return;
-        final String raw = prefs.getString(PREF_SCENE3D, "");
-        if (raw == null || raw.trim().isEmpty()) return;
-        try {
-            final JSONObject root = new JSONObject(raw);
-            final JSONObject cam = root.optJSONObject("cam");
-            if (cam != null) {
-                sceneYawDeg = cam.optDouble("yawDeg", 0);
-                scenePitchDeg = cam.optDouble("pitchDeg", Scene3D.CFG.PITCH_DEFAULT);
-                sceneDist = cam.optDouble("dist", Scene3D.CFG.CAM_DIST);
-            }
-            final JSONObject pins = root.optJSONObject("pins");
-            if (pins != null) {
-                final java.util.Iterator<String> it = pins.keys();
-                while (it.hasNext()) {
-                    final String id = it.next();
-                    final JSONArray arr = pins.optJSONArray(id);
-                    if (arr == null || arr.length() < 3) continue;
-                    final double x = arr.optDouble(0, 0);
-                    final double z = arr.optDouble(2, 0);
-                    if (!Scene3D.isFinite(x) || !Scene3D.isFinite(z)) continue;
-                    scenePins.put(id, new double[]{x, 0, z});
-                }
-            }
-            final JSONObject slots = root.optJSONObject("slots");
-            if (slots != null) {
-                final java.util.Iterator<String> it = slots.keys();
-                while (it.hasNext()) {
-                    final String id = it.next();
-                    final int idx = slots.optInt(id, -1);
-                    if (idx >= 0 && idx < Scene3D.SLOT_COUNT) sceneSlots.put(id, Integer.valueOf(idx));
-                }
-            }
-        } catch (Throwable t) {
-            android.util.Log.w("AudioHub", "scene3d 读失败，回默认视角: " + t);
-            scenePins.clear();
-            sceneSlots.clear();
-            sceneYawDeg = 0;
-            scenePitchDeg = Scene3D.CFG.PITCH_DEFAULT;
-            sceneDist = Scene3D.CFG.CAM_DIST;
-        }
-    }
-
-    /** 把相机/pin/槽位写回 PC 端同一份 JSON（v2，org.json；键名与 ui/scene3d.js store 逐字一致）。 */
-    private void saveSceneStore() {
-        sceneSavedAtMs = System.currentTimeMillis();
-        try {
-            final JSONObject root = new JSONObject();
-            root.put("v", SCENE_STORE_VERSION);
-            final JSONObject cam = new JSONObject();
-            cam.put("yawDeg", Scene3D.round3(sceneYawDeg));
-            cam.put("pitchDeg", Scene3D.round3(scenePitchDeg));
-            cam.put("dist", Scene3D.round3(sceneDist));
-            root.put("cam", cam);
-            final JSONObject pins = new JSONObject();
-            for (java.util.Map.Entry<String, double[]> e : scenePins.entrySet()) {
-                final double[] p = e.getValue();
-                final JSONArray arr = new JSONArray();
-                arr.put(Scene3D.round3(p[0]));
-                arr.put(0);
-                arr.put(Scene3D.round3(p[2]));
-                pins.put(e.getKey(), arr);
-            }
-            root.put("pins", pins);
-            final JSONObject slots = new JSONObject();
-            for (java.util.Map.Entry<String, Integer> e : sceneSlots.entrySet()) {
-                slots.put(e.getKey(), e.getValue().intValue());
-            }
-            root.put("slots", slots);
-            getSharedPreferences("audiohub", MODE_PRIVATE).edit()
-                    .putString(PREF_SCENE3D, root.toString()).apply();
-        } catch (Throwable t) {
-            android.util.Log.w("AudioHub", "scene3d 写失败: " + t);
-        }
     }
 
     private void onGraphNodeTap(final HubGraphView.Node viewNode) {
@@ -1403,73 +1269,119 @@ public class MainActivity extends Activity {
         manualPeers.add(d);
     }
 
-    /** 待确认请求：连接界面和控制界面各渲染一份。 */
-    private String pendingSig = "";
+/** 待确认请求的一行提示（两屏共用）；没有请求时 GONE，点开走对话框。 */
+    private TextView pendingBanner() {
+        final TextView tv = new TextView(this);
+        tv.setTextSize(12.5f);
+        tv.setTextColor(COLOR_WARN);
+        tv.setPadding(dp(2), dp(4), 0, dp(2));
+        tv.setVisibility(View.GONE);
+        tv.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) { showPendingDialog(); }
+        });
+        return tv;
+    }
 
-    private void renderPending(LinearLayout container, List<InviteListener.Pending> pending) {
-        final StringBuilder sig = new StringBuilder();
-        for (InviteListener.Pending p : pending) {
-            sig.append(p.streamId).append(':').append(p.name).append(';');
-        }
-        if (sig.toString().equals(pendingSig)) return;
-        pendingSig = sig.toString();
-
-        container.removeAllViews();
-        if (pending.isEmpty()) return;
-        for (final InviteListener.Pending p : pending) {
-            LinearLayout row = card();
-            TextView who = new TextView(this);
-            who.setText(p.name + "  ·  " + p.ip);
-            who.setTextSize(14);
-            who.setTextColor(COLOR_TEXT);
-            row.addView(who);
-            row.addView(sub("请求把声音送到本机"));
-            LinearLayout btns = new LinearLayout(this);
-            btns.setOrientation(LinearLayout.HORIZONTAL);
-            btns.setPadding(0, dp(8), 0, 0);
-            Button ok = textButton("同意", COLOR_ACCENT);
-            ok.setOnClickListener(new View.OnClickListener() {
-                @Override
-                public void onClick(View v) {
-                    InviteListener.accept(p.streamId);
-                    // 同意"把声音送到本机"= 本机要当汇聚端（协议 §5）：
-                    // 先切图谱 hub，再保证接收服务在跑，否则对方发来的流没人收。
-                    if (!GraphStore.isHub()) {
-                        final String sid = GraphStore.selfId();
-                        if (!sid.isEmpty() && GraphStore.switchHub(sid)) {
-                            pendingSwitchTarget = sid;
-                            switchSyncedAt = 0;
-                            InviteListener.broadcastGraph();
-                        }
-                    }
-                    if (!ReceiverService.sRunning) {
-                        safeStartForegroundService(new Intent(MainActivity.this,
-                                ReceiverService.class)
-                                .setAction(ReceiverService.ACTION_START)
-                                .putExtra(ReceiverService.EXTRA_PORT, GraphStore.AUDIO_PORT));
-                    }
-                    pendingSig = "";
-                    refresh();
-                }
-            });
-            Button no = textButton("拒绝", COLOR_WARN);
-            no.setOnClickListener(new View.OnClickListener() {
-                @Override
-                public void onClick(View v) { InviteListener.reject(p.streamId); }
-            });
-            btns.addView(ok);
-            btns.addView(no);
-            row.addView(btns);
-            container.addView(row);
+    /** 待确认请求：主界面只显示一行提示，点开对话框处理（一屏装完、不滚动）。 */
+    private void renderPending(List<InviteListener.Pending> pending) {
+        final String text = pending.isEmpty()
+                ? "" : ("有 " + pending.size() + " 个待确认的接入请求 · 点击处理");
+        final TextView[] banners = {connectPending, ctrlPending};
+        for (TextView tv : banners) {
+            if (tv == null) continue;
+            tv.setText(text);
+            tv.setVisibility(pending.isEmpty() ? View.GONE : View.VISIBLE);
         }
     }
 
+    /** 待确认请求对话框：同意 = 本机切汇聚端并保证接收服务在跑（协议 §5）。 */
+    private void showPendingDialog() {
+        final java.util.List<InviteListener.Pending> pending;
+        synchronized (InviteListener.sPending) {
+            pending = new java.util.ArrayList<>(InviteListener.sPending);
+        }
+        if (pending.isEmpty()) return;
+
+        final LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        list.setPadding(dp(12), dp(4), dp(12), dp(4));
+        for (final InviteListener.Pending p : pending) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(0, dp(6), 0, dp(6));
+
+            LinearLayout info = new LinearLayout(this);
+            info.setOrientation(LinearLayout.VERTICAL);
+            info.setLayoutParams(new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            TextView who = new TextView(this);
+            who.setText(p.name + "  ·  " + p.ip);
+            who.setTextSize(13.5f);
+            who.setTextColor(COLOR_TEXT);
+            info.addView(who);
+            TextView desc = new TextView(this);
+            desc.setText("请求把声音送到本机");
+            desc.setTextSize(11.5f);
+            desc.setTextColor(COLOR_DIM);
+            info.addView(desc);
+            row.addView(info);
+
+            Button ok = textButton("同意", COLOR_ACCENT);
+            ok.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) { acceptPending(p.streamId); }
+            });
+            row.addView(ok);
+
+            Button no = textButton("拒绝", COLOR_WARN);
+            no.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    InviteListener.reject(p.streamId);
+                    refresh();
+                }
+            });
+            row.addView(no);
+            list.addView(row);
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle("接入请求")
+                .setView(list)
+                .setNegativeButton("关闭", null)
+                .show();
+    }
+
+    /**
+     * 同意一条接入请求（旧逻辑：同意"把声音送到本机"= 本机要当汇聚端，协议 §5）：
+     * 先切图谱 hub，再保证接收服务在跑，否则对方发来的流没人收。
+     */
+    private void acceptPending(int streamId) {
+        InviteListener.accept(streamId);
+        if (!GraphStore.isHub()) {
+            final String sid = GraphStore.selfId();
+            if (!sid.isEmpty() && GraphStore.switchHub(sid)) {
+                pendingSwitchTarget = sid;
+                switchSyncedAt = 0;
+                InviteListener.broadcastGraph();   // 本地变化：2 次 / 60ms
+            }
+        }
+        if (!ReceiverService.sRunning) {
+            safeStartForegroundService(new Intent(this, ReceiverService.class)
+                    .setAction(ReceiverService.ACTION_START)
+                    .putExtra(ReceiverService.EXTRA_PORT, GraphStore.AUDIO_PORT));
+        }
+        refresh();
+    }
+
+    /**
+     * 设备列表（自动发现 + 手动 / 上次连接）：主界面只放摘要，完整列表进对话框。
+     * 手动 / 上次连接的设备排在前面——广播被拦时只有它们能用。
+     */
     private void renderPeers(List<Discovery.Device> autoPeers) {
-        peerList.removeAllViews();
-        if (ctrlPeerList != null) ctrlPeerList.removeAllViews();
-        // 手动 / 上次连接的设备排在前面（广播被拦时只有它们能用）
-        final java.util.List<Discovery.Device> peers =
-                new java.util.ArrayList<>(manualPeers);
+        final java.util.List<Discovery.Device> peers = new java.util.ArrayList<>(manualPeers);
         for (Discovery.Device d : autoPeers) {
             boolean dup = false;
             for (Discovery.Device m : manualPeers) {
@@ -1477,86 +1389,51 @@ public class MainActivity extends Activity {
             }
             if (!dup) peers.add(d);
         }
-        if (peers.isEmpty()) {
-            TextView tv = new TextView(this);
-            // 把本机 IP 显示出来：扫不到时最常见的原因是两台设备不在同一网段
-            // （比如电脑插网线 10.x，手机连 WiFi 192.168.x）
-            tv.setText("正在扫描附近设备…\n本机 IP " + localIp()
-                    + "，请确认电脑与本机在同一个 WiFi / 网段");
-            tv.setTextSize(12.5f);
-            tv.setTextColor(COLOR_DIM);
-            tv.setLineSpacing(0, 1.3f);
-            tv.setPadding(dp(2), dp(6), 0, dp(6));
-            peerList.addView(tv);
-            if (ctrlPeerList != null) {
-                TextView t2 = new TextView(this);
-                t2.setText(tv.getText());
-                t2.setTextSize(12.5f);
-                t2.setTextColor(COLOR_DIM);
-                t2.setPadding(dp(2), dp(6), 0, dp(6));
-                ctrlPeerList.addView(t2);
-            }
-            return;
-        }
-        for (final Discovery.Device d : peers) {
-            LinearLayout row = new LinearLayout(this);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            row.setGravity(Gravity.CENTER_VERTICAL);
-            row.setPadding(dp(12), dp(10), dp(8), dp(10));
-            LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            rp.setMargins(0, 0, 0, dp(8));
-            row.setLayoutParams(rp);
-            row.setBackgroundColor(COLOR_CARD);
-
-            LinearLayout info = new LinearLayout(this);
-            info.setOrientation(LinearLayout.VERTICAL);
-            info.setLayoutParams(new LinearLayout.LayoutParams(
-                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-            TextView name = new TextView(this);
-            name.setText(d.name + "  ·  " + d.roleText());
-            name.setTextSize(13.5f);
-            name.setTextColor(COLOR_TEXT);
-            info.addView(name);
-            TextView addr = new TextView(this);
-            addr.setText(d.ip + ":" + d.audioPort);
-            addr.setTextSize(11.5f);
-            addr.setTextColor(COLOR_DIM);
-            info.addView(addr);
-            row.addView(info);
-
-            Button invite = textButton("邀请", COLOR_ACCENT);
-            invite.setOnClickListener(new View.OnClickListener() {
-                @Override
-                public void onClick(View v) { invitePeer(d); }
-            });
-            row.addView(invite);
-
-            Button connect = textButton("连入", COLOR_ACCENT);
-            connect.setOnClickListener(new View.OnClickListener() {
-                @Override
-                public void onClick(View v) { pickRemoteHub(d); }
-            });
-            row.addView(connect);
-            peerList.addView(row);
-            if (ctrlPeerList != null) {
-                LinearLayout copy = buildPeerRow(d, false);
-                ctrlPeerList.addView(copy);
-            }
+        currentPeers.clear();
+        currentPeers.addAll(peers);
+        if (devSummary != null) {
+            // 带本机 IP：扫不到时最常见的原因是两台设备不在同一网段
+            devSummary.setText(peers.isEmpty()
+                    ? ("正在扫描附近设备…  本机 IP " + localIp())
+                    : ("已发现 " + peers.size() + " 台设备 · 点「设备列表」连接/邀请"));
         }
     }
 
-    /** 构建一行设备卡片。primary=true 时是所有交互按钮齐全的版本。 */
-    private LinearLayout buildPeerRow(final Discovery.Device d, boolean primary) {
+    /** 设备列表对话框：每行可「邀请」（本机当 hub 时）/「连入」。 */
+    private void showPeersDialog() {
+        if (currentPeers.isEmpty() && discovery != null) {
+            renderPeers(discovery.peers());
+        }
+        final LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        list.setPadding(dp(12), dp(4), dp(12), dp(4));
+        if (currentPeers.isEmpty()) {
+            TextView empty = new TextView(this);
+            empty.setText("暂未发现设备。请确认：① 电脑已打开 AudioHub；"
+                    + "② 手机与电脑在同一 WiFi / 网段（本机 " + localIp() + "）");
+            empty.setTextSize(12.5f);
+            empty.setTextColor(COLOR_DIM);
+            empty.setLineSpacing(0, 1.3f);
+            empty.setPadding(dp(2), dp(6), dp(2), dp(6));
+            list.addView(empty);
+        } else {
+            for (Discovery.Device d : currentPeers) {
+                list.addView(buildPeerRow(d));
+            }
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("设备列表")
+                .setView(list)
+                .setNegativeButton("关闭", null)
+                .show();
+    }
+
+    /** 构建一行设备卡片：邀请 / 连入。 */
+    private LinearLayout buildPeerRow(final Discovery.Device d) {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(12), dp(10), dp(8), dp(10));
-        LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        rp.setMargins(0, 0, 0, dp(8));
-        row.setLayoutParams(rp);
-        row.setBackgroundColor(COLOR_CARD);
+        row.setPadding(dp(8), dp(6), dp(4), dp(6));
 
         LinearLayout info = new LinearLayout(this);
         info.setOrientation(LinearLayout.VERTICAL);

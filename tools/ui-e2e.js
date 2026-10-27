@@ -65,6 +65,27 @@ async function note (cdp, tag) {
   } catch (e) { /* debug only */ }
 }
 
+// 页面适配断言：整页不出现滚动条（v1.4 起界面按视口自适应，内容不滚动即完整展示）。
+async function pageFit(cdp, what) {
+  const s = await cdp.eval(
+    "JSON.stringify({w:document.documentElement.scrollWidth,h:document.documentElement.scrollHeight,iw:innerWidth,ih:innerHeight})");
+  const m = JSON.parse(s);
+  check(m.w <= m.iw + 1 && m.h <= m.ih + 1,
+    what + ' fits the window with no page scrollbars (' + m.w + 'x' + m.h + ' ≤ ' + m.iw + 'x' + m.ih + ')');
+  return m;
+}
+
+// 直接读本机 hub 的 /api/state（绕过渲染层，用来验证内核里真实存了什么）。
+function hubState() {
+  return new Promise((resolve) => {
+    http.get({ host: '127.0.0.1', port: HUB_HTTP_PORT, path: '/api/state', timeout: 2000 }, (res) => {
+      let b = '';
+      res.on('data', (c) => (b += c));
+      res.on('end', () => { try { resolve(JSON.parse(b)); } catch (e) { resolve(null); } });
+    }).on('error', () => resolve(null));
+  });
+}
+
 function getJson(urlPath) {
   return new Promise((resolve, reject) => {
     const req = http.get({ host: '127.0.0.1', port: DEBUG_PORT, path: urlPath, timeout: 1000 }, (res) => {
@@ -244,6 +265,7 @@ async function main() {
     console.log('==> app up: selfId=' + snap.selfId + ' screen=' + snap.screen + ' nodes=' + snap.nodes);
     check(snap.hasGraph === true, 'renderer reads graph from /api/state.graph');
     check(snap.nodes === 1, 'graph starts with only this PC');
+    await pageFit(cdp, 'connect screen');
 
     const noSelect = await cdp.eval("document.querySelector('#hubSelect') === null");
     check(noSelect === true, 'legacy role <select id="hubSelect"> is gone');
@@ -253,6 +275,8 @@ async function main() {
     snap = await waitDebug(cdp, (s) => s.nodes >= 2, 5000, 'second node in graph');
     check(snap.nodes >= 2, 'second device appears in the shared graph');
     check(snap.controlShown === true, 'control screen with graph is shown');
+    await sleep(350);   // 等一帧布局与画布 resize
+    await pageFit(cdp, 'control screen');
 
     // 3D：图谱是 <canvas>，用场景快照断言两个节点都有投影坐标（不再有 DOM 节点）。
     const graphTag = await cdp.eval("document.querySelector('#graph') ? document.querySelector('#graph').tagName : ''");
@@ -264,6 +288,31 @@ async function main() {
       'hub stays at screen (460,208) ±2px (' + snap.scene.hubScreen.sx + ',' + snap.scene.hubScreen.sy + ')');
     check(Math.abs(snap.scene.view.focal - 522.71) <= 1, 'camera focal matches 522.71px (' + snap.scene.view.focal + ')');
     await note(cdp, 'after projection');
+
+    // 滚轮方向（用户反馈"方向反了"的回归）：滚轮向下 = 拉远看全景（deltaY>0 → dist 增大），
+    // 滚轮向上 = 凑近放大。用 CDP 真滚轮事件，走 canvas 自己的 wheel 监听。
+    const wheelRect = JSON.parse(await cdp.eval(
+      "JSON.stringify(document.querySelector('#graph').getBoundingClientRect())"));
+    const wheelX = wheelRect.left + wheelRect.width * 0.5;
+    const wheelY = wheelRect.top + wheelRect.height * 0.5;
+    async function readDist() {
+      const v = JSON.parse(await cdp.eval('JSON.stringify(window.__hubDebug().scene.view)'));
+      return v.dist;
+    }
+    async function wheel(deltaY) {
+      await cdp.send('Input.dispatchMouseEvent', {
+        type: 'mouseWheel', x: wheelX, y: wheelY, deltaX: 0, deltaY: deltaY, modifiers: 0
+      });
+      await sleep(250);
+    }
+    const dist0 = await readDist();
+    await wheel(120);
+    const distOut = await readDist();
+    await wheel(-120);
+    const distBack = await readDist();
+    check(distOut > dist0 + 0.05, 'wheel down zooms out (dist ' + dist0.toFixed(2) + ' → ' + distOut.toFixed(2) + ' m)');
+    check(distBack < distOut - 0.05 && Math.abs(distBack - dist0) < 0.15,
+      'wheel up zooms back in (dist ' + distOut.toFixed(2) + ' → ' + distBack.toFixed(2) + ' m)');
 
     // v1.3 物理房间模型：听者固定在房间中心、朝 -Z；节点按"真实距离"落位（0.85–2.2 m），
     // 球大小随距离缩小（用户的"用大小模拟远近"），并且相机 orbit 不改变声场。
@@ -375,6 +424,31 @@ async function main() {
     check(!!fakeAfter && fakeAfter.dist < fakeBefore.dist - 0.2 && fakeAfter.rPx > fakeBefore.rPx,
       'dragging a node changes its distance and ball size (dist ' + fakeBefore.dist + '→' +
       (fakeAfter || {}).dist + ' m, rPx ' + fakeBefore.rPx + '→' + (fakeAfter || {}).rPx + ')');
+
+    // v1.4 摆位同步：拖完的落点要写进本机内核图谱（POS 帧），并被 /api/state 回吐给
+    // 所有电脑/手机（这里用 HTTP 直读内核验证，不依赖渲染层自说自话）。
+    let placed = null;
+    for (let i = 0; i < 25 && !placed; i++) {
+      const st = await hubState();
+      const node = st && st.graph && (st.graph.nodes || []).find((n) => n.id === FAKE_ID);
+      if (node && node.posSet === true && st.graph.placementVersion >= 1) placed = { node: node, version: st.graph.placementVersion };
+      else await sleep(160);
+    }
+    check(!!placed, 'dragged layout is stored in the hub graph as a POS placement (placementVersion=' +
+      (placed ? placed.version : '-') + ')');
+    if (placed) {
+      const scenePos = JSON.parse(await cdp.eval('JSON.stringify(window.__hubDebug().scene.positions["' + FAKE_ID + '"])'));
+      check(Array.isArray(scenePos) && Math.abs(placed.node.x - scenePos[0]) < 0.15 &&
+        Math.abs(placed.node.z - scenePos[2]) < 0.15,
+        'graph position (x=' + placed.node.x + ', z=' + placed.node.z + ') matches the dragged scene spot (' +
+        (scenePos ? scenePos[0] + ',' + scenePos[2] : '-') + ')');
+      // 内核回声后场景仍停在该落点（没有被 200ms 轮询弹回自动槽位）
+      const echo = await waitDebug(cdp, (s) => {
+        const p = s.scene && s.scene.positions && s.scene.positions[FAKE_ID];
+        return p && Math.abs(p[0] - placed.node.x) < 0.2 && Math.abs(p[2] - placed.node.z) < 0.2;
+      }, 3000, 'placement echo in scene');
+      check(!!echo, 'placement survives the /api/state poll (node stays where it was dropped)');
+    }
 
     // Click the second node -> action bar appears. 坐标来自 3D 投影，点击走 canvas 拾取。
     const fakeNs = await waitNodeScreen(cdp, FAKE_ID, 5000);

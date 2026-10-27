@@ -510,6 +510,25 @@ ipcMain.handle('hub:setSourceSpatial', async (_e, arg) => {
   return res
 })
 
+// 房间摆位同步（docs/GRAPH-PROTOCOL.md §13）：拖动落点交给本机内核，
+// 内核 version+1 后广播给图谱里所有节点（手机端只读显示，多台电脑位置一致）。
+// 注意这里不做任何本地持久化：布局是全网一份，存在各端内核里。
+ipcMain.handle('hub:setNodePlacement', async (_e, arg) => {
+  const a = arg || {}
+  if (typeof a.nodeId !== 'string' || !a.nodeId) return { ok: false }
+  const body = { nodeId: a.nodeId.slice(0, 128) }
+  if (a.clear === true) {
+    body.clear = true
+  } else {
+    const clamp = (v) => Math.min(Math.max(Number(v) || 0, -20), 20)
+    body.x = Math.round(clamp(a.x) * 100) / 100
+    body.z = Math.round(clamp(a.z) * 100) / 100
+  }
+  const res = await httpRequest('POST', '/api/graph/placement', body)
+  if (!res) return { ok: false, unsupported: true }
+  return res
+})
+
 // 主动扫描：让音频核心发一轮 WHO 探测，等对端回信标后再回读状态。
 // 只调 refresh 不等待的话，界面拿到的还是探测前那份 peers。
 // 接受对端邀请：把本机的声音送过去，并告诉它"你来当汇聚端"

@@ -22,6 +22,8 @@ import java.util.Map;
  *   ROLE|hub / ROLE|source|ip:port          → 旧版角色指令（兼容窗口，60 秒自动放行）
  *   GRAPH|version|origin|hubId|nodes        → 合并图谱（协议 §2.1 / §4.2）
  *   GRAPH-REQ                               → 单播回当前图谱，同源 200ms 限速（协议 §4.3）
+ *   POS|version|origin|items                → 合并人工摆位整表（协议 §13；整布局 LWW）
+ *   POS-REQ                                 → 单播回当前 POS，同源 200ms 限速
  *
  * 图谱广播由本线程按 deadline 驱动（3 秒周期 + 本地变化的 2 次/60ms + 限速），
  * 不新开线程：接收超时是 300ms，tick() 在每次收包后和每次超时后执行。
@@ -39,6 +41,10 @@ public final class InviteListener {
     /** 协议 §4.4：本地变化立即发 2 次，间隔 60ms。 */
     private static final int GRAPH_LOCAL_BURST = 2;
     private static final long GRAPH_LOCAL_GAP_MS = 60L;
+    /** 协议 §13：同一来源 200ms 内不重复回 POS（与 GRAPH-REQ 同策略）。 */
+    private static final long POS_REPLY_MIN_GAP_MS = 200L;
+    /** 协议 §13：采纳后中继也要限速，避免多端同时采纳时打风暴（C++ 同值）。 */
+    private static final int POS_MAX_PER_SEC = 5;
 
     // 界面轮询的快照
     /** 一条待确认的接入请求（别人要把声音送到本机）。 */
@@ -111,6 +117,11 @@ public final class InviteListener {
     private int rateWindowCount;       // 窗口内已广播次数
     /** 仅 listener 线程访问：来源 ip → 上次回 GRAPH 的时间。 */
     private final Map<String, Long> graphReplyAt = new HashMap<>();
+    /** 仅 listener 线程访问：来源 ip → 上次回 POS 的时间。 */
+    private final Map<String, Long> posReplyAt = new HashMap<>();
+    /** 采纳远端摆位后向全网中继一次；与 GRAPH 一样按 1s 窗口限速。 */
+    private long posRateWindowStart;
+    private int posRateWindowCount;
 
     public static synchronized InviteListener get() {
         if (instance == null) instance = new InviteListener();
@@ -198,6 +209,8 @@ public final class InviteListener {
             if (n.id.equals(snap.selfId)) continue;
             if (n.audioPort <= 0) continue;
             self.sendGraphRequestTo(n.ip, n.audioPort + PORT_OFFSET);
+            // 连上/同步时顺便把人工摆位也请求一份（协议 §13：手机只收不广播）
+            self.sendPosRequestTo(n.ip, n.audioPort + PORT_OFFSET);
         }
     }
 
@@ -238,6 +251,10 @@ public final class InviteListener {
 
     private void sendGraphRequestTo(String ip, int port) {
         sendText(ip, port, "GRAPH-REQ\n");
+    }
+
+    private void sendPosRequestTo(String ip, int port) {
+        sendText(ip, port, "POS-REQ\n");
     }
 
     private void sendText(String ip, int port, String text) {
@@ -294,6 +311,8 @@ public final class InviteListener {
             if (n.id.equals(GraphStore.selfId())) continue;
             if (n.audioPort <= 0) continue;
             sendGraphRequestTo(n.ip, n.audioPort + PORT_OFFSET);
+            // 新学到的节点也可能握着更新的摆位（中继），同样要一份 POS
+            sendPosRequestTo(n.ip, n.audioPort + PORT_OFFSET);
         }
     }
 
@@ -310,6 +329,58 @@ public final class InviteListener {
 
     private void pruneGraphReplyMap(long now) {
         final java.util.Iterator<Map.Entry<String, Long>> it = graphReplyAt.entrySet().iterator();
+        while (it.hasNext()) {
+            final Map.Entry<String, Long> e = it.next();
+            if (now - e.getValue().longValue() > 10000L) it.remove();
+        }
+    }
+
+    // ------------------------------------------------------------ 人工摆位：收到 POS 帧
+
+    /**
+     * 收到 POS：合并整表布局（协议 §13，整布局 LWW）。
+     * 不需要回调 UI —— MainActivity 每 400ms 轮询一次，下一个 tick 自然用新坐标重绘。
+     */
+    private void handlePos(String line, String fromIp) {
+        GraphStore.markSeen(fromIp);
+        // 采纳了更新的整表 → 按协议 §13 向所有已知节点重发一次（中继；各端限速）
+        if (PlacementStore.mergeFromFrame(line)) broadcastPlacementNow();
+    }
+
+    /** 把当前 POS 整表广播给所有已知节点（采纳后中继；手机端不会自己产生摆位）。 */
+    private void broadcastPlacementNow() {
+        final long now = System.currentTimeMillis();
+        synchronized (schedLock) {
+            if (now - posRateWindowStart >= 1000L) {
+                posRateWindowStart = now;
+                posRateWindowCount = 0;
+            }
+            if (posRateWindowCount >= POS_MAX_PER_SEC) return;   // 限速：本次不中继
+            posRateWindowCount++;
+        }
+        final GraphStore.Snapshot snap = GraphStore.snapshot();
+        if (snap.nodes.size() <= 1) return;   // 只有自己：没有发送目标
+        final String frame = PlacementStore.encodeFrame();
+        for (GraphStore.Node n : snap.nodes) {
+            if (n.id.equals(snap.selfId)) continue;
+            if (n.audioPort <= 0) continue;
+            sendText(n.ip, n.audioPort + PORT_OFFSET, frame);
+        }
+    }
+
+    /** 收到 POS-REQ：单播回当前 POS，同源 200ms 限速（协议 §13）。 */
+    private void handlePosRequest(String fromIp, int fromPort) {
+        GraphStore.markSeen(fromIp);
+        final long now = System.currentTimeMillis();
+        final Long last = posReplyAt.get(fromIp);
+        if (last != null && now - last.longValue() < POS_REPLY_MIN_GAP_MS) return;
+        posReplyAt.put(fromIp, Long.valueOf(now));
+        sendText(fromIp, fromPort, PlacementStore.encodeFrame());
+        if (posReplyAt.size() > 64) prunePosReplyMap(now);
+    }
+
+    private void prunePosReplyMap(long now) {
+        final java.util.Iterator<Map.Entry<String, Long>> it = posReplyAt.entrySet().iterator();
         while (it.hasNext()) {
             final Map.Entry<String, Long> e = it.next();
             if (now - e.getValue().longValue() > 10000L) it.remove();
@@ -430,6 +501,10 @@ public final class InviteListener {
                 handleGraphRequest(fromIp, fromPort);
             } else if (line.startsWith("GRAPH|")) {
                 handleGraph(line, fromIp);
+            } else if ("POS-REQ".equals(parts[0])) {
+                handlePosRequest(fromIp, fromPort);
+            } else if (line.startsWith("POS|")) {
+                handlePos(line, fromIp);
             } else if ("CONN-REQ".equals(parts[0]) && parts.length >= 3) {
                 // 别的设备要把声音送到本机。
                 final int streamId = parseInt(parts[2], -1);

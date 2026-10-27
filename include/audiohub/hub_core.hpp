@@ -151,6 +151,18 @@ class HubCore {
   // 某 IP 最近一次收到数据报距今多少毫秒（从未见到 = -1）。界面用它判 online（§7.1）。
   int64_t graph_peer_last_seen_ms(const std::string& ip) const;
 
+  // ---- 房间摆位（POS）：GRAPH 之外的独立同步帧（docs/GRAPH-PROTOCOL.md §13）----
+  // 桌面端拖拽 -> 本机摆位 version+1 -> 广播给图谱里所有节点，多台电脑与手机看到同一份
+  // 布局；手机端只读（画俯视图）。坐标单位米，X 向右、Z 向观察者（屏幕下方），|x|,|z| <= 20。
+  // 节点 id 与图谱一致（"<ip>:<audioPort>"），节点不存在也允许存——布局可能先于设备入网，
+  // 合并时按 LWW 收敛，不需要依赖当前图谱成员。
+  PlacementState Placements() const;
+  // 返回 false = 坐标越界 / node_id 非法；与现有位置相同算成功（幂等，不产生新版本）。
+  bool SetNodePlacement(const std::string& node_id, float x_m, float z_m);
+  // 删掉某节点的摆位（回到自动布局）。返回是否确实删除了。
+  bool ClearNodePlacement(const std::string& node_id);
+  uint64_t placement_version() const;  // 调试 / 测试
+
   std::string local_ip() const;
   void SetEventCallback(std::function<void(const std::string&)> cb);
 

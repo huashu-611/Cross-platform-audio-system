@@ -58,6 +58,16 @@ constexpr int kGraphRequestReplyMs = 200;
 constexpr int kGraphRateWindowMs = 1000;
 constexpr int kGraphRateMaxSends = 5;
 
+// ---- 房间摆位（POS，docs/GRAPH-PROTOCOL.md §13）----
+// 摆位是低频状态（只有拖拽时变），按键时连发 2 次 + 状态变化合并转发，就够了；
+// 定时保活挂在 GRAPH 同一拍（3 s）上，补偿丢包。限速与 GRAPH 分开记，
+// 否则这两类帧会互相抢那一秒 5 次的配额。
+constexpr int kPlacementPeriodicMs = 3000;
+constexpr int kPlacementRepeatMs = 60;
+constexpr int kPlacementRequestReplyMs = 200;
+constexpr int kPlacementRateWindowMs = 1000;
+constexpr int kPlacementRateMaxSends = 5;
+
 using Clock = std::chrono::steady_clock;
 
 // 本机 IP 的测试钩子：AUDIOHUB_LOCAL_IP 非空时优先。
@@ -205,6 +215,18 @@ struct HubCore::Impl {
   int graph_pending_repeats = 0;         // 本地变化还差几次广播（连发 2 次）
   Clock::time_point graph_next_repeat{};    // 下一次补发时刻
   Clock::time_point graph_next_periodic{};  // 下一次周期广播
+
+  // ---- 房间摆位（POS）----
+  // 与 graph_ 共用 mutex：数据量更小（<=32 项），读写都在 HTTP / 握手 / 混音线程。
+  PlacementState placement_;
+  uint64_t placement_seen_version = 0;
+  std::map<std::string, Clock::time_point> placement_req_replied;      // ip -> 上次回 POS-REQ
+  std::map<std::string, std::vector<Clock::time_point>> placement_sends;  // ip -> 发送时刻
+  std::map<std::string, Clock::time_point> placement_deferred;         // ip -> 被限速后的补发
+  std::vector<std::pair<std::string, uint16_t>> placement_probes;      // 待发的 POS-REQ
+  int placement_pending_repeats = 0;             // 本地变化还差几次广播（连发 2 次）
+  Clock::time_point placement_next_repeat{};     // 下一次补发时刻
+  Clock::time_point placement_next_periodic{};   // 下一次周期广播
 
   std::thread receiver;
   std::thread control;
@@ -490,6 +512,15 @@ struct HubCore::Impl {
         HandleGraphFrame(from_ip, line);
         continue;
       }
+      // 摆位帧（§13）与 GRAPH 共用一个口；先判请求帧再判数据帧。
+      if (IsPlacementRequestFrame(line)) {
+        ReplyPlacementRequest(from_ip, from_port);
+        continue;
+      }
+      if (line.compare(0, 4, "POS|") == 0) {
+        HandlePlacementFrame(from_ip, line);
+        continue;
+      }
 
       std::vector<std::string> parts;
       size_t start = 0;
@@ -682,6 +713,15 @@ struct HubCore::Impl {
     graph_probes.clear();
     graph_pending_repeats = 0;
     graph_next_periodic = Clock::now() + std::chrono::milliseconds(kGraphPeriodicMs);
+    // 摆位随进程启动从空开始：房间布局由桌面端拖拽后广播，不需要持久化在本进程里。
+    placement_ = PlacementState();
+    placement_seen_version = 0;
+    placement_req_replied.clear();
+    placement_sends.clear();
+    placement_deferred.clear();
+    placement_probes.clear();
+    placement_pending_repeats = 0;
+    placement_next_periodic = Clock::now() + std::chrono::milliseconds(kPlacementPeriodicMs);
   }
 
   // 会话清空（"全部断开"，协议 §4.6）：版本 +1、origin/hubId 回到自己、只留自节点。
@@ -700,6 +740,12 @@ struct HubCore::Impl {
     graph_deferred.clear();
     graph_probes.clear();
     graph_pending_repeats = 0;
+    // 摆位是"房间"的状态，不随会话清空；只清收发记账。
+    placement_req_replied.clear();
+    placement_sends.clear();
+    placement_deferred.clear();
+    placement_probes.clear();
+    placement_pending_repeats = 0;
   }
 
   void TouchGraphIp(const std::string& ip) {
@@ -862,6 +908,9 @@ struct HubCore::Impl {
       // 否则新入网的设备要空等一轮才知道真正的 hub 是谁。
       GraphTrySendLocked(ip, hs, EncodeGraphFrame(graph_));
       GraphQueueProbeLocked(ip, hs);
+      // 摆位同理：新设备入网立刻拿一份当前布局，并回探它知道的布局（§13.3）。
+      if (placement_.version > 0) PlacementTrySendLocked(ip, hs, EncodePlacementFrame(placement_));
+      GraphQueuePlacementProbeLocked(ip, hs);
     }
     if (node_id != nullptr && added) *node_id = new_id;
     return added;
@@ -917,6 +966,31 @@ struct HubCore::Impl {
       }
 
       GraphSendRequestsLocked();
+
+      // ---- 摆位：周期保活 / 本地改动补发 / 限速补发 / POS-REQ ----
+      if (now >= placement_next_periodic) {
+        placement_next_periodic = now + std::chrono::milliseconds(kPlacementPeriodicMs);
+        PlacementBroadcastLocked();
+      }
+      if (placement_pending_repeats > 0 && now >= placement_next_repeat) {
+        placement_pending_repeats--;
+        placement_next_repeat = now + std::chrono::milliseconds(kPlacementRepeatMs);
+        PlacementBroadcastLocked();
+      }
+      for (auto it = placement_deferred.begin(); it != placement_deferred.end();) {
+        if (now < it->second) {
+          ++it;
+          continue;
+        }
+        const std::string ip = it->first;
+        it = placement_deferred.erase(it);
+        const GraphNode* node = FindNodeByIp(graph_, ip);
+        if (node == nullptr || node->id == self_node_id) continue;
+        uint16_t hs = 0;
+        if (!HsPortFor(node->audio_port, &hs)) continue;
+        PlacementTrySendLocked(ip, hs, EncodePlacementFrame(placement_));
+      }
+      PlacementSendRequestsLocked();
     }
   }
 
@@ -957,6 +1031,140 @@ struct HubCore::Impl {
     const auto it = graph_last_seen.find(ip);
     if (it == graph_last_seen.end()) return -1;
     return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - it->second).count();
+  }
+
+  // ------------------------------------------------------------ 房间摆位（POS）
+  //
+  // 契约见 docs/GRAPH-PROTOCOL.md §13。骨架照抄 GRAPH（同一条握手线程、同一个
+  // audioPort+2 的口），但版本、限速、周期节拍全部独立：拖设备不该 bump 图谱版本，
+  // 切换汇聚端也不该覆盖房间布局。
+
+  void PlacementScheduleDoubleLocked() {
+    placement_pending_repeats = 2;
+    placement_next_repeat = Clock::now();
+  }
+
+  void PlacementScheduleOnceLocked() {
+    if (placement_pending_repeats < 1) placement_pending_repeats = 1;
+    placement_next_repeat = Clock::now();
+  }
+
+  bool PlacementTrySendLocked(const std::string& ip, uint16_t port, const std::string& frame) {
+    if (ip.empty() || port == 0) return false;
+    const auto now = Clock::now();
+    auto& hist = placement_sends[ip];
+    hist.erase(std::remove_if(hist.begin(), hist.end(),
+                              [&](const Clock::time_point& t) {
+                                return now - t >= std::chrono::milliseconds(kPlacementRateWindowMs);
+                              }),
+               hist.end());
+    if (static_cast<int>(hist.size()) >= kPlacementRateMaxSends) {
+      const auto due = hist.front() + std::chrono::milliseconds(kPlacementRateWindowMs);
+      auto it = placement_deferred.find(ip);
+      if (it == placement_deferred.end() || due < it->second) placement_deferred[ip] = due;
+      return false;
+    }
+    if (!handshake_socket.SendToAddr(ip, port, frame.data(), frame.size())) return false;
+    hist.push_back(now);
+    return true;
+  }
+
+  // 空表 + version 0 = 从没摆过，没必要发；用户清空后是"空表 + version>0"，
+  // 必须发出去，否则对端会一直留着旧布局。
+  int PlacementBroadcastLocked() {
+    if (placement_.version == 0 && placement_.items.empty()) return 0;
+    const std::string frame = EncodePlacementFrame(placement_);
+    int sent = 0;
+    for (const auto& n : graph_.nodes) {
+      if (n.id == self_node_id) continue;
+      uint16_t hs = 0;
+      if (!HsPortFor(n.audio_port, &hs)) continue;
+      if (PlacementTrySendLocked(NodeIpOf(n.id), hs, frame)) ++sent;
+    }
+    return sent;
+  }
+
+  void GraphQueuePlacementProbeLocked(const std::string& ip, uint16_t port) {
+    if (ip.empty() || port == 0) return;
+    for (const auto& p : placement_probes) {
+      if (p.first == ip && p.second == port) return;
+    }
+    placement_probes.emplace_back(ip, port);
+  }
+
+  void PlacementSendRequestsLocked() {
+    const std::string req = "POS-REQ\n";
+    for (const auto& p : placement_probes) {
+      handshake_socket.SendToAddr(p.first, p.second, req.data(), req.size());
+    }
+    placement_probes.clear();
+  }
+
+  // 收到 POS-REQ：回当前摆位，同一来源 200 ms 内只回一次（与 GRAPH-REQ 同策略）。
+  void ReplyPlacementRequest(const std::string& ip, uint16_t port) {
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto now = Clock::now();
+    auto it = placement_req_replied.find(ip);
+    if (it != placement_req_replied.end() &&
+        now - it->second < std::chrono::milliseconds(kPlacementRequestReplyMs)) {
+      return;
+    }
+    placement_req_replied[ip] = now;
+    if (placement_.version == 0 && placement_.items.empty()) return;  // 没摆过就不回空帧
+    const std::string frame = EncodePlacementFrame(placement_);
+    handshake_socket.SendToAddr(ip, port, frame.data(), frame.size());
+  }
+
+  // 收到 POS：整表 LWW 合并；只有 changed 才转发一次（防 ping-pong，与 GRAPH 同规则）。
+  void HandlePlacementFrame(const std::string& from_ip, const std::string& line) {
+    PlacementState remote;
+    if (!DecodePlacementFrame(line, &remote)) return;  // 非法帧整帧丢弃
+
+    bool changed = false;
+    uint64_t version = 0;
+    size_t count = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      TouchGraphIpLocked(from_ip);
+      if (remote.version > placement_seen_version) placement_seen_version = remote.version;
+      const PlacementMergeResult result = MergePlacement(&placement_, remote);
+      changed = result.changed;
+      if (changed) {
+        if (placement_.version > placement_seen_version) placement_seen_version = placement_.version;
+        PlacementScheduleOnceLocked();
+      }
+      version = placement_.version;
+      count = placement_.items.size();
+    }
+    if (changed) {
+      Emit("[GRAPH] 合并摆位 v" + std::to_string(version) + " <- " + from_ip + "，" +
+           std::to_string(count) + " 项");
+    }
+  }
+
+  // 本地摆位改动（拖拽落点 / 清除）：先抬到"见过的最大版本"再 +1，然后连发 2 次。
+  bool SetNodePlacementLocked(const std::string& node_id, int x_cm, int z_cm) {
+    if (placement_seen_version > placement_.version) placement_.version = placement_seen_version;
+    if (IsPlacementCoordValid(x_cm) == false || IsPlacementCoordValid(z_cm) == false) return false;
+    // 幂等：GUI 拖完可能重复提交同一个厘米坐标，不应该制造新版本。
+    const PlacementItem* cur = FindPlacement(placement_, node_id);
+    if (cur != nullptr && cur->x_cm == x_cm && cur->z_cm == z_cm) return true;
+    if (!SetPlacementItem(&placement_, node_id, x_cm, z_cm, self_node_id)) return false;
+    placement_seen_version = placement_.version;
+    PlacementScheduleDoubleLocked();
+    return true;
+  }
+
+  bool ClearNodePlacementLocked(const std::string& node_id) {
+    if (placement_seen_version > placement_.version) placement_.version = placement_seen_version;
+    if (!RemovePlacementItem(&placement_, node_id, self_node_id)) return false;
+    placement_seen_version = placement_.version;
+    PlacementScheduleDoubleLocked();
+    return true;
+  }
+
+  static bool IsPlacementCoordValid(int cm) {
+    return cm >= -kPlacementCoordLimitCm && cm <= kPlacementCoordLimitCm;
   }
 
   // ------------------------------------------------------------ 控制线程
@@ -1594,6 +1802,50 @@ void HubCore::SyncGraphNow() { impl_->SyncGraphNow(); }
 
 int64_t HubCore::graph_peer_last_seen_ms(const std::string& ip) const {
   return impl_->GraphPeerLastSeenMs(ip);
+}
+
+// ---- 房间摆位（POS）----
+
+PlacementState HubCore::Placements() const {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->placement_;
+}
+
+uint64_t HubCore::placement_version() const {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->placement_.version;
+}
+
+bool HubCore::SetNodePlacement(const std::string& node_id, float x_m, float z_m) {
+  if (!std::isfinite(x_m) || !std::isfinite(z_m)) return false;
+  const int x_cm = static_cast<int>(std::lround(static_cast<double>(x_m) * 100.0));
+  const int z_cm = static_cast<int>(std::lround(static_cast<double>(z_m) * 100.0));
+  bool changed = false;
+  bool ok = false;
+  {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const uint64_t before = impl_->placement_.version;
+    ok = impl_->SetNodePlacementLocked(node_id, x_cm, z_cm);
+    changed = ok && impl_->placement_.version != before;
+  }
+  if (changed) {
+    impl_->Emit("[GRAPH] 摆位更新: " + node_id + " -> (" + std::to_string(x_cm) + ", " +
+                std::to_string(z_cm) + ") cm");
+  }
+  return ok;
+}
+
+bool HubCore::ClearNodePlacement(const std::string& node_id) {
+  bool changed = false;
+  bool ok = false;
+  {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const uint64_t before = impl_->placement_.version;
+    ok = impl_->ClearNodePlacementLocked(node_id);
+    changed = ok && impl_->placement_.version != before;
+  }
+  if (changed) impl_->Emit("[GRAPH] 摆位清除: " + node_id);
+  return ok;
 }
 
 // 测试钩子优先：tools/graph-smoke.ps1 在同一台机器上起两个 hub，

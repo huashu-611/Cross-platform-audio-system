@@ -443,3 +443,232 @@ TEST(Graph_DecodeNormalizesKindAndPortFromId) {
   CHECK_TRUE(out.nodes[0].kind == "other");
   CHECK_EQ(out.nodes[0].audio_port, 47000);  // id 里的端口
 }
+
+// ------------------------------------------------------------------ 房间摆位（POS）
+
+namespace {
+
+audiohub::PlacementItem MakePlacement(const std::string& id, int x_cm, int z_cm) {
+  audiohub::PlacementItem it;
+  it.node_id = id;
+  it.x_cm = static_cast<int16_t>(x_cm);
+  it.z_cm = static_cast<int16_t>(z_cm);
+  return it;
+}
+
+audiohub::PlacementState MakePlacementState(uint64_t version, const std::string& origin,
+                                            const std::vector<audiohub::PlacementItem>& items) {
+  audiohub::PlacementState p;
+  p.version = version;
+  p.origin = origin;
+  p.items = items;
+  return p;
+}
+
+bool PlacementItemsSorted(const audiohub::PlacementState& p) {
+  for (size_t i = 1; i < p.items.size(); ++i) {
+    if (!(p.items[i - 1].node_id < p.items[i].node_id)) return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+TEST(Placement_RoundTripKeepsItemsAndSorts) {
+  const auto p = MakePlacementState(7, kSelfA,
+                                    {MakePlacement(kNodeC, -123, 45),
+                                     MakePlacement(kNodeB, 200, -150)});
+  const std::string frame = audiohub::EncodePlacementFrame(p);
+  CHECK_TRUE(frame.compare(0, 8, "POS|7|19") == 0 || frame.compare(0, 4, "POS|") == 0);
+  CHECK_TRUE(frame.back() == '\n');
+
+  audiohub::PlacementState out;
+  CHECK_TRUE(audiohub::DecodePlacementFrame(frame, &out));
+  CHECK_EQ(out.version, 7);
+  CHECK_TRUE(out.origin == kSelfA);
+  CHECK_EQ(out.items.size(), 2);
+  CHECK_TRUE(PlacementItemsSorted(out));
+  CHECK_TRUE(out.items[0].node_id == kNodeB);  // 按 id 升序
+  CHECK_EQ(out.items[0].x_cm, 200);
+  CHECK_EQ(out.items[0].z_cm, -150);
+  CHECK_EQ(out.items[1].x_cm, -123);
+  CHECK_EQ(out.items[1].z_cm, 45);
+}
+
+TEST(Placement_EmptyTableIsLegal) {
+  // 用户清空所有摆位后：version>0 + 空表，必须能编码/解析出来。
+  const auto p = MakePlacementState(9, kSelfA, {});
+  const std::string frame = audiohub::EncodePlacementFrame(p);
+  CHECK_TRUE(frame == "POS|9|" + std::string(kSelfA) + "|\n");
+  audiohub::PlacementState out;
+  CHECK_TRUE(audiohub::DecodePlacementFrame(frame, &out));
+  CHECK_EQ(out.version, 9);
+  CHECK_EQ(out.items.size(), 0);
+}
+
+TEST(Placement_DecodeRejectsBadFrames) {
+  audiohub::PlacementState out;
+  const std::string id = kNodeB;
+  auto frame = [&id](const std::string& items) { return "POS|1||" + items + "\n"; };
+  // 前缀 / 段数
+  CHECK_FALSE(audiohub::DecodePlacementFrame("", &out));
+  CHECK_FALSE(audiohub::DecodePlacementFrame("GRAPH|1|||\n", &out));
+  CHECK_FALSE(audiohub::DecodePlacementFrame("POS|1|\n", &out));            // 只有 3 段
+  CHECK_FALSE(audiohub::DecodePlacementFrame("POS|1|||\n", &out));          // 5 段
+  CHECK_FALSE(audiohub::DecodePlacementFrame("POS|x||\n", &out));           // 版本非法
+  CHECK_FALSE(audiohub::DecodePlacementFrame("POS|1|a\tb|\n", &out));       // origin 含控制字符
+  // 空表 + 空 origin（汇聚端还没定 id）是合法的：解析后没有摆位项
+  CHECK_TRUE(audiohub::DecodePlacementFrame("POS|1||\n", &out));
+  CHECK_EQ(out.items.size(), 0);
+  // 节点项：字段数 / id / 坐标
+  CHECK_FALSE(audiohub::DecodePlacementFrame(frame(id + ",1"), &out));
+  CHECK_FALSE(audiohub::DecodePlacementFrame(frame("no-colon,1,2"), &out));
+  CHECK_FALSE(audiohub::DecodePlacementFrame(frame(id + ",,2"), &out));
+  CHECK_FALSE(audiohub::DecodePlacementFrame(frame(id + ",1,2;git"), &out));
+  CHECK_FALSE(audiohub::DecodePlacementFrame(frame(id + ",2001,0"), &out));   // 超 ±20m
+  CHECK_FALSE(audiohub::DecodePlacementFrame(frame(id + ",-2001,0"), &out));
+  CHECK_FALSE(audiohub::DecodePlacementFrame(frame(id + ",1.5,0"), &out));    // 只收厘米整数
+  // 正常值边界
+  CHECK_TRUE(audiohub::DecodePlacementFrame(frame(id + ",2000,-2000"), &out));
+  CHECK_EQ(out.items.size(), 1);
+  if (out.items.size() == 1) {
+    CHECK_EQ(out.items[0].x_cm, 2000);
+    CHECK_EQ(out.items[0].z_cm, -2000);
+  }
+  // 重复 id 保留第一个
+  CHECK_TRUE(audiohub::DecodePlacementFrame(frame(id + ",1,2;" + id + ",3,4"), &out));
+  CHECK_EQ(out.items.size(), 1);
+  if (out.items.size() == 1) CHECK_EQ(out.items[0].x_cm, 1);
+  // 超长帧（>1000 字节）
+  std::string huge = "POS|1||";
+  for (int i = 0; i < 80; ++i) {
+    if (i) huge += ';';
+    huge += id + "," + std::to_string(i) + "," + std::to_string(i);
+  }
+  huge += "\n";
+  CHECK_TRUE(huge.size() > audiohub::kMaxPlacementFrameBytes);
+  CHECK_FALSE(audiohub::DecodePlacementFrame(huge, &out));
+  // 项数超上限（但帧长没超）：也必须整帧丢弃
+  std::string many = "POS|1||";
+  for (size_t i = 0; i < audiohub::kMaxGraphNodes + 1; ++i) {
+    if (i) many += ';';
+    many += "10.0.0." + std::to_string(i + 1) + ":47000,1,1";
+  }
+  many += "\n";
+  CHECK_TRUE(many.size() <= audiohub::kMaxPlacementFrameBytes);
+  CHECK_FALSE(audiohub::DecodePlacementFrame(many, &out));
+}
+
+TEST(Placement_EncodeTrimsOverlongFrame) {
+  // 项数上限 32（帧长上限 1000）：超限时按 id 升序从尾部裁，裁完仍必须能解析。
+  std::vector<audiohub::PlacementItem> items;
+  for (size_t i = 0; i < audiohub::kMaxGraphNodes + 8; ++i) {
+    items.push_back(MakePlacement("192.168.100." + std::to_string(i + 1) + ":47000", i, i));
+  }
+  const auto p = MakePlacementState(3, kSelfA, items);
+  const std::string frame = audiohub::EncodePlacementFrame(p);
+  CHECK_TRUE(frame.size() <= audiohub::kMaxPlacementFrameBytes);
+  audiohub::PlacementState out;
+  CHECK_TRUE(audiohub::DecodePlacementFrame(frame, &out));
+  CHECK_TRUE(PlacementItemsSorted(out));
+  CHECK_EQ(out.items.size(), audiohub::kMaxGraphNodes);  // 裁到上限整好装下
+
+  // 恰好等于上限时不该被裁
+  std::vector<audiohub::PlacementItem> exact(items.begin(),
+                                             items.begin() + audiohub::kMaxGraphNodes);
+  const std::string frame2 = audiohub::EncodePlacementFrame(MakePlacementState(4, kSelfA, exact));
+  audiohub::PlacementState out2;
+  CHECK_TRUE(audiohub::DecodePlacementFrame(frame2, &out2));
+  CHECK_EQ(out2.items.size(), audiohub::kMaxGraphNodes);
+}
+
+TEST(Placement_MergeWholeTableLww) {
+  // 远端版本更大：整表采纳
+  audiohub::PlacementState local =
+      MakePlacementState(2, kNodeB, {MakePlacement(kNodeB, 100, 100)});
+  const auto remote = MakePlacementState(3, kSelfA, {MakePlacement(kNodeC, -50, 60)});
+  const auto r = audiohub::MergePlacement(&local, remote);
+  CHECK_TRUE(r.changed);
+  CHECK_TRUE(r.adopted);
+  CHECK_TRUE(r.items_changed);
+  CHECK_EQ(local.version, 3);
+  CHECK_TRUE(local.origin == kSelfA);
+  CHECK_EQ(local.items.size(), 1);
+  CHECK_TRUE(local.items[0].node_id == kNodeC);
+  CHECK_EQ(local.items[0].x_cm, -50);
+  CHECK_EQ(local.items[0].z_cm, 60);
+
+  // 旧版本：忽略
+  const auto before = local;
+  const auto r_old = audiohub::MergePlacement(&local, MakePlacementState(1, kSelfA, {}));
+  CHECK_FALSE(r_old.changed);
+  CHECK_TRUE(local.version == before.version);
+  CHECK_EQ(local.items.size(), before.items.size());
+
+  // 同版本：origin 字典序大者胜（与 MergeGraph 一致）
+  auto a = MakePlacementState(5, "aaa:47000", {MakePlacement(kNodeB, 1, 1)});
+  const auto b = MakePlacementState(5, "zzz:47000", {MakePlacement(kNodeB, 2, 2)});
+  const auto r_tie = audiohub::MergePlacement(&a, b);
+  CHECK_TRUE(r_tie.changed);
+  CHECK_EQ(a.items[0].x_cm, 2);
+  // 反过来（更小的 origin）不能覆盖
+  const auto a2 = a;
+  const auto r_smaller = audiohub::MergePlacement(&a, MakePlacementState(5, "aaa:47000",
+                                                                         {MakePlacement(kNodeB, 9, 9)}));
+  CHECK_FALSE(r_smaller.changed);
+  CHECK_EQ(a.items[0].x_cm, a2.items[0].x_cm);
+
+  // 同版本同 origin：忽略
+  CHECK_FALSE(audiohub::MergePlacement(&a, a).changed);
+
+  // 更高版本的空表 = 对方清空了所有摆位
+  const auto r_clear = audiohub::MergePlacement(&a, MakePlacementState(6, kSelfA, {}));
+  CHECK_TRUE(r_clear.changed);
+  CHECK_EQ(a.items.size(), 0);
+}
+
+TEST(Placement_SetAndRemoveBumpsVersion) {
+  audiohub::PlacementState p;
+  CHECK_TRUE(audiohub::SetPlacementItem(&p, kNodeB, 100, -40, kSelfA));
+  CHECK_EQ(p.version, 1);
+  CHECK_TRUE(p.origin == kSelfA);
+  CHECK_TRUE(audiohub::FindPlacement(p, kNodeB) != nullptr);
+
+  // 同一坐标重复提交：不产生新版本（GUI 轮询/重试会重复发）
+  CHECK_FALSE(audiohub::SetPlacementItem(&p, kNodeB, 100, -40, kSelfA));
+  CHECK_EQ(p.version, 1);
+
+  // 改坐标：版本 +1
+  CHECK_TRUE(audiohub::SetPlacementItem(&p, kNodeB, 200, 80, kSelfA));
+  CHECK_EQ(p.version, 2);
+  CHECK_EQ(audiohub::FindPlacement(p, kNodeB)->x_cm, 200);
+
+  // 越界 / 非法 id / 空 origin：拒绝且不改状态
+  const auto before = p;
+  CHECK_FALSE(audiohub::SetPlacementItem(&p, kNodeB, 2001, 0, kSelfA));
+  CHECK_FALSE(audiohub::SetPlacementItem(&p, "no-colon", 0, 0, kSelfA));
+  CHECK_FALSE(audiohub::SetPlacementItem(&p, kNodeB, 0, 0, ""));
+  CHECK_EQ(p.version, before.version);
+
+  // 删除：版本 +1；删不存在的返回 false
+  CHECK_TRUE(audiohub::RemovePlacementItem(&p, kNodeB, kSelfA));
+  CHECK_EQ(p.version, 3);
+  CHECK_TRUE(audiohub::FindPlacement(p, kNodeB) == nullptr);
+  CHECK_FALSE(audiohub::RemovePlacementItem(&p, kNodeB, kSelfA));
+}
+
+TEST(Placement_RequestFrameAndCrossTypeSafety) {
+  CHECK_TRUE(audiohub::IsPlacementRequestFrame("POS-REQ\n"));
+  CHECK_TRUE(audiohub::IsPlacementRequestFrame("POS-REQ\r\n"));
+  CHECK_TRUE(audiohub::IsPlacementRequestFrame("POS-REQ"));
+  CHECK_FALSE(audiohub::IsPlacementRequestFrame("POS-RE"));
+  CHECK_FALSE(audiohub::IsPlacementRequestFrame("POS-REQ extra"));
+  CHECK_FALSE(audiohub::IsPlacementRequestFrame("POS|1||\n"));
+  // 两类帧不能互相冒充
+  CHECK_FALSE(audiohub::IsGraphRequestFrame("POS-REQ"));
+  CHECK_FALSE(audiohub::IsPlacementRequestFrame("GRAPH-REQ"));
+  audiohub::GraphState g;
+  CHECK_FALSE(audiohub::DecodeGraphFrame("POS|1||\n", &g));
+  audiohub::PlacementState p;
+  CHECK_FALSE(audiohub::DecodePlacementFrame(MakeFrame(1, kSelfA, kSelfA, {}), &p));
+}

@@ -55,10 +55,11 @@
   <!-- ============ 控制界面：全网图谱 ============ -->
   <div id="screenControl" style="display:none">
     <!-- 3D 图谱：Canvas 2D 手写透视投影（ui/scene3d.js）。
-         逻辑坐标恒为 920x460（内部按 DPR 放大），与旧 SVG viewBox 一致，
+         画布撑满 .graphwrap（逻辑视口恒 920x460，按容器等比缩放并居中，见 scene3d.fitInfo），
          hub 投影仍是 (460,208)；role/aria 保留，读屏体验不倒退。 -->
-    <canvas id="graph" width="920" height="460" role="img" aria-label="全网设备图谱（3D）"
-            style="width:100%;height:auto;display:block"></canvas>
+    <div class="graphwrap">
+      <canvas id="graph" width="920" height="460" role="img" aria-label="全网设备图谱（3D）"></canvas>
+    </div>
 
     <!-- 点节点后的操作条：切换汇聚端确认 / 当前汇聚端信息 -->
     <div id="graphAction" class="actionbar" style="display:none">
