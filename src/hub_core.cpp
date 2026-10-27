@@ -34,6 +34,18 @@ constexpr int kCatchUpWindows = 3;
 constexpr int kSourceTimeoutSec = 5;
 // ASRC 内部保留的输入帧数。
 constexpr int kAsrcReserveFrames = 8;
+// 源端采集重启的判定阈值：sample_pos 回退超过 2 秒。
+//
+// 手机端 CaptureService 重启（切前后台、重新授权录屏、系统杀服务后自动拉起）
+// 时，stream_id 不变、但 sample_pos 从 0 重新计数；本端若还挂着旧读指针，
+// 之后每个包都判"迟到"整包丢弃，缓冲水位恒为 0、电平 -120，包计数却继续涨，
+// 只能重启汇聚端才恢复。正常乱序最多回退一两百毫秒，2 秒足够区分。
+constexpr int kRestartJumpFrames = 2 * kSampleRate;
+// 连续这么久没有一个包成功进入抖动缓冲 = 读指针已经跑过源端的写指针，
+// 再怎么等也等不回来（源端采集重启、暂停后恢复、网络断点之后都会这样）。
+// 这时清空重来，让下一个包按"首包"逻辑重新锚定读指针。
+// 1 秒是权衡：太短会把正常断流抖动误判成错位，太长则用户听到的静音更久。
+constexpr int kPushStallResetMs = 1000;
 // 控制口 = 音频口 + 2（+1 是 PING/PONG 口）。握手和发现都走文本帧。
 constexpr uint16_t kControlPortOffset = 2;
 
@@ -105,6 +117,15 @@ struct Stream {
   // 空间化结果独立缓冲：Process 是原地处理，拷一份再处理，MixBlock 负责求和。
   std::vector<float> spatial_buffer;
   uint64_t packets = 0;
+  // 上一个包的流内绝对采样序号（-1 = 还没收到过）。
+  // 用来识别"源端采集重启但 stream_id 没变"：序号大幅回退时必须清空抖动缓冲重新对齐，
+  // 否则读指针永远跑在写指针前面，这条流就永久静音了。
+  int64_t last_sample_pos = -1;
+  // 最近一次"包成功写进抖动缓冲"的时刻，以及"已清空、等下一个包重新锚定"标记。
+  // 两者配合识别"包在涨但一个也进不了缓冲"的永久静音：接收线程成功 Push 时刷新
+  // last_good_push，混音线程发现它 1 秒没动就清空重来（见 RebaseStreamLocked）。
+  Clock::time_point last_good_push{};
+  bool awaiting_reanchor = false;
   // 握手：未经接收方确认的流，混音时按静音处理。
   // 这样"请求-确认"机制是真的生效的，同时不影响直接发包的调试场景
   // （那种场景把 --no-handshake 关掉即可）。
@@ -213,6 +234,20 @@ struct HubCore::Impl {
       cb = event_cb;
     }
     if (cb) cb(text);
+  }
+
+  // 清空一条流的抖动缓冲/重采样器，让下一个包重新锚定读指针。
+  // 调用方必须已持有 mutex（接收线程和混音线程都会调用）。
+  void RebaseStreamLocked(Stream& s, const std::string& why) {
+    s.jitter.Reset();
+    s.asrc.Reset();
+    s.asrc.SetRatio(1.0);
+    s.pi.Reset();
+    s.excess_windows = 0;
+    s.tick_counter = 0;
+    s.last_good_push = Clock::now();
+    s.awaiting_reanchor = true;
+    Emit("[~] 流 " + std::to_string(s.id) + " " + why + "，重新对齐");
   }
 
   bool Start(uint16_t p, int latency, int render_ms, const StartOptions& opts,
@@ -380,18 +415,40 @@ struct HubCore::Impl {
       if (it == streams.end()) {
         auto created = std::make_unique<Stream>(header.stream_id, latency_ms);
         created->peer_ip_for_bye = from_ip;
-        // 三种情况视为已确认：没启用握手 / 之前握手通过过 / 之前 Accept 过
-        created->confirmed =
-            !require_handshake || accepted_ids.count(header.stream_id) > 0;
+        // 四种情况视为已确认：没启用握手 / 自动同意新连接 / 之前握手通过过 / 之前 Accept 过
+        // 自动同意（auto_accept）必须覆盖"直接发音频、没走 CONN-REQ 的源"：
+        // 手机端 CaptureService 与直连测试源只发包不握手，而 GUI 汇聚端默认
+        // auto_accept=true 却仍按"未确认"整条流静音，现象就是【包在涨、耳机全静音】。
+        // auto_accept 关闭（用户在界面上关掉"自动同意"）时保持严格：数据流继续待确认。
+        created->confirmed = !require_handshake || auto_accept_.load() ||
+                             accepted_ids.count(header.stream_id) > 0;
         if (accepted_ids.count(header.stream_id) > 0) {
           created->peer_name = "已确认设备";
         }
         it = streams.emplace(header.stream_id, std::move(created)).first;
         Emit("[+] 新流接入: id=" + std::to_string(header.stream_id));
       }
-      it->second->jitter.Push(header.sample_pos, scratch.data(), frames);
-      it->second->packets++;
-      it->second->last_packet = Clock::now();
+      // 源端采集重启：同一个 stream_id 的 sample_pos 从 0 重新开始。
+      // 这里必须先把抖动缓冲/重采样器清空——旧的读指针在几十亿帧的位置上，
+      // 新包的序号永远追不上，会整包判"迟到"，表现为"包在涨、耳机永久静音"。
+      // 用 int32 差值，避免 2^32 帧（约 24.8 小时）处序号回绕被误判成重启。
+      // 旧流只活了几百毫秒就重启时回退幅度可能不足 2 秒、这里判不出来，
+      // 由混音线程"kPushStallResetMs 没有有效包进入缓冲"的安全网兜底。
+      Stream& stream = *it->second;
+      if (stream.last_sample_pos >= 0) {
+        const int32_t jump = static_cast<int32_t>(
+            header.sample_pos - static_cast<uint32_t>(stream.last_sample_pos));
+        if (jump < -kRestartJumpFrames) {
+          RebaseStreamLocked(stream, "采样序号回退 " + std::to_string(-jump) + " 帧");
+        }
+      }
+      stream.last_sample_pos = static_cast<int64_t>(header.sample_pos);
+      if (stream.jitter.Push(header.sample_pos, scratch.data(), frames)) {
+        stream.last_good_push = Clock::now();
+        stream.awaiting_reanchor = false;
+      }
+      stream.packets++;
+      stream.last_packet = Clock::now();
 
       received_packets++;
       received_bytes += static_cast<uint64_t>(n);
@@ -972,6 +1029,17 @@ struct HubCore::Impl {
         mix_inputs.clear();
         for (auto& kv : streams) {
           Stream& s = *kv.second;
+
+          // 安全网：读指针已经跑到源端写指针前面时，之后每个包都被判"迟到/超容量"，
+          // 水位恒 0、电平 -120，包计数却照涨——现象就是"正常在发包但耳机没声"，
+          // 不重启汇聚端永远回不来。连续 1 秒没有一个包成功入缓冲就清空重来，
+          // 让下一个包按首包逻辑重新锚定读指针。采样序号大幅回退的情况在上面
+          // 收包线程里已经立刻处理了，这里兜住小幅回退/序号连续但时间轴错开的情形。
+          if (s.packets > 0 && !s.awaiting_reanchor && s.jitter.started() &&
+              (now - s.last_good_push) > std::chrono::milliseconds(kPushStallResetMs)) {
+            RebaseStreamLocked(s, "连续 " + std::to_string(kPushStallResetMs) +
+                                      " 毫秒没有有效包进入缓冲");
+          }
 
           // ---- 外环：把水位锁到目标值 ----
           if (++s.tick_counter >= kAdjustEveryTicks) {
