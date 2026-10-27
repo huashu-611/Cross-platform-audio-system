@@ -23,8 +23,11 @@ import java.util.Locale;
  *   · 正交映射：1 米 = ppu 像素。世界坐标 (wx, wz) 米 →
  *     {@code sx = cx + wx * ppu}、{@code sy = cy + wz * ppu}；
  *     屏幕上方 = -Z = 房间正前方，屏幕右 = +X = 右耳方向。
- *   · 视野半径固定 2.6 m（房间半径 2.4 m 外留一点边距），ppu = 屏幕短边 / 2 / 2.6，
- *     等比缩放、居中，绝不会像旧的 920x460 虚拟画布那样被非等比拉伸成椭圆。
+ *   · 视野自适应（v1.6）：遍历所有节点的 wx/wz，算出让「最远节点 + 球半径 + 标签」也落在
+ *     画布内的 ppu（四边各留约 12% 边距）：近处不小于 2.6 m 视野，远处最多缩到 640 m 视野
+ *     （±320 m 坐标上限的对角也装得下）。等比缩放、居中，绝不会像旧的 920x460 虚拟画布
+ *     那样被非等比拉伸成椭圆。
+ *   · 环按真实比例（半径米数 × ppu）：缩放小到环挤成一团时自动省略环/方位字，只留比例尺。
  *   · 完全只读：没有轨道旋转、没有捏合缩放、没有拖动节点、没有长按取消 pin。
  *     保留点击（选中节点/音量面板/切换汇聚端确认）与双击（切汇聚端）两个入口。
  *   · 位置权威来自 hub 同步的 POS 帧（{@link PlacementStore}）；没有人工摆位的节点由
@@ -89,8 +92,14 @@ public class HubGraphView extends View {
     private static final int COLOR_GROUND = oklch(0.42, 0.03, 255, 0.42);
     private static final int COLOR_GROUND_DIM = oklch(0.42, 0.03, 255, 0.22);
 
-    /** 视野半径（米）：屏幕短边的半长对应 2.6 m。 */
-    private static final float VIEW_RADIUS_M = 2.6f;
+    /** 标签占用的像素盒（名称/信息行/角标），拟合缩放时算进边距。 */
+    private static final float LABEL_HALF_W_DP = 60f;
+    private static final float LABEL_V_DP = 30f;
+    /** 环/方位字低于这些像素尺寸就不画：否则在 hub 球上糊成一团。 */
+    private static final float RING_MIN_PX_DP = 8f;
+    private static final float ROOM_MIN_PX_DP = 10f;
+    private static final float RING_LABEL_MIN_PX_DP = 20f;
+    private static final float MARK_MIN_PX_DP = 60f;
 
     /** 双击时间窗（ms）。 */
     private static final long DOUBLE_TAP_MS = 320L;
@@ -105,6 +114,8 @@ public class HubGraphView extends View {
     private float cx;
     private float cy;
     private float ppu;
+    /** 当前视野半径（米）：算 ppu 时得到，画在左下角当比例尺。 */
+    private float viewRadiusM = GraphFit.MIN_VIEW_RADIUS_M;
 
     private final Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint strokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -175,6 +186,10 @@ public class HubGraphView extends View {
         nodes.clear();
         if (input != null) nodes.addAll(input);
         if (!selectedId.isEmpty() && find(selectedId) == null) selectedId = "";
+        // 节点位置变了就重算缩放：桌面把节点拖远后，手机端必须跟着缩放到能看见
+        final int w = getWidth();
+        final int h = getHeight();
+        if (w > 0 && h > 0) computeLayout(w, h);
         invalidate();
     }
 
@@ -202,7 +217,7 @@ public class HubGraphView extends View {
     }
 
     // =====================================================================
-    // 布局：等比、居中
+    // 布局：等比、居中、视野自适应
     // =====================================================================
 
     @Override
@@ -211,13 +226,28 @@ public class HubGraphView extends View {
         computeLayout(w, h);
     }
 
+    /**
+     * 布局：视野自适应（v1.6）。ppu 由 {@link GraphFit} 按当前所有节点算：最远节点连球半径
+     * 与标签一起装进画布、四边各留 12% 边距；近处不小于 2.6 m 视野，远处最多 640 m。
+     * 节点位置每次 setData 变化都会重算（否则拖远的节点会一直画在屏外）。
+     */
     private void computeLayout(int w, int h) {
         if (w <= 0 || h <= 0) return;
-        // 顶部给状态文字留一条窄带，其余等高：短边决定 ppu，保证圆环永远是正圆
+        // 顶部给状态文字留一条窄带；剩余区域等比居中
         final float topReserve = sp(16f) + dp(8);
+        final GraphFit.Item[] items = new GraphFit.Item[nodes.size()];
+        for (int i = 0; i < items.length; ++i) {
+            final Node n = nodes.get(i);
+            items[i] = new GraphFit.Item((float) n.wx, (float) n.wz,
+                    (float) (n.hub ? Scene3D.CFG.HUB_BALL_R : Scene3D.CFG.NODE_BALL_R),
+                    n.hub ? dp(18f) : dp(8f), n.hub ? dp(56f) : dp(22f));
+        }
+        final GraphFit.Result fit = GraphFit.fit(w, h, topReserve, items,
+                dp(LABEL_HALF_W_DP), dp(LABEL_V_DP));
+        ppu = fit.ppu;
+        viewRadiusM = fit.viewRadiusM;
+        // 等比、居中：cx/cy 就是听者/hub 原点（屏幕上方 = -Z = 正前方，右侧 = +X）
         final float usableH = Math.max(1f, h - topReserve);
-        final float shortSide = Math.min((float) w, usableH);
-        ppu = shortSide / 2f / VIEW_RADIUS_M;
         cx = w / 2f;
         cy = topReserve + usableH / 2f;
     }
@@ -293,39 +323,53 @@ public class HubGraphView extends View {
         return clamp((float) (Scene3D.CFG.NODE_BALL_R * ppu), dp(8), dp(22));
     }
 
-    /** 地面：R=1 m 实线、R=2.4 m 虚线 + 方位 + 45° 距离标注 + 原点。 */
+    /** 地面：R=1 m 实线、R=2.4 m 虚线 + 方位 + 45° 距离标注 + 原点 + 左下比例尺。 */
     private void drawGround(Canvas canvas) {
-        drawRing(canvas, (float) Scene3D.CFG.RING_R, false, COLOR_GROUND);
-        drawRing(canvas, (float) Scene3D.CFG.ROOM_R, true, COLOR_GROUND_DIM);
-
-        // 方位标注（1.75 m 处，略小于房间边界，避免压到节点）
-        final float markR = (float) ((Scene3D.CFG.RING_R + Scene3D.CFG.ROOM_R) / 2.0);
-        final String[] marks = {"前", "右", "后", "左"};
-        textPaint.setTextAlign(Paint.Align.CENTER);
-        textPaint.setTypeface(Typeface.DEFAULT);
-        textPaint.setTextSize(sp(10f));
-        textPaint.setColor(COLOR_FAINT);
-        textPaint.setAlpha((int) Math.round(255 * 0.85f));
-        final float[][] positions = {
-                {cx, cy - markR * ppu},
-                {cx + markR * ppu, cy},
-                {cx, cy + markR * ppu},
-                {cx - markR * ppu, cy},
-        };
-        for (int i = 0; i < marks.length; ++i) {
-            canvas.drawText(marks[i], clampTextX(positions[i][0], marks[i]), positions[i][1] + sp(3.5f),
-                    textPaint);
+        final float ringPx = (float) Scene3D.CFG.RING_R * ppu;
+        final float roomPx = (float) Scene3D.CFG.ROOM_R * ppu;
+        // 环始终按真实比例（半径米数 × ppu），不单独缩放；缩得太小就干脆不画，避免糊在 hub 球上。
+        if (roomPx >= dp(ROOM_MIN_PX_DP)) {
+            drawRing(canvas, (float) Scene3D.CFG.ROOM_R, true, COLOR_GROUND_DIM);
+            if (ringPx >= dp(RING_MIN_PX_DP)) {
+                drawRing(canvas, (float) Scene3D.CFG.RING_R, false, COLOR_GROUND);
+            }
         }
 
-        // 距离标注：两个环各在 45°（右后方向）标 "1.0 m" / "2.4 m"
+        // 方位标注（两个环中间 1.7 m 处）：离中心太近会压在 hub 球上，缩到 60 dp 以内就不画
+        final float markR = (float) ((Scene3D.CFG.RING_R + Scene3D.CFG.ROOM_R) / 2.0);
+        final float markRpx = markR * ppu;
+        if (markRpx >= dp(MARK_MIN_PX_DP)) {
+            final String[] marks = {"前", "右", "后", "左"};
+            textPaint.setTextAlign(Paint.Align.CENTER);
+            textPaint.setTypeface(Typeface.DEFAULT);
+            textPaint.setTextSize(sp(10f));
+            textPaint.setColor(COLOR_FAINT);
+            textPaint.setAlpha((int) Math.round(255 * 0.85f));
+            final float[][] positions = {
+                    {cx, cy - markRpx},
+                    {cx + markRpx, cy},
+                    {cx, cy + markRpx},
+                    {cx - markRpx, cy},
+            };
+            for (int i = 0; i < marks.length; ++i) {
+                canvas.drawText(marks[i], clampTextX(positions[i][0], marks[i]),
+                        positions[i][1] + sp(3.5f), textPaint);
+            }
+        }
+
+        // 距离标注：两个环各在 45°（右后方向）标 "1.0 m" / "2.4 m"；环本身有足够像素才标
+        textPaint.setTextAlign(Paint.Align.CENTER);
+        textPaint.setTypeface(Typeface.DEFAULT);
         textPaint.setTextSize(sp(9.5f));
         textPaint.setColor(COLOR_FAINT);
         textPaint.setAlpha((int) Math.round(255 * 0.70f));
         final float k = (float) Math.sin(45 * Scene3D.DEG);
         final float[] ringRs = {(float) Scene3D.CFG.RING_R, (float) Scene3D.CFG.ROOM_R};
         for (float rr : ringRs) {
+            final float rrPx = rr * ppu;
+            if (rrPx < dp(RING_LABEL_MIN_PX_DP)) continue;   // 环太小，标了也糊
             final String label = formatMeters(rr) + " m";
-            canvas.drawText(label, cx + rr * k * ppu + dp(6), cy + rr * k * ppu, textPaint);
+            canvas.drawText(label, cx + rrPx * k + dp(6), cy + rrPx * k, textPaint);
         }
         textPaint.setAlpha(255);
 
@@ -335,6 +379,23 @@ public class HubGraphView extends View {
         fillPaint.setColor(COLOR_GROUND_DIM);
         fillPaint.setAlpha(255);
         canvas.drawCircle(cx, cy, dp(1) + 1f, fillPaint);
+
+        drawScaleHint(canvas);
+    }
+
+    /**
+     * 左下角比例尺：当前视野半径（米）。缩放到几百米时节点都挤成小点，
+     * 用户需要一个「现在这屏有多大」的参照，否则会误以为位置信息丢了。
+     */
+    private void drawScaleHint(Canvas canvas) {
+        final int h = getHeight();
+        textPaint.setTextAlign(Paint.Align.LEFT);
+        textPaint.setTypeface(Typeface.DEFAULT);
+        textPaint.setTextSize(sp(9.5f));
+        textPaint.setColor(COLOR_FAINT);
+        textPaint.setAlpha((int) Math.round(255 * 0.65f));
+        canvas.drawText("视野 " + formatMeters(viewRadiusM) + " m", dp(6), h - dp(6), textPaint);
+        textPaint.setAlpha(255);
     }
 
     private void drawRing(Canvas canvas, float radiusM, boolean dashed, int color) {

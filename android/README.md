@@ -55,6 +55,12 @@ adb install -r android/build/audiohub-source.apk
   节点集算出的布局一致。
 - 点击球：选中高亮 + 展开音量面板；点非汇聚端节点会弹「切换汇聚端」确认；
   双击节点直接切换汇聚端。
+- **视野自适应（v1.6 起）**：节点都在房间附近时保持 2.6 m 的近景观感；有节点在远处时
+  （距离即音量之后坐标可达 ±320 m）自动缩小 `ppu`，最远节点「连球半径和名字标签」
+  都留在画布约 12% 边距以内，不会被挤到屏幕外。环始终按真实比例画；视野太大时
+  环、方位字、刻度会省略（1 px 的环没有意义），左下角改为显示「视野 xx m」。
+- 合规：屏幕坐标始终是 `sx = cx + wx*ppu`、`sy = cy + wz*ppu`（sy 向下 = +Z），
+  屏幕上方 = 正前方 = -Z；视野缩放不改变方位关系。
 
 ## 位置同步协议（POS，与 C++ 端逐条一致）
 
@@ -108,6 +114,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-apk.ps1
 
 产物：`android/build/audiohub-source.apk`（脚本会打印路径和大小）。
 
+### 自检脚本（纯 Java 8，不需要 Android SDK）
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File android\verify\run-spatial-check.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File android\verify\run-graphfit-check.ps1
+```
+
+`run-spatial-check.ps1` 把 `Spatial.java` 与 C++ `tests/test_spatial.cpp` 的期望值逐条对齐
+（空间化公式、ITD、延时逐样本过渡的接缝残差……）；`run-graphfit-check.ps1` 验证俯视图
+视野自适应的数值约束（近/远节点、±320 m、随机布局都装得下、方位角不变、环按真比例）。
+两个脚本都在临时目录编译，不写工作区；退出码 0 = 全部通过。
+
 这个脚本做了两件不太常见的事，都是被逼的：
 
 - **构建时给 manifest 注入 `package` 属性**：aapt2 命令行要求它，而 AGP 8
@@ -136,6 +154,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-apk.ps1
 | `CaptureService.java` | 前台服务、MediaProjection、AudioRecord、节拍发送、WifiLock |
 | `MainActivity.java` | 界面（纯代码搭，没有 XML 布局）：连接页 / 控制页、全自适应无滚动 |
 | `HubGraphView.java` | 俯视只读平面图：正交映射、方位/环、球体/电平弧/选中高亮、点击/双击 |
+| `GraphFit.java` | 俯视图视野自适应的纯数学：节点世界坐标/标签盒 → ppu 与视野半径 |
 | `PlacementStore.java` | POS 帧严格编解码 + 整表 LWW 合并（与 `src/graph.cpp` 对齐） |
 | `InviteListener.java` | 常驻握手口（audioPort+2）：CONN/ROLE/GRAPH/GRAPH-REQ/POS/POS-REQ |
 | `GraphStore.java` | 图谱状态 + GRAPH 帧编解码 + 汇聚端切换 |
