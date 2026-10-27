@@ -30,6 +30,28 @@ namespace {
 constexpr int kAdjustEveryTicks = 40;
 constexpr int kCatchUpThresholdMs = 40;
 constexpr int kCatchUpWindows = 3;
+
+// ---- 抖动自适应缓冲（v1.7）----
+//
+// 手机走 WiFi 时数据不是匀着到的：省电、信道竞争、系统调度都会把几十毫秒的
+// 音频攒成一批送过来。目标延迟固定 60 ms 时，这种突发会周期性抽干抖动缓冲，
+// 输出只能补零 —— 听感就是"偶尔卡一下，而且挺频繁"。
+//
+// 这套逻辑不猜网络模型，只看结果：
+//   · 出现欠载      → 物理扩缓冲（插一小段静音把读指针往后放）+ 抬高目标延迟；
+//   · 水位长期高于目标 → 数据被网络推后了，抬目标吸收，不做硬丢帧（硬丢就是可听的跳字）；
+//   · 只有水位逼近容量（400 ms）才一次性丢回 200 ms，当作最后保险。
+// 上限 240 ms：再高对音乐已没意义，反而拖慢"手机上按暂停"的反馈速度。
+constexpr int kAdaptiveTargetMaxMs = 240;
+constexpr int kAdaptiveGrowMs = 20;     // 欠载时至少多留这么多余量
+constexpr int kAdaptiveGrowMaxMs = 60;  // 单次最多扩这么多（丢得越多补得越多）
+constexpr int kRaiseThresholdMs = 40;   // 水位高于目标多少算"被网络推后"
+constexpr int kRaiseWindows = 3;        // 连续几个调整窗口才抬目标
+constexpr int kEmergencyDropMs = 320;   // 水位硬上限：超过就丢
+constexpr int kEmergencyKeepMs = 200;   // 保命丢帧后保留的水位
+// 会话关系表的存活时间：手机 App 退出后不会再广播 GRAPH / 发音频，
+// 这么久没再见到就从"会话设备"里摘掉，界面不会一直显示在线。
+constexpr int kSessionPeerTtlMs = 30000;
 // 超过这么久没有包的流判定为掉线，从列表里移除。
 constexpr int kSourceTimeoutSec = 5;
 // ASRC 内部保留的输入帧数。
@@ -104,7 +126,8 @@ struct Stream {
         jitter(kChannels, kSampleRate, MsToFrames(400)),
         asrc(kChannels),
         pi(0.00002, 0.000002, -0.002, 0.002) {
-    jitter.SetTargetDelayMs(latency_ms);
+    base_target_ms = std::clamp(latency_ms, 20, kAdaptiveTargetMaxMs);
+    jitter.SetTargetDelayMs(base_target_ms);
   }
 
   uint16_t id;
@@ -117,6 +140,12 @@ struct Stream {
   int tick_counter = 0;
   int excess_windows = 0;
   int catchup_count = 0;
+  // 自适应缓冲（v1.7）：base_target_ms 是 --latency 给的原始目标，
+  // target 只能往上抬到 kAdaptiveTargetMaxMs，调 SetLatency 时两者一起复位。
+  int base_target_ms = 60;
+  uint64_t last_underrun_frames = 0;  // 上一次调整窗口看到的欠载帧数（用于算增量）
+  int high_windows = 0;               // 水位连续高于目标的窗口数
+  int low_windows = 0;                // 水位连续低于目标的窗口数（用于慢慢把缓冲还回去）
   Clock::time_point last_catchup{};
   Clock::time_point last_packet{};
   float gain = 1.0f;
@@ -666,6 +695,16 @@ struct HubCore::Impl {
         if (it != streams.end()) {
           const std::string who = it->second->peer_name.empty() ? ("流 " + std::to_string(stream_id))
                                                                 : it->second->peer_name;
+          // 对端主动退出：会话关系也一并摘掉。
+          // 不摘的话 session_peers 会一直留着它，界面把 30 秒内的"曾经在线"当成现在在线，
+          // 用户看到的就是"手机退了、桌面还显示它在"。
+          const std::string bye_ip = it->second->peer_ip_for_bye;
+          if (!bye_ip.empty()) {
+            session_peers.erase(bye_ip);
+            // 判活时间戳也摘掉：否则 BYE 之后界面还要再等满 10 秒判活窗口
+            // 才变离线，看起来就像"手机都退了，桌面还显示在线"。
+            graph_last_seen.erase(bye_ip);
+          }
           streams.erase(it);
           Emit("[-] 已断开: " + who);
         }
@@ -846,7 +885,6 @@ struct HubCore::Impl {
     std::string hub_id;
     {
       std::lock_guard<std::mutex> lock(mutex);
-      TouchGraphIpLocked(from_ip);
       if (remote.version > graph_seen_version) graph_seen_version = remote.version;
 
       // 先记下这次新学到的节点：合并后要给它们各补一次 GRAPH-REQ（协议 §4.4）
@@ -860,6 +898,10 @@ struct HubCore::Impl {
 
       const GraphMergeResult result = MergeGraph(&graph_, remote);
       changed = result.changed;
+      // 判活要放在合并之后：第一次收到某台设备的 GRAPH 时，它的节点就是
+      // 这一帧才学到的，合并前 TouchGraphIpLocked 找不到节点会直接返回，
+      // 结果"刚广播过"的设备反而显示离线（真机上要等它 3 秒后再发一帧才好）。
+      TouchGraphIpLocked(from_ip);
       if (changed) {
         if (graph_.version > graph_seen_version) graph_seen_version = graph_.version;
         GraphScheduleOnceLocked();   // 合并变化：立即 1 次
@@ -991,6 +1033,9 @@ struct HubCore::Impl {
         PlacementTrySendLocked(ip, hs, EncodePlacementFrame(placement_));
       }
       PlacementSendRequestsLocked();
+
+      // ---- 会话关系保活：把已经退出的设备从"会话设备"里摘掉（v1.7）----
+      SessionPeersTickLocked(now);
     }
   }
 
@@ -1249,28 +1294,81 @@ struct HubCore::Impl {
                                       " 毫秒没有有效包进入缓冲");
           }
 
-          // ---- 外环：把水位锁到目标值 ----
+          // ---- 外环：自适应缓冲 + PI 微调 ----
+          //
+          // v1.7：高水位不再硬追帧。以前 FastForward 一次丢掉几十毫秒，
+          // 听感就是"隔一会儿跳一下"；WiFi 突发越频繁跳得越勤。
+          // 现在网络把数据推后多少，就把目标延迟抬多少吸收掉，只留 ASRC 的
+          // ±0.2% 比率慢慢回正；水位逼近容量（400 ms）才一次性丢回 200 ms 保命。
           if (++s.tick_counter >= kAdjustEveryTicks) {
             s.tick_counter = 0;
             const int occupancy = s.jitter.occupancy_ms();
             const int target = s.jitter.target_delay_ms();
             const int excess = occupancy - target;
-            const bool cooldown_ok =
-                (Clock::now() - s.last_catchup) > std::chrono::seconds(5);
+            const auto js = s.jitter.stats();
 
-            if (excess > kCatchUpThresholdMs) {
-              s.excess_windows++;
-            } else {
-              s.excess_windows = 0;
+            // 1) 出现欠载 = 缓冲不够大。按这次丢掉的量补余量：插静音只是在读指针
+            //    后面加一段空位，声音不断，只是整体后移；立即生效，不靠慢速 PI。
+            if (js.frames_underrun > s.last_underrun_frames) {
+              const uint64_t lost = js.frames_underrun - s.last_underrun_frames;
+              s.last_underrun_frames = js.frames_underrun;
+              const int lost_ms = static_cast<int>(lost * 1000 / kSampleRate);
+              // 只有"成块地没数据"（≥5 ms）才算真实网络停顿。采样率微差造成的
+              // 一两帧欠载交给 PI 比例微调去追，不能因此插 20 ms 静音——那样
+              // 每来一次小欠载就多一个可闻的空洞，反而制造卡顿。
+              if (lost_ms >= 5) {
+                const int grow =
+                    std::clamp(lost_ms + 10, kAdaptiveGrowMs, kAdaptiveGrowMaxMs);
+                const int next_target = std::min(target + grow, kAdaptiveTargetMaxMs);
+                if (next_target > target) {
+                  s.jitter.SetTargetDelayMs(next_target);
+                  s.jitter.InsertSilence(MsToFrames(next_target - target));
+                  Emit("[~] 流 " + std::to_string(s.id) + " 抖动欠载 " +
+                       std::to_string(lost_ms) + " ms，缓冲 " + std::to_string(target) +
+                       " -> " + std::to_string(next_target) + " ms");
+                }
+              }
             }
 
-            if (s.excess_windows >= kCatchUpWindows && cooldown_ok) {
-              s.jitter.FastForward(MsToFrames(excess - 2));
+            // 2) 水位长期高于目标：数据被网络推后了。抬目标吸收，不做硬丢帧。
+            if (excess > kRaiseThresholdMs) {
+              s.high_windows++;
+            } else {
+              s.high_windows = 0;
+            }
+            if (s.high_windows >= kRaiseWindows && occupancy > target) {
+              const int next_target = std::min(occupancy, kAdaptiveTargetMaxMs);
+              if (next_target > target) {
+                s.jitter.SetTargetDelayMs(next_target);
+                Emit("[~] 流 " + std::to_string(s.id) + " 网络抖动，目标延迟 " +
+                     std::to_string(target) + " -> " + std::to_string(next_target) +
+                     " ms");
+              }
+              s.high_windows = 0;
+            }
+
+            // 3) 水位长期低于目标（网络变好）：慢慢把多留的缓冲还回去，
+            //    避免延迟只升不降。只改目标，不动数据，所以不会有跳字。
+            if (excess < -kRaiseThresholdMs) {
+              s.low_windows++;
+            } else {
+              s.low_windows = 0;
+            }
+            if (s.low_windows >= 50 && target > s.base_target_ms) {
+              s.jitter.SetTargetDelayMs(std::max(s.base_target_ms, target - 10));
+              s.low_windows = 0;
+            }
+
+            // 4) 最后保险：水位逼近容量才硬丢，丟到 200 ms。
+            if (occupancy > kEmergencyDropMs) {
+              s.jitter.FastForward(MsToFrames(occupancy - kEmergencyKeepMs));
               s.last_catchup = Clock::now();
               s.catchup_count++;
-              s.excess_windows = 0;
               s.pi.Reset();
               s.asrc.SetRatio(1.0);
+              Emit("[~] 流 " + std::to_string(s.id) + " 水位 " +
+                   std::to_string(occupancy) + " ms 过高，丢弃到 " +
+                   std::to_string(kEmergencyKeepMs) + " ms");
             } else {
               const double ratio = 1.0 + s.pi.Update(static_cast<double>(excess), 0.2);
               s.asrc.SetRatio(ratio);
@@ -1385,6 +1483,7 @@ struct HubCore::Impl {
       info.id = s.id;
       info.occupancy_ms = s.jitter.occupancy_ms();
       info.target_ms = s.jitter.target_delay_ms();
+      info.catchup_count = s.catchup_count;
       info.gain = s.gain;
       info.muted = s.muted;
       info.packets = s.packets;
@@ -1396,6 +1495,8 @@ struct HubCore::Impl {
       const auto st = s.jitter.stats();
       info.underrun_frames = st.frames_underrun;
       info.overflow_packets = st.packets_overflow;
+      info.late_packets = st.packets_late;
+      info.lost_packets = st.packets_overflow;
       info.confirmed = s.confirmed;
       info.peer_ip = s.peer_ip_for_bye;
       info.peer_name = s.peer_name;
@@ -1433,7 +1534,17 @@ struct HubCore::Impl {
   void SetLatency(int ms) {
     std::lock_guard<std::mutex> lock(mutex);
     latency_ms = std::clamp(ms, 20, 250);
-    for (auto& kv : streams) kv.second->jitter.SetTargetDelayMs(latency_ms);
+    for (auto& kv : streams) {
+      Stream& s = *kv.second;
+      // 重新给了目标延迟，就把它当成新的基线：自适应缓冲从零开始，
+      // 否则之前为抗抖动抬上去的目标会赖着不走（v1.7）。
+      s.base_target_ms = latency_ms;
+      s.jitter.SetTargetDelayMs(latency_ms);
+      s.last_underrun_frames = s.jitter.stats().frames_underrun;
+      s.high_windows = 0;
+      s.low_windows = 0;
+      s.excess_windows = 0;
+    }
   }
 
   // ---- 3D 空间化 ----
@@ -1643,6 +1754,36 @@ struct HubCore::Impl {
     } else {
       if (!name.empty()) it->second.name = name;
       if (audio_port) it->second.audio_port = audio_port;
+    }
+  }
+
+  // 把"已经彻底没动静"的会话设备摘掉（调用者持锁）。
+  //
+  // v1.7：手机 App 退出后既不发音频也不再广播 GRAPH，但 session_peers 以前是只进不出，
+  // 界面就一直把它显示成在线，邀请过去当然没人接。这里按 TTL 清理：
+  //   有活着的流 → 保留；最近 TTL 内收到过它的 GRAPH → 保留；否则删除。
+  void SessionPeersTickLocked(Clock::time_point now) {
+    for (auto it = session_peers.begin(); it != session_peers.end();) {
+      const std::string& ip = it->first;
+      bool live = false;
+      for (const auto& kv : streams) {
+        if (kv.second->peer_ip_for_bye == ip) {
+          live = true;
+          break;
+        }
+      }
+      if (!live) {
+        const auto seen = graph_last_seen.find(ip);
+        if (seen != graph_last_seen.end() &&
+            now - seen->second <= std::chrono::milliseconds(kSessionPeerTtlMs)) {
+          live = true;
+        }
+      }
+      if (live) {
+        ++it;
+      } else {
+        it = session_peers.erase(it);
+      }
     }
   }
 

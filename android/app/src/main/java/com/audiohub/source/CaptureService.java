@@ -27,6 +27,7 @@ import android.util.Log;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.nio.charset.StandardCharsets;
 
 /**
  * 前台的采集服务。
@@ -75,6 +76,12 @@ public class CaptureService extends Service {
     private static final int MUTE_SILENT_DBFS = -100;
     private static final long MUTE_HEAL_SILENCE_MS = 3000L;
 
+    // ---- 停止/退出时立刻断开（协议 §5 CONN-BYE）：让汇聚端马上摘掉本机这一路流和会话，
+    // 不用等 5 秒音频超时才掉流。以前一个 BYE 都不发，用户报的就是
+    // "手机端退出后，桌面端不会同步退出，重新邀请也没有响应"。----
+    private static final int BYE_SENDS = 3;
+    private static final long BYE_GAP_MS = 50L;
+
     private AudioManager audioManager;
     private int savedMusicVolume = -1;          // -1 = 没有保存（当前音量不是我们静音的）
     private volatile boolean mutedByUs = false;
@@ -91,6 +98,8 @@ public class CaptureService extends Service {
     private InetAddress address;
     private int port;
     private int streamId;
+    /** CONN-BYE 只发一次；开始新会话时复位（见 onStartCommand）。 */
+    private volatile boolean byeSent;
 
     private WifiManager.WifiLock wifiLock;
     private PowerManager.WakeLock wakeLock;
@@ -133,6 +142,9 @@ public class CaptureService extends Service {
             }
             stopCapture();
         }
+
+        // 新会话：允许本次会话结束时再发 CONN-BYE（上一次会话的 BYE 已在 stopCapture 发过）
+        byeSent = false;
 
         if (resultCode != Activity.RESULT_OK || resultData == null) {
             fail("没有拿到屏幕/音频采集授权");
@@ -346,6 +358,10 @@ public class CaptureService extends Service {
         // 采集线程自己退出（AudioRecord 错误等）：也要恢复音量，不能把用户手机留在静音。
         sRunning = false;
         restoreMediaVolume();
+        // 采集结束（错误码 / 被系统掐断）：先发 CONN-BYE 让桌面立刻掉流，再停服务释放前台通知。
+        // onDestroy 还会再走一遍 stopCapture，sendByeBestEffort 有幂等保护，不会重复发。
+        sendByeBestEffort();
+        stopSelf();
     }
 
     // ------------------------------------------------------------ 静音与自愈
@@ -462,7 +478,11 @@ public class CaptureService extends Service {
     // ------------------------------------------------------------ 收尾
 
     private void stopCapture() {
-        // 先恢复音量：任何结束路径（停止/失败/销毁/授权被系统撤销）都走这里。
+        // 先尽力让汇聚端立刻摘掉本机这一路流（协议 §5 CONN-BYE）：用户停止/采集结束/
+        // 异常/服务销毁都走这里；此时 socket 还开着、streamId 还在，发出去才有效。
+        // 不发的话桌面端要等 5 秒音频超时才掉流，用户看到的就是"手机退了桌面还显示在线"。
+        sendByeBestEffort();
+        // 恢复音量：任何结束路径（停止/失败/销毁/授权被系统撤销）都走这里。
         restoreMediaVolume();
         running = false;
         sRunning = false;
@@ -508,6 +528,48 @@ public class CaptureService extends Service {
         sRunning = false;
         stopCapture();
         stopSelf();
+    }
+
+    /**
+     * best-effort 发 2~3 次 CONN-BYE（协议 §5），让汇聚端立刻摘掉本机这一路流和会话。
+     *
+     * 为什么连发：UDP 会丢包，BYE 丢了就要等桌面端 5 秒音频超时才掉流；连发 3 次的成本可忽略。
+     * 为什么在 stopCapture 最前面调：BYE 要发到 host 的握手口（音频口 + InviteListener.PORT_OFFSET），
+     * 复用采集 socket（未 connect，可发任意地址），所以必须在 socket.close() 之前发。
+     * 幂等：同一次会话只发一轮；发送失败（网络已断）只记日志，绝不阻断本地清理。
+     */
+    private void sendByeBestEffort() {
+        if (byeSent) return;
+        final DatagramSocket s = socket;
+        final InetAddress host = address;
+        final int hubPort = port;
+        final int sid = streamId;
+        if (s == null || host == null || hubPort <= 0 || sid <= 0) return;
+        byeSent = true;
+        final int targetPort = hubPort + InviteListener.PORT_OFFSET;
+        final byte[] data = ("CONN-BYE|" + sid + "\n").getBytes(StandardCharsets.UTF_8);
+        final DatagramPacket pkt = new DatagramPacket(data, data.length, host, targetPort);
+        for (int i = 0; i < BYE_SENDS; ++i) {
+            try {
+                s.send(pkt);
+            } catch (Exception ignored) {
+                // UDP 无连接：发不出去说明网已经断了，桌面会按超时处理
+            }
+            if (i + 1 < BYE_SENDS) SystemClock.sleep(BYE_GAP_MS);
+        }
+        Log.i(TAG, "已发送 CONN-BYE（流 " + sid + " → " + host.getHostAddress() + ":" + targetPort + "）");
+    }
+
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        // 用户在最近任务里把 App 划掉：系统会调这里（前台采集服务还在跑时）。
+        // 立刻走正常停止路径（发 CONN-BYE + 恢复媒体音量 + 松开锁），再 stopSelf 去掉前台通知。
+        // 以前这里没处理：前台服务会一直活着继续推流 —— 桌面端就"永远显示手机在线"、
+        // 重新邀请也没有任何响应（手机端进程还在但已经没人应答握手）。
+        Log.i(TAG, "任务被移除：停止采集并断开连接");
+        stopCapture();
+        stopSelf();
+        super.onTaskRemoved(rootIntent);
     }
 
     @Override

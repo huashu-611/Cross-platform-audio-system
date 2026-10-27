@@ -26,6 +26,9 @@ struct SourceInfo {
   uint16_t id = 0;
   int occupancy_ms = 0;
   int target_ms = 0;
+  int catchup_count = 0;        // 已发生的硬丢帧次数（正常网络应为 0）
+  uint64_t late_packets = 0;    // 迟到丢弃的包
+  uint64_t lost_packets = 0;    // 溢出丢弃的包
   double level_dbfs = -120.0;
   float gain = 1.0f;
   bool muted = false;

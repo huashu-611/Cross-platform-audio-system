@@ -114,7 +114,7 @@ public class MainActivity extends Activity {
     private static final int COLOR_WARN = 0xFFFBBF24;
 
     /** 构建标记：与 APK versionName 保持一致，用于在手机上确认装的是哪一版。 */
-    private static final String BUILD_TAG = "1.5-topdown";
+    private static final String BUILD_TAG = "1.7-bye";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -223,6 +223,14 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        // 退出 App（返回键 / 划掉最近任务）：必须马上停掉采集服务，否则前台服务继续推流、
+        // 汇聚端一直显示本机在线，再邀请这台手机也不会有响应。
+        // stopService 会走 CaptureService.onDestroy → stopCapture → 先发 CONN-BYE 再关 socket，
+        // 且这里是"停止服务"，不受 Android 12+ 后台启动限制；转屏重建（isChangingConfigurations）
+        // 不打断采集；划掉任务另有 CaptureService.onTaskRemoved() + manifest stopWithTask 兜底。
+        if (isFinishing() && !isChangingConfigurations()) {
+            stopService(new Intent(this, CaptureService.class));
+        }
         poller.removeCallbacksAndMessages(null);
         if (discovery != null) discovery.stop();
         InviteListener.get().stop();

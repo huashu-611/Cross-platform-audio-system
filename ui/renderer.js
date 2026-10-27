@@ -735,8 +735,15 @@ function renderPeers (container, state) {
     el.querySelector('.name').appendChild(document.createTextNode(p.name || ''))
     el.querySelector('.db').textContent = role
     el.querySelector('.ask').textContent = p.ip + ':' + p.audioPort
-    el.querySelector('.go').addEventListener('click', () =>
-      window.hub.invitePeer({ ip: p.ip, audioPort: p.audioPort }))
+    el.querySelector('.go').addEventListener('click', async () => {
+      const res = await window.hub.invitePeer({ ip: p.ip, audioPort: p.audioPort })
+      if (res && res.ok) {
+        watchInvite(p.ip, p.name)
+        showNotice('已邀请 ' + (p.name || p.ip) + '，等待对方确认…')
+      } else {
+        showNotice('邀请发送失败：音频核心没有响应')
+      }
+    })
     container.appendChild(el)
   }
 }
@@ -801,15 +808,62 @@ function checkNewSources (state) {
   knownSourceIds = ids
 }
 
+// ---- 邀请反馈：发出邀请后 6 秒没回应，明确告诉用户原因 ----
+//
+// 以前点"邀请"之后界面什么都不说：对方 App 没开、不在同一网络、或者
+// 邀请帧丢了，用户都只能干等，然后怀疑"是不是没发出去"。v1.7 起给每次
+// 邀请挂一个 6 秒计时：期间对方开始推流就算成功，超时就在横幅里说明。
+const INVITE_WAIT_MS = 6000
+const invitesWaiting = new Map()   // ip -> { name, until }
+
+function watchInvite (ip, name) {
+  if (!ip) return
+  invitesWaiting.set(ip, { name: name || ip, until: Date.now() + INVITE_WAIT_MS })
+}
+
+function checkInvites (state) {
+  if (invitesWaiting.size === 0) return
+  const now = Date.now()
+  const sources = Array.isArray(state.sources) ? state.sources : []
+  for (const [ip, w] of invitesWaiting) {
+    if (sources.some((s) => s && s.confirmed && s.peerIp === ip)) {
+      invitesWaiting.delete(ip)   // 对方已经开始推流，接入提示由 checkNewSources 负责
+      continue
+    }
+    if (now >= w.until) {
+      invitesWaiting.delete(ip)
+      showNotice('邀请 ' + w.name + ' 无响应：确认对方 App 在前台、且与电脑在同一网络')
+    }
+  }
+}
+
+// ---- 设备离线提示：手机退出后界面要"跟着退"，不能只剩一个僵住的节点 ----
+//
+// v1.7 起 hub 的在线判定只认实时证据（流 / 发现广播 / 10s 内的 GRAPH，BYE 立刻失效），
+// 这里负责在"刚掉线"的这一刻给一条提示，让用户知道桌面已经感知到手机退出了。
+let knownOnlineIds = new Set()
+
+function checkOfflineDevices (graph) {
+  const ids = new Set()
+  for (const n of graph.nodes) {
+    if (n.isSelf) continue
+    if (n.online) ids.add(n.id)
+    else if (knownOnlineIds.has(n.id)) showNotice((n.name || n.ip) + ' 已离线')
+  }
+  knownOnlineIds = ids
+}
+
 // ============================================================ 主刷新
 
 function render (state) {
   if (!state || typeof state !== 'object') return
   lastState = state
   checkNewSources(state)
+  checkInvites(state)
 
   const graph = collectGraph(state)
   checkSwitchSync(graph)
+  checkOfflineDevices(graph)
 
   const b = $('banner')
   if (b) {
@@ -866,13 +920,26 @@ function render (state) {
 
   const statsEl = $('stats')
   if (statsEl) {
+    // 流健康度：卡顿时看这三项——欠载（真的没数据）、迟到/溢出（网络抖/追帧）
+    const srcList = Array.isArray(state.sources) ? state.sources : []
+    let underrun = 0
+    let lateLost = 0
+    for (const s of srcList) {
+      if (!s) continue
+      underrun += Number.isFinite(s.underrun) ? s.underrun : 0
+      lateLost += (Number.isFinite(s.late) ? s.late : 0) + (Number.isFinite(s.lost) ? s.lost : 0)
+    }
     statsEl.innerHTML =
       '<span>设备 <b>' + graph.nodes.length + '</b> 台</span>' +
       (graph.hasGraph ? '<span>图谱 <b>v' + graph.version + '</b></span>' : '') +
       '<span>总线 <b>' + dbText(state.busLevel) + '</b></span>' +
       '<span>码率 <b>' + fmtNumber(state.kbps, 0) + '</b> kbps</span>' +
       '<span>坏包 <b>' + (Number.isFinite(state.malformed) ? state.malformed : 0) + '</b></span>' +
-      '<span>渲染欠载 <b>' + (Number.isFinite(state.renderUnderruns) ? state.renderUnderruns : 0) + '</b></span>'
+      '<span>渲染欠载 <b>' + (Number.isFinite(state.renderUnderruns) ? state.renderUnderruns : 0) + '</b></span>' +
+      (srcList.length > 0
+        ? '<span>流欠载 <b>' + underrun + '</b> 帧</span>' +
+          '<span>迟到/溢出 <b>' + lateLost + '</b></span>'
+        : '')
   }
 }
 
@@ -940,6 +1007,7 @@ $('manualInviteBtn').addEventListener('click', async () => {
   if (res && res.ok) {
     hint.className = 'hint ok'
     hint.textContent = '已向 ' + ip + ':' + port + ' 发出邀请，等对方确认'
+    watchInvite(ip, ip)
   } else {
     hint.className = 'hint warn'
     hint.textContent = '邀请发送失败：地址格式不对或音频核心没响应'
@@ -967,7 +1035,13 @@ $('ctrlInviteBtn').addEventListener('click', async () => {
     ip = raw.slice(0, colon)
     port = parseInt(raw.slice(colon + 1), 10) || 47000
   }
-  await window.hub.invitePeer({ ip, audioPort: port })
+  const res = await window.hub.invitePeer({ ip, audioPort: port })
+  if (res && res.ok) {
+    watchInvite(ip, ip)
+    showNotice('已邀请 ' + ip + '，等待对方确认…')
+  } else {
+    showNotice('邀请发送失败：音频核心没有响应')
+  }
 })
 
 $('leaveBtn').addEventListener('click', async () => {

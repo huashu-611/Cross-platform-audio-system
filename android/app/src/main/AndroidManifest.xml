@@ -39,7 +39,8 @@
         <service
             android:name=".CaptureService"
             android:exported="false"
-            android:foregroundServiceType="mediaProjection" />
+            android:foregroundServiceType="mediaProjection"
+            android:stopWithTask="true" />
 
         <!-- 接收方模式：手机作为汇聚端播放收到的音频 -->
         <service

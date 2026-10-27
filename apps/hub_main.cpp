@@ -117,8 +117,7 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
 // 只放在 hub_main 里：HubCore 保持平台无关，不依赖 JSON。
 std::string GraphStateJson(const audiohub::HubCore& hub,
                            const std::vector<audiohub::SourceInfo>& sources,
-                           const std::vector<audiohub::Peer>& discovered,
-                           const std::vector<audiohub::Peer>& session_peers) {
+                           const std::vector<audiohub::Peer>& discovered) {
   const audiohub::GraphState g = hub.Graph();
   const audiohub::PlacementState placement = hub.Placements();
   const std::string self_id = hub.graph_self_id();
@@ -135,19 +134,15 @@ std::string GraphStateJson(const audiohub::HubCore& hub,
     const size_t colon = n.id.rfind(':');
     const std::string ip = colon == std::string::npos ? n.id : n.id.substr(0, colon);
 
-    // 活标志：本机恒在线；否则看音频流/会话关系表/发现列表/10s 内的 GRAPH（协议 §8）
+    // 活标志：本机恒在线；否则看音频流/发现列表/10s 内的 GRAPH（协议 §8）。
+    //
+    // v1.7 起不再看 session_peers：那是"连过"的历史表，以前只进不出，
+    // 手机 App 都退了它还在，界面就永远显示在线，右键邀请过去也没人接。
+    // 判活只认三类实时证据，任何一类断了就如实变离线。
     bool online = (n.id == self_id);
     if (!online) {
       for (const auto& s : sources) {
         if (s.peer_ip == ip) {
-          online = true;
-          break;
-        }
-      }
-    }
-    if (!online) {
-      for (const auto& p : session_peers) {
-        if (p.ip == ip) {
           online = true;
           break;
         }
@@ -362,12 +357,16 @@ int main(int argc, char** argv) {
                              << ",\"peerName\":\"" << audiohub::JsonEscape(s.peer_name) << "\""
                              << ",\"peerIp\":\"" << audiohub::JsonEscape(s.peer_ip) << "\""
                              << ",\"occupancy\":" << s.occupancy_ms
-                             << ",\"packets\":" << s.packets
+                             << ",\"target\":" << s.target_ms
+                              << ",\"catchup\":" << s.catchup_count
+                              << ",\"late\":" << s.late_packets
+                              << ",\"lost\":" << s.lost_packets
+                              << ",\"packets\":" << s.packets
                              << ",\"underrun\":" << s.underrun_frames
                              << ",\"overflow\":" << s.overflow_packets << "}";
                          }
                          o << "],\"graph\":"
-                           << GraphStateJson(hub, sources, discovered, session_peers) << "}";
+                           << GraphStateJson(hub, sources, discovered) << "}";
                          return o.str();
                        }
 
@@ -492,8 +491,7 @@ int main(int argc, char** argv) {
                           }
                           std::ostringstream o;
                           o << "{\"ok\":true,\"graph\":"
-                            << GraphStateJson(hub, hub.Sources(), hub.DiscoveredPeers(),
-                                              hub.SessionPeers())
+                            << GraphStateJson(hub, hub.Sources(), hub.DiscoveredPeers())
                             << "}";
                           return o.str();
                         }
@@ -635,10 +633,15 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(stats.malformed_packets));
 
     for (const auto& s : sources) {
-      std::printf("   %-14s 水位 %4d ms | 电平 %6.1f dBFS | 增益 %.2f | %s%s\n",
+      // 自适应缓冲的调节过程也打出来：用户报"卡顿"时先看这行——
+      // 是目标延迟在涨（网络在抖）、欠载在增加（真的断流），还是发生了保命丢帧。
+      std::printf("   %-14s 水位 %4d ms | 目标 %4d ms | 欠载 %llu 帧 | 迟到 %llu | "
+                  "溢出 %llu | 保命丢帧 %d 次 | 电平 %6.1f dBFS\n",
                   s.peer_name.empty() ? ("流 " + std::to_string(s.id)).c_str() : s.peer_name.c_str(),
-                  s.occupancy_ms, s.level_dbfs, s.gain, s.confirmed ? "" : "待确认 ",
-                  s.muted ? "已静音" : "");
+                  s.occupancy_ms, s.target_ms,
+                  static_cast<unsigned long long>(s.underrun_frames),
+                  static_cast<unsigned long long>(s.late_packets),
+                  static_cast<unsigned long long>(s.lost_packets), s.catchup_count, s.level_dbfs);
     }
 
     const auto pending = hub.PendingConnections();
