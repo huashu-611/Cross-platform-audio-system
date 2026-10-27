@@ -201,6 +201,28 @@ async function clickAt(cdp, x, y) {
   await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 });
 }
 
+// 右键：Chromium 会把 button:'right' 的按下/抬起派发成 contextmenu（scene3d 的 onContextMenu）。
+async function rightClickAt(cdp, x, y) {
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, buttons: 0 });
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'right', buttons: 2, clickCount: 1 });
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'right', buttons: 0, clickCount: 1 });
+}
+
+// 节点右键菜单（#ctxMenu）当前是否可见
+async function menuShown(cdp) {
+  return (await cdp.eval(
+    "document.querySelector('#ctxMenu') && document.querySelector('#ctxMenu').style.display !== 'none'")) === true;
+}
+
+// 点菜单里文字包含 text 的按钮（返回 'clicked' | 'disabled' | 'missing' | 'no-menu'）
+async function clickMenuText(cdp, text) {
+  return cdp.eval(
+    "(function(){var el=document.querySelector('#ctxMenu');if(!el)return 'no-menu';" +
+    "var bs=[].slice.call(el.querySelectorAll('button'));" +
+    "for(var i=0;i<bs.length;i++){if(bs[i].textContent.indexOf(" + JSON.stringify(text) + ")>=0){" +
+    "if(bs[i].disabled)return 'disabled';bs[i].click();return 'clicked';}}return 'missing';})()");
+}
+
 // 拖动（轨道相机 / 拖节点）：中间补几帧 mouseMoved，canvas 的 drag.moved 才会置真。
 async function dragAt(cdp, x1, y1, x2, y2) {
   await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: x1, y: y1, buttons: 0 });
@@ -472,23 +494,48 @@ async function main() {
       check(!!echo, 'placement survives the /api/state poll (node stays where it was dropped)');
     }
 
-    // Click the second node -> action bar appears. 坐标来自 3D 投影，点击走 canvas 拾取。
+    // v1.5 交互（用户定案）：左键只负责拖动；切换汇聚端 / 位置复位都走右键菜单。
+    // 坐标来自 3D 投影，点击走 canvas 拾取。
     const fakeNs = await waitNodeScreen(cdp, FAKE_ID, 5000);
     check(Number.isFinite(fakeNs.clientX) && Number.isFinite(fakeNs.clientY), 'second node has 3D-projected screen coords');
-    await clickAt(cdp, fakeNs.clientX, fakeNs.clientY);
-    snap = await waitDebug(cdp, (s) => s.selected === FAKE_ID, 3000, 'node selection');
-    const actionVisible = await cdp.eval(
-      "document.querySelector('#graphAction') && document.querySelector('#graphAction').style.display !== 'none'");
-    check(actionVisible === true, 'switch action bar appears after node click');
-    const actionText = await cdp.eval("document.querySelector('#actionText').textContent");
-    check(typeof actionText === 'string' && actionText.indexOf(FAKE_NAME) >= 0,
-      'action text names the target device');
 
-    // Press "switch": hub must move to the fake node and the UI must confirm sync.
-    check((await cdp.eval("document.querySelector('#actionSwitch').click(); 'clicked'")) === 'clicked',
-      'switch button is clickable');
+    // 左键单击：不选中、不弹菜单（单击不再有任何动作）
+    await clickAt(cdp, fakeNs.clientX, fakeNs.clientY);
+    await sleep(300);
+    snap = JSON.parse(await cdp.eval('JSON.stringify(window.__hubDebug())'));
+    check(snap.selected === null && (await menuShown(cdp)) === false,
+      'left click no longer selects a node or opens a bar/menu');
+
+    // 右键 → 菜单（标题 + 切换 + 复位；该节点刚被拖过，所以有"位置复位"）
+    await rightClickAt(cdp, fakeNs.clientX, fakeNs.clientY);
+    let menuOpen = false;
+    for (let i = 0; i < 20 && !menuOpen; i++) { menuOpen = await menuShown(cdp); if (!menuOpen) await sleep(60); }
+    check(menuOpen === true, 'right click opens the node context menu');
+    const menuTitle = await cdp.eval("(document.querySelector('#ctxMenu .ctxtitle')||{}).textContent || ''");
+    check(typeof menuTitle === 'string' && menuTitle.indexOf(FAKE_NAME) >= 0,
+      'context menu names the target device (' + JSON.stringify(menuTitle) + ')');
+    check((await clickMenuText(cdp, '位置复位')) === 'clicked', 'context menu offers 位置复位 for a dragged node');
+    let unplaced = null;
+    for (let i = 0; i < 25 && !unplaced; i++) {
+      const st = await hubState();
+      const node = st && st.graph && (st.graph.nodes || []).find((n) => n.id === FAKE_ID);
+      if (node && node.posSet === false) unplaced = node;
+      else await sleep(160);
+    }
+    check(!!unplaced, '菜单"位置复位" clears the POS placement in the hub graph');
+    check((await menuShown(cdp)) === false, 'context menu closes after choosing an item');
+
+    // 右键 → "切换汇聚端到此设备"
+    const fakeNs2 = await waitNodeScreen(cdp, FAKE_ID, 3000);
+    await rightClickAt(cdp, fakeNs2.clientX, fakeNs2.clientY);
+    let menuOpen2 = false;
+    for (let i = 0; i < 20 && !menuOpen2; i++) { menuOpen2 = await menuShown(cdp); if (!menuOpen2) await sleep(60); }
+    check(menuOpen2 === true, 'context menu reopens for the hub switch');
+    check((await clickMenuText(cdp, '切换汇聚端')) === 'clicked',
+      'context menu offers switching the hub to the target');
     snap = await waitDebug(cdp, (s) => s.hubId === FAKE_ID, 6000, 'hub switch applied in UI state');
-    check(snap.hubId === FAKE_ID, 'UI state hubId moves to the clicked device');
+    check(snap.hubId === FAKE_ID, 'UI state hubId moves to the right-clicked device');
+    check((await menuShown(cdp)) === false, 'context menu hides after switching');
     // 切 hub 后布局动画 250ms：新 hub 大球回到屏幕中心，旧 hub 回到环上（3D 坐标）。
     snap = await waitDebug(cdp, (s) => s.scene && s.scene.hubScreen &&
       Math.abs(s.scene.hubScreen.sx - 460) <= 2 && Math.abs(s.scene.hubScreen.sy - 208) <= 2 &&
@@ -512,18 +559,19 @@ async function main() {
     check(typeof syncText === 'string' && syncText.indexOf('同步') >= 0,
       'UI shows sync feedback after switch (' + JSON.stringify(syncText) + ')');
 
-    // Switch back to this PC (restores hub role; also tests the reverse direction).
-    snap = await cdp.eval("JSON.stringify(window.__hubDebug())").then(JSON.parse);
+    // 右键本机节点 → 切回来（反向验证）
+    snap = JSON.parse(await cdp.eval('JSON.stringify(window.__hubDebug())'));
     await sleep(400);   // 等上一次切 hub 的 250ms 布局插值落位，点到的才是最终位置
     const selfNs = await waitNodeScreen(cdp, snap.selfId, 3000);
-    await clickAt(cdp, selfNs.clientX, selfNs.clientY);
-    await waitDebug(cdp, (s) => s.selected === snap.selfId, 3000, 'self node selected');
-    await cdp.eval("document.querySelector('#actionSwitch').click(); 'clicked'");
+    await rightClickAt(cdp, selfNs.clientX, selfNs.clientY);
+    let menuOpen3 = false;
+    for (let i = 0; i < 20 && !menuOpen3; i++) { menuOpen3 = await menuShown(cdp); if (!menuOpen3) await sleep(60); }
+    check(menuOpen3 === true, 'context menu opens on this PC node');
+    check((await clickMenuText(cdp, '切换汇聚端')) === 'clicked',
+      'context menu can switch the hub back to this PC');
     snap = await waitDebug(cdp, (s) => s.hubId === s.selfId, 6000, 'hub restored to this PC');
     check(snap.hubId === snap.selfId, 'switching back to this PC restores hub role');
-    const barHidden = await cdp.eval(
-      "document.querySelector('#graphAction') && document.querySelector('#graphAction').style.display === 'none'");
-    check(barHidden === true, 'action bar hides after switching');
+    check((await menuShown(cdp)) === false, 'context menu hides after switching back');
 
     // Cleanup: "断开全部" clears the session graph back to this node only.
     // 「全部断开」从控制屏底部的"会话"卡片挪到了头部右侧：它必须只在控制界面出现。

@@ -2,21 +2,22 @@
 //
 //   连接界面 —— 建立连接（设备列表 / 待确认请求）
 //   控制界面 —— 全网图谱（协议 §9）：节点 = 图谱里的所有设备；
-//               汇聚端大球在中心，本机/离线有角标；点非汇聚端节点可把汇聚端切过去。
+//               汇聚端大球在中心，本机/离线有角标；拖动摆位（左键），
+//               右键节点弹菜单：切换汇聚端 / 音量与静音 / 位置复位。
 //
 // 界面切换：图谱节点数 >= 2（网络已形成）或本机有音频流 → 控制界面。
 // 角色不在这里"猜"：state.graph 说了算，本层不调 setRole（旧接口已废弃）。
 // 本文件必须容忍 graph 缺失 / 字段缺失（旧后端、启动瞬间）：退化成用 sources 拼图，不白屏。
 
 let screen = 'connect'          // 'connect' | 'control'
-let selected = null             // 被点选的节点 { nodeId } 或 null
+let selected = null             // 展开音量面板的节点 { nodeId } 或 null
 let lastState = null
 let autoTouched = false
 let volDragging = false
+let menuNodeId = null           // 右键菜单当前指向的节点（图谱里消失时收起菜单）
 
 // 切换汇聚端的交互状态
 let pendingSwitch = null        // { nodeId, fromVersion, timer }：等新图谱确认
-let action = null               // { mode: 'switch'|'hub', nodeId }
 let syncText = ''
 let syncTone = ''               // '' | 'ok' | 'warn'
 
@@ -196,11 +197,11 @@ function collectGraph (state) {
   }
 }
 
-// 该节点对应的音频流 id（0 = 没有流）。优先用后端图谱给的 streamId，
-// 旧后端时退回 sources（按 IP / 名字匹配）。
-function streamIdForNode (node, state) {
+// 该节点是否真的有一路音频在流（0 = 没有）。按 IP / 名字匹配 sources 里 confirmed 的源。
+// 注意：图谱节点自带的 streamId 是"排位号"（hub 按节点 id 排序算出来的），不等于音频流 id，
+// 所以只有这里匹配不到时才退回排位号（见 streamIdForNode）。
+function liveStreamId (node, state) {
   if (!node || node.ghost) return 0
-  if (Number.isInteger(node.streamId) && node.streamId > 0) return node.streamId
   const sources = state && Array.isArray(state.sources) ? state.sources : []
   if (node.ip) {
     const byIp = sources.find((s) => s && s.confirmed && s.peerIp === node.ip)
@@ -210,6 +211,15 @@ function streamIdForNode (node, state) {
     const byName = sources.find((s) => s && s.confirmed && s.peerName === node.name)
     if (byName && Number.isInteger(byName.id) && byName.id > 0) return byName.id
   }
+  return 0
+}
+
+// 该节点对应的音频流 id（0 = 没有流）。优先用真正在流的源，其次退回图谱排位号，
+// 旧后端时再退回 sources（按 IP / 名字匹配）——音量命令对离线节点会被内核忽略。
+function streamIdForNode (node, state) {
+  const live = liveStreamId(node, state)
+  if (live) return live
+  if (node && !node.ghost && Number.isInteger(node.streamId) && node.streamId > 0) return node.streamId
   return 0
 }
 
@@ -230,7 +240,7 @@ function displayLevel (state, node) {
 function hasFlow (state, node) {
   if (!node || node.ghost) return false
   if (node.isSelf) return !!(state && state.pcSource)
-  return streamIdForNode(node, state) > 0
+  return liveStreamId(node, state) > 0
 }
 
 // ============================================================ 网络图（3D 场景）
@@ -239,12 +249,12 @@ function hasFlow (state, node) {
 // 不引依赖；为什么不用 WebGL 见 docs/3D-...方案.md §2.1.1 与 ui/scene3d.js 头注释）。
 //   - v1.3 物理房间模型：听者固定在原点朝 -Z，声源在地面自由摆位（没摆过的设备落在
 //     预计算散点槽位，距离 0.85–2.2 m，按设备 id 持久化）；球的屏幕大小随距离缩放（近大远小），
-//     与音量衰减同向；名称行同时显示 "x.xx m"，双击切换汇聚端、拖动自由摆位；
+//     与音量衰减同向；名称行同时显示 "x.xx m"，拖动自由摆位（左键）；
 //   - v1.4 摆位全网同步：拖完的落点写进本机内核图谱，由 POS 帧广播给所有电脑/手机
 //     （GRAPH-PROTOCOL §13）；别的电脑拖动时本机轮询到新坐标后会平滑跟过去。
 //   - hub 永远在原点 → 投影恒为屏幕 (460,208)，与旧中心完全一致；
-//   - 交互（点选 / 切换 / 音量面板 / 操作条 / 同步状态）全部留在本文件，
-//     scene 只负责绘制与"拾取后回调"，回调仍走 onNodeClick 旧路径。
+//   - v1.5 交互：左键只拖动（摆位 / 轨道旋转）；右键节点弹菜单（切换汇聚端 / 音量与静音 /
+//     位置复位），菜单 UI 与同步状态都在本文件，scene 只负责绘制与"右键 → onMenu"回调。
 // scene3d.js 缺失（旧包 / 加载失败）时静默降级：图谱区空白，其他界面照常可用。
 
 let scene = null
@@ -275,11 +285,10 @@ function ensureScene () {
   try {
     scene = api.create({
       canvas: canvas,
-      onSelect: (nodeId) => onNodeClick(nodeId),
-      onActivate: (nodeId) => onNodeActivate(nodeId),
+      // 右键节点 → 菜单（切换汇聚端 / 音量与静音 / 位置复位）；点空白收起菜单。
+      onMenu: (nodeId, clientX, clientY) => openNodeMenu(nodeId, clientX, clientY),
       // 拖完：先写内核图谱（跨设备同步），再推一次空间音频（不等 50 ms tick）
-      onDragEnd: (nodeId, pos) => { applyPlacement(nodeId, pos); pumpSpatial() },
-      onClearPlacement: (nodeId) => { clearPlacement(nodeId); pumpSpatial() }
+      onDragEnd: (nodeId, pos) => { applyPlacement(nodeId, pos); pumpSpatial() }
     })
   } catch (err) {
     sceneBroken = true
@@ -441,95 +450,121 @@ function renderGraph (state, graph) {
 
 // ============================================================ 图谱交互
 
-function onNodeClick (nodeId) {
-  const state = lastState
-  if (!state || !nodeId) return
-  const graph = collectGraph(state)
-  const node = graph.nodes.find((n) => n.id === nodeId)
-  if (!node) return
-  selected = { nodeId: node.id }
-  refreshScene(state, graph)
+// ============================================================ 图谱交互：左键拖动 / 右键菜单
+//
+// 用户定案（2026-10-27）：左键只负责拖动 —— 节点上拖=摆位，空白处拖=轨道旋转；
+// 单击不选中、不弹条，双击不再有任何动作。切换汇聚端 / 音量 / 位置复位都在右键菜单：
+//   ① 切换汇聚端到此设备（非汇聚端节点；离线也可切换，与旧操作条语义一致）
+//   ② 音量与静音（有音频流的源 / 本机 PC 音源 / 本机 hub 的总音量）
+//   ③ 位置复位（只在该节点被显式摆位过时出现；清掉全网摆位后回到自动槽位）
+// 菜单是 fixed 浮层，跟随鼠标并夹在视口内；Esc / 点菜单外 / 节点消失都会收起。
 
-  if (node.isHub) {
-    // 点汇聚端：只显示信息，不提供切换
-    showHubAction(node, graph)
-    if (graph.isHubSelf) showVolumePanel(state, graph, node)
-    else hideVolumePanel()
-    return
+function menuItem (label, hint, disabled, onClick) {
+  const btn = document.createElement('button')
+  btn.type = 'button'
+  const t = document.createElement('span')
+  t.textContent = label
+  btn.appendChild(t)
+  if (hint) {
+    const h = document.createElement('span')
+    h.className = 'h'
+    h.textContent = hint
+    btn.appendChild(h)
   }
-
-  if (graph.hasGraph) showSwitchAction(node, graph)
-  else hideActionBar()
-
-  const streamId = streamIdForNode(node, state)
-  if (streamId || (node.isSelf && state.pcSource)) showVolumePanel(state, graph, node)
-  else hideVolumePanel()
-}
-
-// 双击节点（scene 回调）：等同于"点一下 → 点操作条里的确认"。
-// 非汇聚端且已有待切换操作条时直接切；否则退化为一次普通点选，不改变任何语义。
-function onNodeActivate (nodeId) {
-  const state = lastState
-  if (!state || !nodeId) return
-  const graph = collectGraph(state)
-  const node = graph.nodes.find((n) => n.id === nodeId)
-  if (!node || node.isHub) return
-  onNodeClick(node.id)
-  if (action && action.mode === 'switch' && action.nodeId === node.id) doSwitch()
-}
-
-function showActionBar (parts, okText, cancelText) {
-  const bar = $('graphAction')
-  const textEl = $('actionText')
-  const okBtn = $('actionSwitch')
-  const cancelBtn = $('actionCancel')
-  if (!bar || !textEl || !okBtn || !cancelBtn) return
-  textEl.textContent = ''
-  for (const p of parts) {
-    if (typeof p === 'string' || typeof p === 'number') {
-      textEl.appendChild(document.createTextNode(String(p)))
-    } else if (p) {
-      const span = document.createElement('span')
-      span.className = p.cls || ''
-      span.textContent = p.text
-      textEl.appendChild(span)
-    }
-  }
-  if (okText) {
-    okBtn.style.display = ''
-    okBtn.textContent = okText
+  if (disabled) {
+    btn.disabled = true
   } else {
-    okBtn.style.display = 'none'
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation()
+      hideNodeMenu({ quiet: true })
+      onClick()
+    })
   }
-  cancelBtn.textContent = cancelText || '取消'
-  bar.style.display = ''
+  return btn
 }
 
-function hideActionBar () {
-  const bar = $('graphAction')
-  if (bar) bar.style.display = 'none'
-  const okBtn = $('actionSwitch')
-  if (okBtn) okBtn.style.display = 'none'
-  action = null
+// 菜单出现在鼠标处，右下越界就翻到左侧/上方（贴着视口边）
+function placeNodeMenu (el, clientX, clientY) {
+  const pad = 8
+  el.style.left = '0px'
+  el.style.top = '0px'
+  const w = el.offsetWidth || 210
+  const h = el.offsetHeight || 96
+  const vw = window.innerWidth || document.documentElement.clientWidth || 1280
+  const vh = window.innerHeight || document.documentElement.clientHeight || 800
+  el.style.left = Math.max(pad, Math.min(clientX, vw - w - pad)) + 'px'
+  el.style.top = Math.max(pad, Math.min(clientY, vh - h - pad)) + 'px'
 }
 
-function showSwitchAction (node, graph) {
-  action = { mode: 'switch', nodeId: node.id }
-  const parts = []
-  if (!node.online) parts.push({ text: '该设备当前离线。', cls: 'warn' })
-  parts.push('把汇聚端切到 ' + node.name + '？')
-  if (node.isSelf) parts.push('（本机将负责收流 / 混音 / 播放）')
-  showActionBar(parts, '切换', '取消')
+function openNodeMenu (nodeId, clientX, clientY) {
+  const el = $('ctxMenu')
+  if (!el) return
+  const state = lastState
+  if (!state || !nodeId) { hideNodeMenu(); return }
+  const graph = collectGraph(state)
+  const node = graph.nodes.find((n) => n.id === nodeId)
+  if (!node) { hideNodeMenu(); return }
+
+  menuNodeId = node.id
+  el.textContent = ''
+
+  const title = document.createElement('div')
+  title.className = 'ctxtitle'
+  title.textContent = node.name +
+    (node.isHub ? ' · 当前汇聚端' : '') +
+    (node.isSelf ? ' · 本机' : (node.online ? '' : ' · 离线'))
+  title.title = node.ip ? (node.ip + (node.audioPort ? ':' + node.audioPort : '')) : ''
+  el.appendChild(title)
+
+  // ① 切换汇聚端
+  if (node.isHub) {
+    el.appendChild(menuItem('切换汇聚端到此设备', '它已经是汇聚端', true, null))
+  } else {
+    let hint = ''
+    if (node.isSelf) hint = '本机将负责收流 / 混音 / 播放'
+    else if (!node.online) hint = '该设备当前离线'
+    el.appendChild(menuItem('切换汇聚端到此设备', hint, false, () => doSwitchTo(node, graph)))
+  }
+
+  // ② 音量与静音（只在真有音频流时出现：图谱里没在流的离线设备没有可调的流）
+  const liveStream = liveStreamId(node, state)
+  const hasAudio = node.isHub
+    ? !!graph.isHubSelf
+    : (liveStream > 0 || (node.isSelf && !!state.pcSource))
+  if (hasAudio) {
+    let hint = ''
+    if (node.isHub) hint = '汇聚端总音量'
+    else if (!liveStream) hint = '音量由汇聚端调节'
+    el.appendChild(menuItem('音量与静音', hint, false, () => {
+      selected = { nodeId: node.id }
+      refreshScene(state, graph)
+      showVolumePanel(state, graph, node)
+    }))
+  }
+
+  // ③ 位置复位（只对显式摆位过的节点出现）
+  if (node.posSet) {
+    el.appendChild(menuItem('位置复位', '回到自动排位（全网同步）', false, () => {
+      clearPlacement(node.id)
+      pumpSpatial()
+    }))
+  }
+
+  el.style.display = ''
+  placeNodeMenu(el, clientX, clientY)
 }
 
-function showHubAction (node, graph) {
-  action = { mode: 'hub', nodeId: node.id }
-  const info = []
-  if (node.ip) info.push(node.ip + (node.audioPort ? ':' + node.audioPort : ''))
-  info.push(node.online ? '在线' : '离线')
-  info.push('图谱 v' + (graph.version || 0))
-  if (node.isSelf) info.push('本机')
-  showActionBar(['当前汇聚端：' + node.name + ' · ' + info.join(' · ')], null, '关闭')
+// 收起菜单。quiet=true 用于"切屏/清会话"等状态路径：只关菜单，不重复重绘。
+function hideNodeMenu (opts) {
+  const el = $('ctxMenu')
+  if (el) el.style.display = 'none'
+  menuNodeId = null
+  const had = !!selected
+  selected = null
+  if (!had) return
+  if (opts && opts.quiet) return
+  hideVolumePanel()
+  if (lastState) refreshScene(lastState, collectGraph(lastState))
 }
 
 // 切换后的同步状态提示
@@ -559,12 +594,10 @@ function checkSwitchSync (graph) {
   }
 }
 
-async function doSwitch () {
-  if (!action || action.mode !== 'switch' || !action.nodeId) return
-  const nodeId = action.nodeId
-  const before = lastState ? collectGraph(lastState) : null
-  const fromVersion = before ? before.version : 0
-  hideActionBar()
+async function doSwitchTo (node, graph) {
+  if (!node || node.isHub) return
+  const nodeId = node.id
+  const fromVersion = graph ? graph.version : (lastState ? collectGraph(lastState).version : 0)
   pendingSwitch = { nodeId: nodeId, fromVersion: fromVersion, timer: null }
   setSync('已切换，正在同步…', '')
   // 兜底：6 秒还没等到新图谱就说明同步没成
@@ -703,10 +736,16 @@ $('volMute').addEventListener('click', () => {
   window.hub.setSource(streamId, { muted: !node.muted })
 })
 
-$('actionSwitch').addEventListener('click', () => { doSwitch() })
-$('actionCancel').addEventListener('click', () => {
-  hideActionBar()
+// 菜单的全局收起：Esc，或点到菜单/音量面板以外的任何地方
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape') hideNodeMenu()
 })
+document.addEventListener('mousedown', (ev) => {
+  const menu = $('ctxMenu')
+  const panel = $('volumePanel')
+  if ((menu && menu.contains(ev.target)) || (panel && panel.contains(ev.target))) return
+  hideNodeMenu()
+}, true)
 
 // ============================================================ 汇聚端信息条
 
@@ -916,8 +955,7 @@ function render (state) {
   // 自动切换屏幕：有图谱网络 / 本机有流 → 控制；否则 → 连接
   const next = anyConnection ? 'control' : 'connect'
   if (next !== screen) {
-    selected = null
-    hideActionBar()
+    hideNodeMenu({ quiet: true })
     hideVolumePanel()
     graphBuiltSig = ''
     showScreen(next)
@@ -934,11 +972,11 @@ function render (state) {
     refreshVolumePanel(state, graph)
   }
 
-  // 回到连接屏 / 选中的节点已从图谱里消失 → 收起操作条与音量面板
+  // 回到连接屏 / 选中的节点已从图谱里消失 / 菜单指向的节点没了 → 收起菜单与音量面板
   const selectionGone = !!selected && !graph.nodes.some((n) => n.id === selected.nodeId)
+  if (menuNodeId && !graph.nodes.some((n) => n.id === menuNodeId)) hideNodeMenu({ quiet: true })
   if (screen === 'connect' || selectionGone) {
-    selected = null
-    hideActionBar()
+    hideNodeMenu({ quiet: true })
     hideVolumePanel()
     if (scene) scene.setDynamic(sceneDynamic(state, graph))
   }
@@ -1063,8 +1101,7 @@ $('leaveBtn').addEventListener('click', async () => {
   }
   // 用户主动"断开所有"：连关系表一起清掉；后端同时把图谱重置为只有本机
   await window.hub.clearSession()
-  selected = null
-  hideActionBar()
+  hideNodeMenu({ quiet: true })
   hideVolumePanel()
   setSync('', '')
 })

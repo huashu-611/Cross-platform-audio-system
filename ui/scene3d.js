@@ -20,6 +20,11 @@
 //     广播给所有电脑/手机 —— 谁拖都算数，位置在全网只有一份（本机 store 只留相机与槽位）；
 //   - 球的屏幕大小 = 透视 × 距离缩放（近大远小），与音量衰减同向；名称行显示 "x.xx m"。
 //
+// v1.5 交互（用户定案，2026-10-27）：
+//   左键只负责拖动 —— 节点上拖=摆位，空白处拖=轨道旋转，单击不选中、不弹条；
+//   右键节点弹菜单（切换汇聚端 / 音量与静音 / 位置复位，菜单 UI 在 renderer.js）；
+//   双击不再触发任何动作（旧"双击切汇聚端"随操作条一起废除）。
+//
 // 相机：绕原点球坐标 (φ, dist, pitch)，默认 φ=0、dist=3.4、pitch=40°，
 // 看向原点；fovY=47.5° → 焦距 focalPx=(460/2)/tan(23.75°)=522.71（与旧 920x460 视口对齐）。
 // 汇聚端永远在原点，因此投影恒为 (460,208)——这正是旧 2D 布局的中心（renderer.js 旧 GRAPH_CX/CY）。
@@ -213,7 +218,7 @@
   // 距离 0.85–2.2 m（前方 ≥1.35 m 防叠 hub 球，后方 ≤1.5 m 防投到屏幕外），
   // 相邻槽位平面距离 ≥0.42 m；按设备 id 持久化（store.slots），增删其他设备不重排。
   // 拖动 = 地面自由摆位（0.45–2.3 m），落点同步进内核图谱（全设备一致）；
-  // 右键 = 清除该设备的全网摆位，退回本机槽位。
+  // 位置复位 = 右键菜单里的一项，清掉全网摆位后退回本机槽位。
   const SLOT_COUNT = 32
 
   // 候选点是否与已占槽位保持 slotGap（米）
@@ -422,10 +427,10 @@
     const ctx = canvas.getContext('2d')
     if (!ctx) throw new Error('Scene3D.create: 2d context unavailable')
 
-    const onSelect = typeof opts.onSelect === 'function' ? opts.onSelect : function () {}
-    const onActivate = typeof opts.onActivate === 'function' ? opts.onActivate : function () {}
+    // 交互分工（v1.5）：左键只负责拖动（节点摆位 / 空白处轨道旋转），
+    // 右键在节点上弹菜单（切换汇聚端 / 音量与静音 / 位置复位），菜单由渲染层实现。
+    const onMenu = typeof opts.onMenu === 'function' ? opts.onMenu : function () {}
     const onDragEnd = typeof opts.onDragEnd === 'function' ? opts.onDragEnd : function () {}
-    const onClearPlacement = typeof opts.onClearPlacement === 'function' ? opts.onClearPlacement : function () {}
 
     const store = loadStore()
     let view = camera(store.cam.yawDeg, store.cam.dist,
@@ -520,7 +525,7 @@
 
       // v1.3：房间槽位（store.slots 持久化，只服务“没摆过”的设备）。先剪掉已不在图中的
       // 设备避免 32 槽位耗尽；新设备取最小空闲槽，按 id 升序分配 → 结果确定。
-      // 显式摆位（图谱 POS 帧）优先于槽位；右键清除摆位后回落到自己的槽位。
+      // 显式摆位（图谱 POS 帧）优先于槽位；菜单里"位置复位"后回落到自己的槽位。
       const present = new Set()
       for (let i = 0; i < othersRaw.length; i++) present.add(othersRaw[i].id)
       let slotsDirty = false
@@ -1229,14 +1234,12 @@
           if (rec) rec.pinned = true
           dirty = true
           onDragEnd(d.id, to)
-        } else if (d.rec) {
-          onSelect(d.rec.id)
         }
+        // 左键不选中：没拖动就是空操作。切换汇聚端 / 音量 / 复位都走右键菜单（见 onMenu）。
         return
       }
-      // orbit：没拖动就是一次普通点选（点球=选中，点空白=什么都不做）
-      if (!d.moved && d.rec) onSelect(d.rec.id)
-      else if (d.moved) saveStore()
+      // orbit：没拖动 = 空操作；只有真的转过视角才需要落盘相机。
+      if (d.moved) saveStore()
     }
 
     function onWheel (ev) {
@@ -1251,26 +1254,12 @@
       dirty = true
     }
 
-    function onDblClick (ev) {
-      const hit = pickAt(ev.clientX, ev.clientY)
-      if (!hit) return
-      ev.preventDefault()
-      onActivate(hit.rec.id)
-    }
-
     function onContextMenu (ev) {
-      const hit = pickAt(ev.clientX, ev.clientY)
-      if (!hit) return
-      const rec = hit.rec
-      if (rec.isHub || rec.ghost) return
       ev.preventDefault()
-      // 右键 = 清除该设备的全网摆位，退回自动槽位（内核回声后其他设备同步回退）
-      const idx = Number.isInteger(store.slots[rec.id]) ? store.slots[rec.id] : 0
-      targetPos.set(rec.id, slotAt(idx).pos.slice())
-      rec.pinned = false
-      applyTargets(new Map(worldPos))
-      dirty = true
-      onClearPlacement(rec.id)
+      if (drag) { drag = null; if (root.document && root.document.body) root.document.body.style.userSelect = '' }
+      const hit = pickAt(ev.clientX, ev.clientY)
+      // 右键 = 节点菜单；点空白只吞掉浏览器默认菜单（不弹自己的）。
+      onMenu(hit ? hit.rec.id : null, ev.clientX, ev.clientY)
     }
 
     function onKeyDown (ev) {
@@ -1299,7 +1288,6 @@
     }
 
     canvas.addEventListener('mousedown', onDown)
-    canvas.addEventListener('dblclick', onDblClick)
     canvas.addEventListener('contextmenu', onContextMenu)
     canvas.addEventListener('wheel', onWheel, { passive: false })
     root.addEventListener('mousemove', onMove)
@@ -1338,7 +1326,6 @@
         if (rafId && root.cancelAnimationFrame) root.cancelAnimationFrame(rafId)
         rafId = 0
         canvas.removeEventListener('mousedown', onDown)
-        canvas.removeEventListener('dblclick', onDblClick)
         canvas.removeEventListener('contextmenu', onContextMenu)
         canvas.removeEventListener('wheel', onWheel)
         root.removeEventListener('mousemove', onMove)

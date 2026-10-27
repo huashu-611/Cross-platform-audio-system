@@ -66,14 +66,12 @@
       <canvas id="graph" width="920" height="460" role="img" aria-label="全网设备图谱（3D）"></canvas>
     </div>
 
-    <!-- 点节点后的操作条：切换汇聚端确认 / 当前汇聚端信息 -->
-    <div id="graphAction" class="actionbar" style="display:none">
-      <span class="acttext" id="actionText">—</span>
-      <button class="actbtn primary" id="actionSwitch">切换</button>
-      <button class="actbtn" id="actionCancel">取消</button>
-    </div>
     <!-- 切换后的同步状态：已切换，正在同步… / 已同步（vN） -->
     <div id="graphStatus" class="graphstatus" style="display:none"></div>
+
+    <!-- 节点右键菜单（左键只拖动；切换汇聚端 / 音量与静音 / 位置复位都在这里）。
+         内容由 renderer.js 动态生成，位置 fixed 跟随鼠标并夹在视口内。 -->
+    <div id="ctxMenu" class="ctxmenu" style="display:none"></div>
 
     <div id="volumePanel" class="volpanel" style="display:none">
       <div class="volname" id="volName">—</div>
