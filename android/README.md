@@ -850,6 +850,64 @@ STOP 里的裸 `stopSelf()` 把 START 连人带义务一起抹掉。
 5. 顺带看这条路径上有没有主线程阻塞（`join` / `sleep` / 同步 IO）——
    它们会吃掉 10 秒额度，让边缘情况变成必现。
 
+## 老是意外断开：图谱广播被 Activity 带走（v0.17）
+
+**症状**：用一阵子就"断一下"——手机明明还在放，汇聚端却把本机判成离线，
+界面弹「xxx 已离线」，严重时直接弹回连接屏。转个屏、切一次后台都可能触发。
+
+**根因**：全网 GRAPH 帧的唯一生产者 `InviteListener` 是 Activity 的子组件，
+它的生命周期被挂在 `MainActivity` 上：
+
+| | 位置 | 问题 |
+| --- | --- | --- |
+| 启动 | `MainActivity.java:241` `onCreate` | 只有 Activity 起来才广播 |
+| 停止 | `MainActivity.java:282` `onDestroy` | **无条件**停，连 `isChangingConfigurations()` 都不判 |
+
+而 `onDestroy` 里的另外两行是有守卫的（`stopService(CaptureService)` 走
+`isFinishing() && !isChangingConfigurations()`），只有 `InviteListener.stop()`
+和 `discovery.stop()` 是无条件的。于是：
+
+    Activity 重建/被回收 → 图谱广播线程停 → 汇聚端 10 秒后（GraphStore.ONLINE_TIMEOUT_MS）
+    graph_peer_last_seen_ms 过期 → nodes[].online = false → renderer 弹「已离线」
+    → 若这台是 hub 或唯一在线 peer，networkUp 变 false → 弹回连接屏
+
+**为什么"重复邀请"的猜测不成立**：`InvitePeer`（C++）只在 `/api/invite` 被调用，
+`ui/main.js:389`/`:701` 与 `ui/renderer.js:1060`/`:1088` 全部是按钮点击；
+手机端 `MainActivity.invitePeer` 也是按钮触发。代码里没有任何周期性或自动重发。
+
+**修法**（两处一起改才完整）：
+
+1. `AndroidManifest.xml` 的 `MainActivity` 加
+   `android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|uiMode|density|fontScale"`
+   —— 转屏/深色模式/字体大小不再重建 Activity。
+2. `MainActivity.onDestroy()` 引入 `final boolean reallyLeaving = isFinishing() && !isChangingConfigurations();`，
+   `InviteListener.get().stop()` 只在 `reallyLeaving` 时执行（原来无条件）。
+
+**顺带修的第二条**：`MainActivity.localIp()` 原来是自己写的一份"返回第一个非回环 IPv4"的简化版，
+与 `Discovery.localIp()` 的完整过滤（wlan/eth/ap/en 优先，跳过 tun/ppp/rmnet/clat、
+169.254./198.18./198.19./100.64./100.65.）不一致。而 `reconcile()` 每 400ms 用它比对
+`GraphStore.selfIp()` —— 网卡枚举顺序一变（插拔热点/VPN/蜂窝唤醒）selfId 就漂移
+→ `streamIdForSelf()` 变 → retarget → 先发 CONN-BYE → 又是一次"莫名断一下"。
+现在 `MainActivity.localIp()` 直接委托 `Discovery.localIp()`。
+
+**实测证据**（模拟器 Pixel，`ps -T` 看线程）：
+
+| | 转屏前 TID | 转屏后 TID | 判定 |
+| --- | --- | --- | --- |
+| v0.16 | 2129 | **2157** | 线程被停又重建 |
+| v0.17 | 2229 | **2229** | 线程未动 |
+
+v0.17 压测 3 轮（转屏 + 切后台 + 回前台），进程 pid 与线程 TID 全程不变。
+
+**回归**：`audioflow-test --rounds 4` 15/15、`ui-e2e` ALL CHECKS PASSED、
+`build.sh` 断言 10970/失败 0/88 用例、`run-jitter-check` T1–T6 全过、
+`run-spatial-check` 23182 项、`run-graphfit-check` 249 项。
+
+**仍未解决的同族问题**：`InviteListener` 仍然挂在 Activity 上。用户按返回键退出后
+广播仍然会停（`isFinishing()` 为真），这在语义上是对的；但如果希望"App 退到后台
+仍保持图谱在线"，需要把 `InviteListener` 挪进 `ReceiverService`/一个独立前台服务。
+这一轮没做，因为还没有明确的用户诉求。
+
 ## 已知限制
 
 - **真机仍未验证，只在模拟器上跑过**。v0.7 已在 Android 14 x86_64 模拟器（WHPX）上走通

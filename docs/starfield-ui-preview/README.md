@@ -1018,3 +1018,70 @@ hub 角色一变又发 STOP，STOP 把 START 连人带义务一起抹掉。
 **仍未验证**：只走到「起前台 + 不崩」，完整的反复切换压力仍需真机复验。
 另外「没连接就进控制台」已被用户确认是**遗留进程**导致，不再是缺陷，
 本条可以关闭。
+
+## 27. 第十七轮（v0.17）：老是意外断开 —— 图谱广播被 Activity 带走
+
+**用户报**（m14732）：「现在出现了新的问题，老是出现意外断开的情况，可能是重复邀请等问题」
+
+**先证伪用户的猜测**：`InvitePeer` 全库只在 `apps/hub_main.cpp` 的 `/api/invite` 被调用，
+上游是 `ui/main.js`（两处 IPC）与 `ui/renderer.js` 的两个按钮点击；手机端
+`MainActivity.invitePeer` 也是按钮触发，还要求 `isLocalHub() && ReceiverService.sRunning`。
+没有任何周期性/自动重发逻辑。**「重复邀请」不成立。**
+
+### 排查路径（顺序很重要）
+
+1. **hub 侧写探针**：`tools/probe-bye-collision.js`、`probe-bye-ip-spoof.js`、
+   `probe-bye-offline.js`、`probe-retarget-bye.js`、`probe-disconnect-storm.js`。
+   逐个验证了「stream_id 撞车」「BYE 冒名误杀」「BYE 导致判离线」「retarget 发 BYE」四条路径。
+   结论：**hub 侧全部排除** —— 掉的只是音频流，下一包立刻重建；节点在线状态完全不受
+   BYE 影响。六轮切换压测里节点在线状态全程稳定。
+2. 探针本身踩了四个坑（都记在这里，省得下次重踩）：
+   - 假手机只收不发 → 永远进不了图谱（`nodes[].online` 需要 IP 已在图谱里）；
+   - 单包 `FRAMES_PER_PACKET = 960`（20ms = 3856 B）**超过 hub 的 `buffer(2048)`**，
+     Windows 下 `ReceiveFrom` 返回 WSAEMSGSIZE 被当 `n <= 0` 静默丢弃 → 必须用
+     `240` 帧（5ms，976 B，对齐 `kFramesPerPacket`）；
+   - `/api/state` 的节点在 **`s.graph.nodes`**，不是顶层 `s.nodes` —— 读错了会得到
+     "永远在线"的假象；
+   - `apps/source_main.cpp` 的控制口是 **UDP** 不是 TCP。
+3. **转向手机端**：查到 `InviteListener`（全网 GRAPH 帧的唯一生产者）全库只有两处生命周期
+   调用，都在 `MainActivity`：`:241` `onCreate` 启动、`:282` `onDestroy` 停止。
+   而 `onDestroy` 里 `stopService(CaptureService)` 有 `isFinishing() && !isChangingConfigurations()`
+   守卫，**`InviteListener.get().stop()` 与 `discovery.stop()` 是无条件的**。
+4. `AndroidManifest.xml` 的 `MainActivity` **没有 `configChanges`** → 转屏/深色模式/
+   字体大小都会重建 Activity → 每转一次屏，图谱广播断一次。
+5. 实证：`adb shell ps -T -p <pid> | grep invite` 看线程 ID。v0.16 转屏前后 TID
+   **2129 → 2157**（线程被停又重建），v0.17 **2229 → 2229**（线程未动）。
+
+### 后果链（为什么用户看到的是"意外断开"）
+
+    Activity 重建/回收 → 图谱广播线程停
+    → 汇聚端 10 秒后（GraphStore.ONLINE_TIMEOUT_MS）graph_peer_last_seen_ms 过期
+    → nodes[].online = false → renderer.checkOfflineDevices 弹「xxx 已离线」
+    → 若这台是 hub 或唯一在线 peer，networkUp 变 false → 弹回连接屏
+
+### 修法
+
+1. manifest 给 `MainActivity` 加 `android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|uiMode|density|fontScale"`。
+2. `MainActivity.onDestroy()` 引入 `final boolean reallyLeaving = isFinishing() && !isChangingConfigurations();`，
+   `InviteListener.get().stop()` 只在 `reallyLeaving` 时执行。
+3. 顺带：`MainActivity.localIp()` 原来是自己写的"返回第一个非回环 IPv4"简化版，
+   与 `Discovery.localIp()` 的完整过滤不一致。`reconcile()` 每 400ms 用它比对
+   `GraphStore.selfIp()`，网卡枚举顺序一变就 selfId 漂移 → `streamIdForSelf()` 变
+   → retarget → 先发 CONN-BYE → 又一次"莫名断一下"。现在直接委托 `Discovery.localIp()`。
+
+### 版本与回归（v0.17）
+
+- `MainActivity.java:159` `BUILD_TAG = "0.17"`、`android/build-apk.sh` `VERSION_CODE=17`/`VERSION_NAME=0.17`；
+  APK 452,695 B，`aapt2` 确认 `versionCode='17' versionName='0.17'`。
+- `audioflow-test --rounds 4` **15/15**、`ui-e2e` **ALL CHECKS PASSED**、
+  `build.sh` **断言 10970 / 失败 0 / 88 用例**、`run-jitter-check` T1–T6 全过、
+  `run-spatial-check` **23182 项**、`run-graphfit-check` **249 项**。
+- v0.17 压测 3 轮（转屏 + HOME + 回前台），进程 pid 与线程 TID 全程不变。
+
+### 留下的尾巴
+
+`InviteListener` 仍然挂在 Activity 上。用户按返回键退出后广播仍会停（`isFinishing()` 为真），
+语义上正确；但若希望"退到后台仍保持图谱在线"，需要把它挪进 `ReceiverService` 或一个
+独立前台服务。这一轮没做，因为没有明确的用户诉求，而且挪动会牵动
+`CaptureService`/`ReceiverService` 的启动顺序（v0.16 刚从这块的坑里出来）。
+

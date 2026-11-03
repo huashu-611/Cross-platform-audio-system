@@ -156,7 +156,7 @@ public class MainActivity extends Activity {
     private static final int COLOR_TEXT_HALO = 0xCC04060F;
 
     /** 构建标记：与 APK versionName 保持一致，用于在手机上确认装的是哪一版。 */
-    private static final String BUILD_TAG = "0.16";
+    private static final String BUILD_TAG = "0.17";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -274,12 +274,21 @@ public class MainActivity extends Activity {
         // stopService 会走 CaptureService.onDestroy → stopCapture → 先发 CONN-BYE 再关 socket，
         // 且这里是"停止服务"，不受 Android 12+ 后台启动限制；转屏重建（isChangingConfigurations）
         // 不打断采集；划掉任务另有 CaptureService.onTaskRemoved() + manifest stopWithTask 兜底。
-        if (isFinishing() && !isChangingConfigurations()) {
+        // 转屏重建（isChangingConfigurations）时什么都不要拆：新的 Activity 实例马上会把
+        // 同样的东西重新建起来，中间那一拍没有任何好处，只有坏处 —— 图谱广播一断，
+        // 汇聚端 10 秒（GraphStore.ONLINE_TIMEOUT_MS）后就把本机判成离线。
+        final boolean reallyLeaving = isFinishing() && !isChangingConfigurations();
+        if (reallyLeaving) {
             stopService(new Intent(this, CaptureService.class));
         }
         poller.removeCallbacksAndMessages(null);
         if (discovery != null) discovery.stop();
-        InviteListener.get().stop();
+        // 图谱广播器（InviteListener）原来是无条件停的，这是「老是意外断开」的主因：
+        // 它就是全网唯一一帧 GRAPH 的产生者，停掉它等于本机对所有对端消失。
+        // 现在只在真的退出 App 时停；系统回收 / 转屏重建都保留它继续广播。
+        if (reallyLeaving) {
+            InviteListener.get().stop();
+        }
         // 退出才释放多播锁
         if (multicastLock != null && multicastLock.isHeld()) {
             multicastLock.release();
@@ -1804,23 +1813,16 @@ public class MainActivity extends Activity {
         Toast.makeText(this, "已向 " + d.name + " 发出邀请", Toast.LENGTH_SHORT).show();
     }
 
+    /**
+     * 本机局域网地址。这里**必须**用 Discovery 那一份实现，不要自己再写一遍枚举 ——
+     * 之前这里有一份"返回第一个非回环 IPv4"的简化版，而 reconcile() 每 400ms 用它比对
+     * GraphStore.selfIp()：一旦网卡枚举顺序变化（插拔热点 / VPN / 蜂窝待机唤醒），
+     * 就会挑到另一个地址，selfId 跟着漂移 → streamIdForSelf() 变 → 触发 retarget，
+     * 而 retarget 会先发 CONN-BYE，表现为「莫名其妙断一下」。
+     * Discovery 版有 wlan/eth/ap/en 优先 + 跳过 tun/ppp/rmnet/clat/169.254/198.18/100.64 的过滤。
+     */
     private String localIp() {
-        try {
-            java.util.Enumeration<java.net.NetworkInterface> nis =
-                    java.net.NetworkInterface.getNetworkInterfaces();
-            while (nis.hasMoreElements()) {
-                java.util.Enumeration<java.net.InetAddress> addrs =
-                        nis.nextElement().getInetAddresses();
-                while (addrs.hasMoreElements()) {
-                    java.net.InetAddress a = addrs.nextElement();
-                    if (!a.isLoopbackAddress() && a instanceof java.net.Inet4Address) {
-                        return a.getHostAddress();
-                    }
-                }
-            }
-        } catch (Exception ignored) {
-        }
-        return "";
+        return Discovery.localIp();
     }
 
     private static int parseInt(String text, int fallback) {

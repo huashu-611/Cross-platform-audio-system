@@ -23,9 +23,16 @@
         android:allowBackup="false"
         android:usesCleartextTraffic="true">
 
+        <!--
+            configChanges：转屏 / 深色模式 / 字体大小 / 键盘插拔时不要重建 Activity。
+            这不只是省一次重建 —— MainActivity.onDestroy() 里会停掉图谱广播器
+            （InviteListener，见下方 onDestroy 注释），重建期间广播断档超过 10 秒，
+            汇聚端就把本机判成离线，用户看到的是「老是意外断开」。
+        -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|uiMode|density|fontScale"
             android:label="AudioHub 源端">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
