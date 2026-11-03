@@ -97,6 +97,8 @@ class WasapiRender {
 
  private:
   void ThreadMain();
+  // 建一条到"当前默认播放设备"的流并跑到 stop_requested 或设备被换掉为止。
+  void ThreadLoop();
 
   RenderCallback callback_;
   int latency_ms_ = 10;
@@ -105,6 +107,10 @@ class WasapiRender {
   std::atomic<bool> stop_requested_{false};
   std::thread thread_;
   std::string last_error_;
+  // 当前这条流绑在哪个默认播放设备上（设备 id），以及是否发现它被换掉了。
+  // 插耳机 / 切蓝牙时 IAudioClient 不会自动改道，只能由 ThreadMain 重建。
+  std::string bound_device_id_;
+  bool device_switched_ = false;
 };
 
 }  // namespace audiohub

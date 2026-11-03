@@ -148,6 +148,23 @@ public final class GraphStore {
     /** 见过的最大 version（含没采纳的）：本地改动用 max+1，保证单调，协议 §3。 */
     private static long seenVersion;
 
+    /**
+     * 会话已结束（用户点了「全部断开」）：本机退出图谱共识。
+     *
+     * 协议 §4.6 只说"重置后不广播"，但只做到"不发"是不够的：对端还在周期广播，
+     * 本机一合并就把刚清掉的节点（以及它认的汇聚端）全捞回来 ——
+     * 用户看到的是「一方断开就清空图谱」「退出后反复回到控制台」「切换后汇聚端没声音」。
+     * 所以这里要显式记录状态：会话结束后既不合并也不广播，直到本机重新入网
+     * （手动连接 / 接受邀请 / 设自己为汇聚端）。
+     */
+    private static boolean detached;
+
+    /** 是否已退出图谱共识（见 detached）。 */
+    public static synchronized boolean isDetached() { return detached; }
+
+    /** 重新入网：解除 detached，并允许立刻广播。 */
+    public static synchronized void reattach() { detached = false; }
+
     /** 始终按 id 升序（协议 §1 的规范序）。 */
     private static final List<Node> nodes = new ArrayList<>();
 
@@ -235,6 +252,8 @@ public final class GraphStore {
     public static synchronized boolean mergeFromFrame(String frame) {
         final RemoteGraph remote = decodeFrame(frame);
         if (remote == null) return false;   // 非法帧：整帧丢弃
+        // 会话已结束：不参与共识。对端周期广播的旧图谱会把刚清掉的节点灌回来。
+        if (detached) return false;
 
         // 1) 节点并集，同 id 保留 local（节点字段会话内不变）；上限 32（与 C++ 一致）
         boolean nodesChanged = false;
@@ -252,18 +271,33 @@ public final class GraphStore {
         if (remote.version > seenVersion) seenVersion = remote.version;
 
         // 2) 汇聚端 LWW
+        //    空 hubId 表示「对端还没确定汇聚端」（协议 §2.1），不是一次真实赋值：
+        //    绝不能用它覆盖本机已知的 hubId，否则一台设备点「全部断开」后广播的
+        //    空 hubId 会顺着 LWW 把整个网络（含 PC 汇聚端）的汇聚端一起清空。
         boolean hubChanged = false;
-        if (remote.version > version) {
+        final boolean remoteHasHub = !remote.hubId.isEmpty();
+        if (hubId.isEmpty() && remoteHasHub) {
+            // 本机还没入网（空白会话）：任何一个带 hubId 的帧都该把汇聚端钉住，
+            // 不受 version 门槛限制（与 C++ MergeGraph 逐条对齐，两端必须算出一致结果）。
+            hubId = remote.hubId;
+            origin = remote.origin;
+            if (remote.version > version) version = remote.version;
+            hubChanged = true;
+        } else if (remote.version > version) {
             version = remote.version;
             origin = remote.origin;
-            hubId = remote.hubId;
-            hubChanged = true;
+            if (remoteHasHub || hubId.isEmpty()) {
+                hubId = remote.hubId;
+                hubChanged = true;
+            }
         } else if (remote.version == version && !remote.origin.equals(origin)) {
             // 同版本按 origin 逐字节字典序裁决（node id 是 ASCII，String.compareTo 等价）
             if (remote.origin.compareTo(origin) > 0) {
                 origin = remote.origin;
-                hubId = remote.hubId;
-                hubChanged = true;
+                if (remoteHasHub || hubId.isEmpty()) {
+                    hubId = remote.hubId;
+                    hubChanged = true;
+                }
             }
         }
 
@@ -470,12 +504,21 @@ public final class GraphStore {
      * （协议对 Android 的措辞是"hubId 清空"，与 PC 的 hubId=selfId 不同。）
      */
     public static synchronized void resetSession() {
-        version = Math.max(version, seenVersion) + 1;
-        origin = selfId;
+        // version 必须归零，不能像旧实现那样 +1：
+        // 清空 hubId 之后本机处于「还没加入任何网络」的空白态，若此时把 version
+        // 抬到比汇聚端还高，之后汇聚端发来的每一帧 GRAPH 都会被 LWW 判为「版本更低」
+        // 而丢弃 → 本机永远学不到 hubId（hubNode()==null → reconcile 停采集），
+        // 同时本机广播出去的高版本空 hubId 还会清空 PC 端的汇聚端。
+        // 归零等价于「刚启动」，汇聚端只要发过帧就能被采纳。
+        version = 0;
+        seenVersion = 0;
+        origin = "";
         hubId = "";
         seenByIp.clear();
         newlyLearned.clear();
         nodes.clear();
+        // 会话结束：本机退出图谱共识（见 detached 注释）。
+        detached = true;
         if (!selfId.isEmpty()) {
             final Node self = new Node(selfId, selfIp, AUDIO_PORT,
                     sanitizeName(selfName), KIND_ANDROID, 0);

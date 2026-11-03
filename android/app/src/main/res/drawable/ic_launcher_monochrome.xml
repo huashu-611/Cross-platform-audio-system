@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  单色图层（Android 13+ 主题图标用）。
+
+  默认的自适应图标是「深空底 + 暖金恒星 + 两颗行星」；系统开启「主题图标」后会把
+  图标重绘成单色剪影（用户 2026-10-28 看到的灰底白星就是系统自动生成的剪影，行星
+  全被抹掉、形状也不受控）。这里显式提供一张设计过的剪影：中央四角星 + 两颗行星 +
+  两颗小星点，开主题图标时也能看出「汇聚端恒星 + 环绕设备」的含义。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 中央四角星（同心圆位置 = 108dp 画布的视觉中心） -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M54,14 L61.5,44.5 L86,52 L61.5,59.5 L54,90 L46.5,59.5 L22,52 L46.5,44.5 Z" />
+
+    <!-- 左上行星 -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M22.8,36 a5.2,5.2 0 1,1 10.4,0 a5.2,5.2 0 1,1 -10.4,0 Z" />
+
+    <!-- 右下行星 -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M72.2,68 a5.8,5.8 0 1,1 11.6,0 a5.8,5.8 0 1,1 -11.6,0 Z" />
+
+    <!-- 两颗小星点 -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M33.4,76 a1.6,1.6 0 1,1 3.2,0 a1.6,1.6 0 1,1 -3.2,0 Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M70.6,30 a1.4,1.4 0 1,1 2.8,0 a1.4,1.4 0 1,1 -2.8,0 Z" />
+</vector>

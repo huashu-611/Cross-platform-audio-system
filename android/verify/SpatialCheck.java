@@ -209,17 +209,17 @@ public final class SpatialCheck {
 
     private static void distanceGainClamps() {
         final int f = begin("SpatialDistanceGainClamps");
-        near("d=1", Spatial.distanceGain(1.0f), 1.0f, kTol);     // 0 dB
-        near("d=2", Spatial.distanceGain(2.0f), 0.5f, kTol);     // -6.02 dB
-        near("d=0.5", Spatial.distanceGain(0.5f), 2.0f, kTol);   // +6.02 dB
-        near("d=0.25", Spatial.distanceGain(0.25f), 2.0f, kTol); // 近场封顶
-        // 用户 2026-10-27 定稿「距离即音量」：取消远场下限，一直按 1/d 衰减。
-        near("d=4", Spatial.distanceGain(4.0f), 0.25f, kTol);    // -12.04 dB
-        near("d=10", Spatial.distanceGain(10.0f), 0.1f, kTol);   // -20 dB
-        near("d=40", Spatial.distanceGain(40.0f), 0.025f, kTol); // -32 dB
-        near("d=0", Spatial.distanceGain(0.0f), 2.0f, kTol);     // 除零保护
+        near("d=1", Spatial.distanceGain(1.0f), 1.0f, kTol);      // 0 dB
+        near("d=2", Spatial.distanceGain(2.0f), 0.329877f, kTol); // -9.63 dB（指数 1.6）
+        near("d=0.5", Spatial.distanceGain(0.5f), 2.0f, kTol);    // 近场封顶
+        near("d=0.25", Spatial.distanceGain(0.25f), 2.0f, kTol);  // 近场封顶
+        // 用户 2026-10-27 定稿「距离就是音量」；v0.4 指数 1.6 让远距离变化更明显。
+        near("d=4", Spatial.distanceGain(4.0f), 0.108819f, kTol); // -19.3 dB
+        near("d=10", Spatial.distanceGain(10.0f), 0.025120f, kTol); // -32 dB
+        near("d=40", Spatial.distanceGain(40.0f), 0.002728f, kTol); // -51.3 dB
+        near("d=0", Spatial.distanceGain(0.0f), 2.0f, kTol);      // 除零保护
         near("20log10(g(2))", (float) (20.0 * Math.log10(Spatial.distanceGain(2.0f))),
-                -6.0206f, 0.01f);
+                -9.6340f, 0.02f);
         end("SpatialDistanceGainClamps", f);
     }
 

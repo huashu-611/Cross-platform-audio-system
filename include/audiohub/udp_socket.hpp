@@ -35,6 +35,10 @@ class UdpSocket {
   // 用它做 RTT 测量会凭空多出十几毫秒。
   bool SetReceiveTimeoutMs(int ms);
   bool SetReceiveBufferBytes(int bytes);
+  // 发送缓冲：音频包是 5 ms 一拍的稳定小包，但系统调度抖动会让某几拍挤在一起。
+  // 默认缓冲（Windows 约 64 KB）装得下 ~65 个包，够用；显式调大是为了给
+  // "切换目标时旧包还在队列里"留余量，避免 sendto 直接返回 WSAEWOULDBLOCK。
+  bool SetSendBufferBytes(int bytes);
   // 设置对端地址（P0 只支持 IPv4 字面量，避免引入 DNS 依赖）。
   bool SetPeer(const std::string& ipv4, uint16_t port);
 

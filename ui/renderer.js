@@ -816,9 +816,42 @@ function checkNewSources (state) {
 //
 // 以前点"邀请"之后界面什么都不说：对方 App 没开、不在同一网络、或者
 // 邀请帧丢了，用户都只能干等，然后怀疑"是不是没发出去"。v1.7 起给每次
-// 邀请挂一个 6 秒计时：期间对方开始推流就算成功，超时就在横幅里说明。
-const INVITE_WAIT_MS = 6000
+// 邀请挂一个计时：期间对方开始推流就算成功，超时就在横幅里说明。
+//
+// 2026-10-29：从 6 秒放宽到 20 秒。对方要在手机上看到弹窗、再用手指点「同意」，
+// 6 秒经常不够 —— 用户会先看到"无响应"，然后过两秒手机才连上，观感就是"发了没反应"。
+const INVITE_WAIT_MS = 20000
 const invitesWaiting = new Map()   // ip -> { name, until }
+
+// 把一个"用户随手填的地址"解析成 { ip, port }。
+//
+// 用户填进来的东西远比想象的花：中文输入法打出的全角冒号「：」、从别处复制的
+// 空格、手滑写成「192.168.1.44:47000 」带尾空格、或者干脆写了「http://ip:port」。
+// 以前一律 lastIndexOf(':')，遇到全角冒号就整串当成 IP 发出去 —— 内核自然找不到
+// 对端，界面只提示"发不出去"，用户看不出是自己打错了（2026-10-29 报的 bug：
+// "不加 :47000 后缀手机上接不到申请"）。这里统一归一化，认不出来的按默认端口处理。
+const DEFAULT_AUDIO_PORT = 47000
+function parsePeerAddress (text) {
+  let raw = String(text == null ? '' : text).trim()
+  if (!raw) return { ip: '', port: DEFAULT_AUDIO_PORT }
+  // 全角字符 → 半角（只处理地址里可能出现的几种）
+  raw = raw.replace(/：/g, ':').replace(/：/g, ':')
+    .replace(/．/g, '.').replace(/。$/g, '')
+    .replace(/／/g, '/').replace(/\s+/g, '')
+  // 允许用户直接粘 "http://192.168.1.44:47000/"
+  const scheme = raw.indexOf('://')
+  if (scheme >= 0) raw = raw.slice(scheme + 3)
+  if (raw.endsWith('/')) raw = raw.slice(0, -1)
+  let ip = raw
+  let port = DEFAULT_AUDIO_PORT
+  const colon = raw.lastIndexOf(':')
+  if (colon > 0) {
+    ip = raw.slice(0, colon)
+    const parsed = parseInt(raw.slice(colon + 1), 10)
+    if (Number.isInteger(parsed) && parsed > 0 && parsed < 65536) port = parsed
+  }
+  return { ip, port }
+}
 
 function watchInvite (ip, name) {
   if (!ip) return
@@ -888,8 +921,17 @@ function render (state) {
 
   const sources = Array.isArray(state.sources) ? state.sources : []
   const confirmedCount = sources.filter((s) => s && s.confirmed).length
-  // 控制屏显示条件（协议 §9.2）：图谱节点数 >= 2（网络已形成）或本机有音频流
-  const networkUp = graph.nodes.length >= 2
+  // 控制屏显示条件（协议 §9.2）：图谱里至少有一台**在线**的其他设备，或本机有音频流。
+  //
+  // 这里只数 online 的节点，不数 nodes.length：图谱里的节点是"并集"，从不删除，
+  // 退出后残留的旧节点会一直留在里面。以前用 nodes.length >= 2 判断，于是
+  // 「全部断开后过一会儿又被弹回控制台，而画面上只有一个自己的汇聚端」（用户反馈）。
+  const onlinePeers = graph.nodes.filter((n) => !n.isSelf && n.online).length
+  // 汇聚端那台自己掉线了就不算「网络还在」：本机是客户端时，汇聚端离线等于会话结束。
+  // 不看这条的话，对端退出后要等 10 秒离线窗口才收场，中间界面会来回跳。
+  const hubNode = graph.hubNode
+  const hubAlive = !!hubNode && (hubNode.isSelf === true || hubNode.online !== false)
+  const networkUp = onlinePeers >= 1 && hubAlive
   const localFlow = confirmedCount > 0 || !!state.pcSource
   const anyConnection = networkUp || localFlow
 
@@ -1014,13 +1056,7 @@ $('manualInviteBtn').addEventListener('click', async () => {
     hint.textContent = '请先填对方的地址'
     return
   }
-  let ip = raw
-  let port = 47000
-  const colon = raw.lastIndexOf(':')
-  if (colon > 0) {
-    ip = raw.slice(0, colon)
-    port = parseInt(raw.slice(colon + 1), 10) || 47000
-  }
+  const { ip, port } = parsePeerAddress(raw)
   const res = await window.hub.invitePeer({ ip, audioPort: port })
   if (res && res.ok) {
     hint.className = 'hint ok'
@@ -1028,7 +1064,10 @@ $('manualInviteBtn').addEventListener('click', async () => {
     watchInvite(ip, ip)
   } else {
     hint.className = 'hint warn'
-    hint.textContent = '邀请发送失败：地址格式不对或音频核心没响应'
+    // 把内核给的原因说出来：以前一律"地址格式不对或音频核心没响应"，
+    // 用户分不清是自己填错、还是没填端口、还是核心没起来。
+    const why = (res && res.error) ? res.error : '音频核心没有响应'
+    hint.textContent = '邀请发送失败：' + why
   }
 })
 
@@ -1044,21 +1083,15 @@ $('ctrlAddBtn').addEventListener('click', () => {
 })
 
 $('ctrlInviteBtn').addEventListener('click', async () => {
-  const raw = $('ctrlIp').value.trim()
-  if (!raw) return
-  let ip = raw
-  let port = 47000
-  const colon = raw.lastIndexOf(':')
-  if (colon > 0) {
-    ip = raw.slice(0, colon)
-    port = parseInt(raw.slice(colon + 1), 10) || 47000
-  }
+  const { ip, port } = parsePeerAddress($('ctrlIp').value)
+  if (!ip) return
   const res = await window.hub.invitePeer({ ip, audioPort: port })
   if (res && res.ok) {
     watchInvite(ip, ip)
-    showNotice('已邀请 ' + ip + '，等待对方确认…')
+    showNotice('已邀请 ' + ip + ':' + port + '，等待对方确认…')
   } else {
-    showNotice('邀请发送失败：音频核心没有响应')
+    const why = (res && res.error) ? res.error : '音频核心没有响应'
+    showNotice('邀请发送失败：' + why)
   }
 })
 

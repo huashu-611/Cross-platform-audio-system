@@ -71,13 +71,15 @@ public class MainActivity extends Activity {
     private boolean userLeft = false;
 
     // ---- 图谱 / 采集职责（协议 §6.2）----
-    /** 已保存的 MediaProjection 授权：切换目标或 streamId 变了复用它重启采集。 */
+    /**
+     * 从系统授权界面刚拿到的 MediaProjection 授权，只用于「立刻启动一次采集」。
+     * Android 14 起这是一次性令牌：启动后必须丢弃（见 clearProjectionAuth），
+     * 不能存着给后续重启用，否则 startForeground 会抛 SecurityException。
+     */
     private int projectionResultCode = 0;
     private Intent projectionResultData;
     /** 用户希望本机在采集（点过"送入"或连接成功后自动开始）。 */
     private boolean sourceIntent = false;
-    /** 上次因目标变化重启采集的时间，防止 400ms 轮询里反复重启。 */
-    private long lastSourceRestartAt = 0;
     /** 切换汇聚端后的提示状态。 */
     private String pendingSwitchTarget = "";
     private long switchSyncedAt = 0;
@@ -105,6 +107,16 @@ public class MainActivity extends Activity {
     private android.net.wifi.WifiManager.MulticastLock multicastLock;
     private android.net.wifi.WifiManager wifiManager;
     private boolean inviteDialogShowing;
+
+    /** hubId 指向的节点缺失的起始时间（0 = 正常）：
+     * 图谱帧可能比自己延迟一两个拉手，这段时间内不把正在跑的采集掐掉。 */
+    private long hubMissingSinceMs = 0L;
+
+    /** 图谱里找不到 hub 时的宽限期：
+     * 这段时间内用上次记住的 hubIp 兜底继跑，
+     * 避免图谱抖动一下就把正在工作的采集掐掉（
+     * 用户报的「进控制屏瞬间就退」就是这条路径）。 */
+    private static final long HUB_MISSING_GRACE_MS = 6000L;
 
     /** 汇聚端：null = 本机（默认，因为电脑跑着汇聚端）；否则是那台设备。 */
     private String hubIp;
@@ -144,7 +156,7 @@ public class MainActivity extends Activity {
     private static final int COLOR_TEXT_HALO = 0xCC04060F;
 
     /** 构建标记：与 APK versionName 保持一致，用于在手机上确认装的是哪一版。 */
-    private static final String BUILD_TAG = "1.7-bye";
+    private static final String BUILD_TAG = "0.16";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -176,6 +188,10 @@ public class MainActivity extends Activity {
         hubIp = prefs.getString("hub_ip", null);
         hubPort = prefs.getInt("hub_port", 47000);
         hubName = prefs.getString("hub_name", null);
+        // 会话状态跨进程保留：默认「不在任何会话里」→ 打开就是连接界面。
+        // 否则清后台重开时，远端广播的旧图谱会直接把界面拉进控制屏（没有汇聚端的
+        // 双星界面），而那时并没有真正连上，把任一端设成汇聚端也不会传声。
+        userLeft = prefs.getBoolean("user_left", true);
 
         // 图谱：本机节点尽早就位；上次连过的设备先登记成占位节点
         // （kind 先 other，对端发来 GRAPH 后会被校正成它自己的名字/类型）
@@ -424,7 +440,7 @@ public class MainActivity extends Activity {
 
         // 版本/特性标记：手机上装的是哪一版一眼可辨（排查“装了新版还是旧界面”类问题）
         TextView buildTag = new TextView(this);
-        buildTag.setText("星图 · v" + BUILD_TAG);
+        buildTag.setText("v" + BUILD_TAG + " · 星图");
         buildTag.setTextSize(11f);
         buildTag.setTextColor(COLOR_FAINT);
         buildTag.setPadding(0, 0, 0, dp(6));
@@ -643,7 +659,7 @@ public class MainActivity extends Activity {
                 stopSource();
                 projectionResultCode = 0;
                 projectionResultData = null;
-                userLeft = true;      // 立刻回连接界面，且不被服务状态拉回
+                setUserLeft(true);    // 立刻回连接界面，且进程重启后仍保持
                 manualPeers.clear();  // 主动断开：关系表一起清掉
                 hubIp = null;
                 hubName = null;
@@ -724,8 +740,14 @@ public class MainActivity extends Activity {
             switchSyncedAt = 0;
             InviteListener.broadcastGraph();   // 本地变化：2 次 / 60ms（协议 §4.5）
         }
-        sourceIntent = false;
-        stopSource();
+        setUserLeft(false);   // 明确把本机设为汇聚端 = 会话开始
+        GraphStore.reattach();   // 重新入网：解除「全部断开」留下的退网状态
+        // 不要清 sourceIntent！它是"用户希望本机把声音送出去"的意愿，
+        // 不是"现在正在发"的状态。被设为汇聚端期间由 reconcile 的 isHub 分支
+        // 挡住采集就够了；清掉它以后，用户把汇聚端切回电脑时就再也不会恢复
+        // 采集了（用户看到的正是「切到手机再切回来，手机就不再送声音」）。
+        // 真正的显式关闭只有 toggleSource / 断开连接 / onActivityResult 失败三处。
+        stopSourceKeepingAuth();
         if (!ReceiverService.sRunning) {
             safeStartForegroundService(new Intent(this, ReceiverService.class)
                     .setAction(ReceiverService.ACTION_START)
@@ -733,6 +755,39 @@ public class MainActivity extends Activity {
         }
         refresh();
         Toast.makeText(this, "本机已成为汇聚端", Toast.LENGTH_SHORT).show();
+    }
+
+    /**
+     * 对端用 ROLE|source 指定了"谁来当汇聚端"——跟着走。
+     *
+     * 为什么不能复用 {@link #pickRemoteHub}：那条路是**用户主动连一台设备**，
+     * 语义是"我要加入它"，所以它会做两件在这里有害的事：
+     *   1. 先 stop 掉 ReceiverService（用户以为只是换目标，实际把接收端拆了）；
+     *   2. 握手失败就 setUserLeft(true) 退回连接界面 + 弹"对方还没有同意连接"。
+     * ROLE 是汇聚端那边的决定，不是用户操作：远端一台设备在反复切换时会连发
+     * 好几次 ROLE|source，中途任何一次 CONN-ACK 抖动都会把用户踢出控制台
+     * （用户 2026-11-02 报的「来回切换时手机退出控制台，说桌面端没同意连接」）。
+     *
+     * 这里只做三件事：记住目标、把自己当成音源（等 reconcile 决定起/停采集）、
+     * 保持 ReceiverService 不动（万一图谱又切回来，接收端还是活的）。
+     */
+    private void followRemoteRole(final Discovery.Device d) {
+        if (d == null || d.ip == null || d.ip.isEmpty()) return;
+        final int audioPort = d.audioPort > 0 ? d.audioPort : GraphStore.AUDIO_PORT;
+        GraphStore.upsertNode(d.ip, audioPort, d.name, GraphStore.KIND_OTHER);
+        hubIp = d.ip;
+        hubPort = audioPort;
+        hubName = d.name;
+        saveHub();
+        addManualPeer(d.ip, d.name, audioPort);
+        // 对端说"你往我这里送" = 会话语义成立：解除退网状态、留在控制界面。
+        setUserLeft(false);
+        GraphStore.reattach();
+        // 用户意愿：本机当音源。真正起不起采集由 reconcile 按图谱 hub 决定。
+        sourceIntent = true;
+        hintText = "";
+        // 不 stop ReceiverService：对端随时可能把汇聚端切回本机，届时它要能立刻收流。
+        refresh();
     }
 
     /**
@@ -751,7 +806,8 @@ public class MainActivity extends Activity {
         hubName = d.name;
         saveHub();
         addManualPeer(d.ip, d.name, audioPort);
-        userLeft = false;
+        setUserLeft(false);
+        GraphStore.reattach();   // 重新入网：解除「全部断开」留下的退网状态
         hintText = "";
         startService(new Intent(this, ReceiverService.class)
                 .setAction(ReceiverService.ACTION_STOP));
@@ -766,8 +822,12 @@ public class MainActivity extends Activity {
                     @Override
                     public void run() {
                         if (!ok) {
+                            // 没握手成功就不算进过会话：把「已断开」状态写回去，
+                            // 否则下次冷启动可能又被远端残留图谱拉进控制屏。
+                            setUserLeft(true);
+                            refresh();
                             Toast.makeText(MainActivity.this,
-                                    "对方还没有同意连接，界面已切换但声音还没接通",
+                                    "对方还没有同意连接，请稍后再试",
                                     Toast.LENGTH_LONG).show();
                             return;
                         }
@@ -796,6 +856,17 @@ public class MainActivity extends Activity {
                 .apply();
     }
 
+    /**
+     * userLeft 落盘：断开后即使清后台重开，也稳定停在连接界面，直到用户明确发起
+     * 新连接（点「送入」、同意邀请、从设备列表 / 手动 IP 连入、把本机设为汇聚端）。
+     * 只放内存里的话，进程重启后默认 false，远端残留图谱会把界面拉进控制屏。
+     */
+    private void setUserLeft(boolean value) {
+        userLeft = value;
+        getSharedPreferences("audiohub", MODE_PRIVATE).edit()
+                .putBoolean("user_left", value).apply();
+    }
+
     // ------------------------------------------------------------ 本机声音
 
     private void toggleSource() {
@@ -813,7 +884,8 @@ public class MainActivity extends Activity {
                         Toast.LENGTH_SHORT).show();
             } else {
                 sourceIntent = true;
-                userLeft = false;   // 用户主动「送入」= 明确发起新连接
+                setUserLeft(false);   // 用户主动「送入」= 明确发起新连接
+                GraphStore.reattach();   // 重新入网：解除「全部断开」留下的退网状态
                 ensurePermissionsThenStart();
             }
         }
@@ -825,6 +897,24 @@ public class MainActivity extends Activity {
             startService(new Intent(this, CaptureService.class)
                     .setAction(CaptureService.ACTION_STOP));
         }
+        // 服务停下后这条采集授权就作废了（Android 14 一次性授权）：留着它会被
+        // reconcile 当成"可以自动恢复采集"，下次启动时被系统拒绝 → 闪退。
+        clearProjectionAuth();
+    }
+
+    /**
+     * 停采集但**保留**投屏会话：本机暂时被设为汇聚端时用。
+     *
+     * 与 stopSource 的区别是不动 CaptureService 里那份 MediaProjection ——
+     * 用户几乎必然会来回切换汇聚端，每次都要重新弹系统授权框是不可接受的
+     * （而且 Android 14 的一次性授权本来就不给第二次机会）。
+     */
+    private void stopSourceKeepingAuth() {
+        if (CaptureService.sRunning) {
+            startService(new Intent(this, CaptureService.class)
+                    .setAction(CaptureService.ACTION_PAUSE));
+        }
+        // 不调 clearProjectionAuth()：保留授权，切回音源时还能接着用。
     }
 
     private void ensurePermissionsThenStart() {
@@ -872,11 +962,13 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "没有授权，无法采集", Toast.LENGTH_SHORT).show();
             return;
         }
-        // 保存授权：切换汇聚端 / 音源序号变了要用它重启采集（协议 §6.2）
+        // 注意：这份授权只在本次启动有效（Android 14 一次性令牌），启动后立刻丢弃；
+        // 切换汇聚端由 CaptureService 内部 retarget 复用当前采集会话完成（协议 §6.2）。
         projectionResultCode = resultCode;
         projectionResultData = data;
         sourceIntent = true;
-        userLeft = false;   // 用户授权采集 = 明确发起新连接
+        setUserLeft(false);   // 用户授权采集 = 明确发起新连接
+        GraphStore.reattach();   // 重新入网：解除「全部断开」留下的退网状态
 
         final GraphStore.Snapshot g = GraphStore.snapshot();
         final GraphStore.Node hub = g.hubNode();
@@ -890,6 +982,10 @@ public class MainActivity extends Activity {
         final int streamId = g.streamIdForSelf();
         getSharedPreferences("audiohub", MODE_PRIVATE).edit()
                 .putInt("port", port).putInt("streamId", streamId).apply();
+        // Android 14 起采集授权是一次性的：这次启动之后立刻丢弃，不能再留着
+        // 让 reconcile 自动重启采集 —— 用旧授权重新 startForeground 会被系统拒绝
+        // 并抛 SecurityException（2026-10-28 闪退的根因）。切换目标由
+        // CaptureService 内部 retarget 处理，不需要这份授权。
         try {
             startForegroundService(new Intent(this, CaptureService.class)
                     .setAction(CaptureService.ACTION_START)
@@ -903,12 +999,44 @@ public class MainActivity extends Activity {
                     + android.util.Log.getStackTraceString(t));
             Toast.makeText(this, "启动采集失败：" + t.getClass().getSimpleName(),
                     Toast.LENGTH_LONG).show();
+        } finally {
+            clearProjectionAuth();
         }
+    }
+
+    /** 丢弃当前保存的采集授权（一次性令牌：用过一次就不能再用来启动采集）。 */
+    private void clearProjectionAuth() {
+        projectionResultCode = 0;
+        projectionResultData = null;
     }
 
     // ------------------------------------------------------------ 刷新
 
+    /**
+     * 界面刷新的安全壳：refresh 会被 400ms 轮询之外的很多入口直接调用（同意邀请、
+     * 断开、切换汇聚端、权限回调……）。只要里面抛一个运行时异常，Android 就会把
+     * 整个进程带走 —— 用户看到的就是「点同意的瞬间 App 直接退出」。所以外壳统一
+     * 兜住：记日志、不崩，界面下一轮 400ms 自己会恢复。
+     */
     private void refresh() {
+        try {
+            refreshInner();
+        } catch (Throwable t) {
+            android.util.Log.e("AudioHub", "refresh 异常: "
+                    + android.util.Log.getStackTraceString(t));
+        }
+    }
+
+    private void refreshInner() {
+        // 采集服务启动/运行失败时会把原因放在 CaptureService.sLastError 里。
+        // 这里取走：清掉已经失效的授权（否则 400ms 一次的 reconcile 会反复用旧授权
+        // 重试 → 每次都崩），并明确告诉用户下一步该做什么。
+        final String captureError = CaptureService.consumeError();
+        if (captureError != null) {
+            clearProjectionAuth();
+            sourceIntent = false;
+            Toast.makeText(this, captureError, Toast.LENGTH_LONG).show();
+        }
         // 协议 §6.2：先按图谱校正本机职责（采集 / 接收），再刷新界面
         reconcile();
 
@@ -951,8 +1079,20 @@ public class MainActivity extends Activity {
         // userLeft 只在「用户明确发起新连接」时清除（本机声音送入 / 接受待确认请求 /
         // 设备列表或手动 IP 发起连接）；不因服务停止或远端残留图谱自动清除，
         // 否则断开后旧图谱（10s 才转离线）会把界面又拉回控制屏。
+        // 图谱里至少两台设备、且汇聚端已知，才算真的进过会话；只有半张图
+        // （远端广播的残留 / 刚发现的设备）时留在连接界面，避免用户看到的
+        // 「没有汇聚端的双星界面」。
+        final boolean hasHub = g.hubId != null && !g.hubId.isEmpty();
+        // 只数**在线**的其他设备：图谱节点是并集、从不删除，退出后残留的旧节点会一直
+        // 留在表里。以前用 nodes.size() >= 2，于是「全部断开后过一会儿又弹回控制屏，
+        // 而画面上只有一个自己的汇聚端」（用户反馈）。
+        int onlinePeers = 0;
+        for (GraphStore.Node n : g.nodes) {
+            if (n.id.equals(GraphStore.selfId())) continue;
+            if (GraphStore.isOnline(n)) onlinePeers++;
+        }
         final boolean showControl = !userLeft
-                && (g.nodes.size() >= 2 || hubRunning || srcRunning);
+                && (hubRunning || srcRunning || (onlinePeers >= 1 && hasHub));
         showScreen(showControl ? "control" : "connect");
 
         // 画全网图谱：每个节点一个球，汇聚端在中间（协议 §9.3）。
@@ -1059,7 +1199,7 @@ public class MainActivity extends Activity {
                     d.canSend = true;
                     d.canReceive = true;
                     Toast.makeText(this, "对端已把本机设为音源", Toast.LENGTH_SHORT).show();
-                    pickRemoteHub(d);
+                    followRemoteRole(d);
                 }
             }
         }
@@ -1095,6 +1235,14 @@ public class MainActivity extends Activity {
                         }
                     })
                     .setNegativeButton("拒绝", null)
+                    .setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
+                        @Override
+                        public void onDismiss(android.content.DialogInterface d) {
+                            // 旧代码只置 true 不复位：第一次邀请弹过之后，后面所有邀请
+                            // 都会被 !inviteDialogShowing 挡掉（用户反馈「再邀请没弹窗」）。
+                            inviteDialogShowing = false;
+                        }
+                    })
                     .show();
         }
     }
@@ -1116,7 +1264,8 @@ public class MainActivity extends Activity {
     /**
      * 协议 §6.2：每个 400ms 轮询按图谱校正本机职责。
      *   isHub      → 保持 ReceiverService 运行，停采集
-     *   isSource   → 采集目标 / streamId 对不上就用已保存授权重启；没授权只提示
+     *   isSource   → 采集目标 / streamId 对不上就让服务内部 retarget（不重建采集）；
+     *                服务没跑时用刚拿到的一次性授权启动，没授权只提示
      *   汇聚端未知  → 两个服务都停，回到空闲
      */
     private void reconcile() {
@@ -1132,15 +1281,41 @@ public class MainActivity extends Activity {
             }
         }
 
+        // 用户已主动「断开」：不要再被远端残留图谱把服务拉起来。界面停在连接页，
+        // 直到用户明确发起新连接（此时会把 userLeft 落盘为 false）。
+        if (userLeft) {
+            if (ReceiverService.sRunning) {
+                startService(new Intent(this, ReceiverService.class)
+                        .setAction(ReceiverService.ACTION_STOP));
+            }
+            if (CaptureService.sRunning) {
+                sourceIntent = false;
+                stopSource();
+            }
+            return;
+        }
+
         final GraphStore.Snapshot g = GraphStore.snapshot();
         final boolean hubRunning = ReceiverService.sRunning;
         final boolean srcRunning = CaptureService.sRunning;
 
         if (g.isHub()) {
-            // 汇聚端：本机负责收流放音，不能同时采集（回授）
-            sourceIntent = false;
+            // 汇聚端：本机负责收流放音，不能同时采集（回授）。
+            //
+            // 但**不能顺手把一次性的采集授权毁掉**：用户反复切换汇聚端时，
+            // 每次切回"本机当音源"都需要重新弹一次系统投屏授权框 ——
+            // 而 Android 14 的授权是一次性的，`stopSource()` 里那句
+            // `clearProjectionAuth()` 会让"切回来之后再也发不出声音"。
+            // 所以这里只停采集，保留授权；授权真的过期时由 reconcile 的
+            // hasProjectionAuth() 分支提示用户点「送入」重新授权。
+            //
+            // 注意：**不能**把 sourceIntent 清掉。它是"用户想让本机送声"的意愿，
+            // 不是"现在正在送"的状态；汇聚端期间本来就会被下面的 return 挡住。
+            // 清掉它以后切回来就再也不会恢复采集 —— 用户看到的就是
+            // 「切一次汇聚端之后就没声音了」。真正的显式关闭在 toggleSource /
+            // 断开连接 / 用户把本机设为汇聚端（setLocalHub）这几处。
             hintText = "";
-            if (srcRunning) stopSource();
+            if (srcRunning) stopSourceKeepingAuth();
             if (!hubRunning) {
                 safeStartForegroundService(new Intent(this, ReceiverService.class)
                         .setAction(ReceiverService.ACTION_START)
@@ -1150,7 +1325,9 @@ public class MainActivity extends Activity {
         }
 
         final GraphStore.Node hub = g.hubNode();
+        if (hub == null && hubMissingSinceMs == 0L) hubMissingSinceMs = System.currentTimeMillis();
         if (hub != null) {
+            hubMissingSinceMs = 0L;
             // 音源：同一台设备不能既发又收，接收服务要停掉
             if (hubRunning) {
                 startService(new Intent(this, ReceiverService.class)
@@ -1162,13 +1339,18 @@ public class MainActivity extends Activity {
                 final String actual = CaptureService.sHost + ":" + CaptureService.sPort
                         + ":" + CaptureService.sStreamId;
                 if (!desired.equals(actual)) {
-                    // 目标或音源序号变了：停旧的，下个 tick 用新目标重启（复用授权）
-                    restartSource();
+                    // 目标或音源序号变了：只换发送目标，复用正在跑的采集与 MediaProjection
+                    // 会话。Android 14 的采集授权一次性，之前"停旧服务再用旧授权重启"会
+                    // 在 startForeground 处被系统拒绝 → 进程闪退（2026-10-28 报的 bug）。
+                    startCapture(hub, streamId);
                 } else {
                     hintText = "";
                 }
             } else if (sourceIntent) {
-                if (hasProjectionAuth()) {
+                // 有一次性授权 → 直接起采集；
+                // 没有授权但服务里还留着投屏会话（之前被设为汇聚端暂停过）→
+                // ACTION_START 会走 CaptureService 的 resume 分支，不需要再弹授权框。
+                if (hasProjectionAuth() || CaptureService.sHasProjection) {
                     hintText = "";
                     startCapture(hub, streamId);
                 } else {
@@ -1178,7 +1360,18 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // 汇聚端未知（可能刚断开 / 还没同步到）：停掉一切，保持空闲
+        // 汇聚端未知（刚扫手还没同步到 / 对端 GRAPH 还没到）：
+        // 先给 HUB_MISSING_GRACE_MS 宽限期，期间用上次记住的 hubIp 兜底继跑；
+        // 超时还没同步到才停。
+        final GraphStore.Node remembered = rememberedHub();
+        final boolean withinGrace = System.currentTimeMillis() - hubMissingSinceMs < HUB_MISSING_GRACE_MS;
+        if (remembered != null && withinGrace && (srcRunning || hubRunning)) {
+            if (srcRunning) {
+                // 只是 retarget（服务内目标没变就直接返回），不重建采集会话
+                startCapture(remembered, g.streamIdForSelf());
+            }
+            return;
+        }
         if (hubRunning) {
             startService(new Intent(this, ReceiverService.class)
                     .setAction(ReceiverService.ACTION_STOP));
@@ -1186,8 +1379,26 @@ public class MainActivity extends Activity {
         if (srcRunning) stopSource();
     }
 
+    /**
+     * 用上次记住的 hubIp/hubPort 构造一个临时节点：
+     * 图谱里 hubId 指向的节点缺失时（对端 GRAPH 还没到 / 节点 id 对不上）
+     * 用它兜底，而不是立刻把采集停掉。
+     */
+    private GraphStore.Node rememberedHub() {
+        if (hubIp == null || hubIp.isEmpty()) return null;
+        final int port = hubPort > 0 ? hubPort : GraphStore.AUDIO_PORT;
+        return new GraphStore.Node(hubIp + ":" + port, hubIp, port,
+                hubName != null ? hubName : hubIp, GraphStore.KIND_OTHER, 0);
+    }
+
     private void startCapture(final GraphStore.Node hub, final int streamId) {
-        if (!hasProjectionAuth()) {
+        final boolean alreadyRunning = CaptureService.sRunning;
+        // 两条路都能启动采集：
+        //   1) 手上还有一次性授权（用户刚点过「送入」/ 刚同意邀请）；
+        //   2) 服务里还留着上次暂停保住的投屏会话（来回切汇聚端时的常态）。
+        // 只看 1) 会让"切一次汇聚端就再也发不出声音"——那正是用户报的现象。
+        if (!alreadyRunning && !hasProjectionAuth() && !CaptureService.sHasProjection) {
+            // 两条都没有：只能让用户点「送入」重新授权（一次性授权真的用掉了）
             graphHint("本机已设为音源，开始采集后生效");
             return;
         }
@@ -1199,20 +1410,17 @@ public class MainActivity extends Activity {
                     .putExtra(CaptureService.EXTRA_HOST, hub.ip)
                     .putExtra(CaptureService.EXTRA_PORT, hub.audioPort)
                     .putExtra(CaptureService.EXTRA_STREAM_ID, streamId));
+            if (!alreadyRunning) {
+                // 授权只用这一次：服务已经在跑时是 retarget（不需要授权），
+                // 其余情况启动完就丢弃，避免之后被当成可复用的授权。
+                // （复用暂停保住的会话不需要——那条路走的是 sHasProjection）
+                clearProjectionAuth();
+            }
         } catch (Throwable t) {
             android.util.Log.e("AudioHub", "启动采集失败: "
                     + android.util.Log.getStackTraceString(t));
             graphHint("启动采集失败：" + t.getClass().getSimpleName());
         }
-    }
-
-    /** 目标变化时重启采集：先停旧服务（避免同设备双采），1.5s 防抖。 */
-    private void restartSource() {
-        final long now = System.currentTimeMillis();
-        if (now - lastSourceRestartAt < 1500L) return;
-        lastSourceRestartAt = now;
-        startService(new Intent(this, CaptureService.class)
-                .setAction(CaptureService.ACTION_STOP));
     }
 
     /** 双击节点 = PC 端 dblclick → onActivate：直接把汇聚端切过去（单击仍是音量面板+确认框）。
@@ -1259,6 +1467,7 @@ public class MainActivity extends Activity {
                 .setPositiveButton("切换", new android.content.DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(android.content.DialogInterface dialog, int which) {
+                        GraphStore.reattach();   // 主动切汇聚端 = 重新入网
                         if (!GraphStore.switchHub(target.id)) {
                             Toast.makeText(MainActivity.this, "节点已不在图谱里",
                                     Toast.LENGTH_SHORT).show();
@@ -1308,7 +1517,7 @@ public class MainActivity extends Activity {
     /** 手动填 IP 连过去：广播被拦时的兜底手段。 */
     private void showManualAddDialog() {
         final EditText input = new EditText(this);
-        input.setHint("电脑的 IP，例如 10.135.129.59");
+        input.setHint("电脑的 IP，例如 192.168.1.10（端口可省）");
         input.setText(hubIp != null ? hubIp : "");
         input.setInputType(android.text.InputType.TYPE_CLASS_TEXT);
         input.setTextColor(COLOR_TEXT);
@@ -1463,7 +1672,8 @@ public class MainActivity extends Activity {
      */
     private void acceptPending(int streamId) {
         InviteListener.accept(streamId);
-        userLeft = false;   // 用户同意接入 = 明确发起新连接
+        setUserLeft(false);   // 用户同意接入 = 明确发起新连接
+        GraphStore.reattach();   // 重新入网：解除「全部断开」留下的退网状态
         if (!GraphStore.isHub()) {
             final String sid = GraphStore.selfId();
             if (!sid.isEmpty() && GraphStore.switchHub(sid)) {

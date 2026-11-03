@@ -84,3 +84,6 @@ android/local.properties
 
 # IDE
 .idea/
+
+# Android 签名密钥（本机调试用，不入库）
+android/keystore/

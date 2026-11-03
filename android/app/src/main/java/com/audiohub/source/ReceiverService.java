@@ -75,6 +75,10 @@ public class ReceiverService extends Service {
     private Thread recvThread;
     private Thread playThread;
     private volatile boolean running;
+    // 最近一次 onStartCommand 的 startId：fail() 用它收尾。
+    // 不能用裸 stopSelf() —— 会把仍在路上的 startForegroundService 请求一并丢掉，
+    // 那条请求的前台义务就没人履行，10 秒后系统抛异常杀进程。
+    private volatile int pendingStartId = -1;
     private WifiManager.WifiLock wifiLock;
     private PowerManager.WakeLock wakeLock;
 
@@ -88,11 +92,71 @@ public class ReceiverService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        pendingStartId = startId;
+
+        // ---- 前台义务：进前台必须排在**所有**分支之前 ----
+        //
+        // Context.startForegroundService() 一发出，系统立刻开始 10 秒倒计时；
+        // 到点没看到 startForeground() 就抛
+        //   ForegroundServiceDidNotStartInTimeException
+        // 然后把整个进程杀掉（用户 2026-11-02 贴的崩溃栈就是它）。
+        //
+        // v0.7 只在 ACTION_START 分支里提前调用了，仍然留着几个洞：
+        //   · intent == null（进程被系统回收后补投）
+        //   · 未知 action
+        //   · ACTION_STOP：它本身是 startService() 下发的、确实没有前台义务，
+        //     但**裸 stopSelf() 会把还在路上的 startForegroundService() 请求
+        //     一起丢掉** —— 那条请求的义务就永远没人履行，10 秒后照样杀进程。
+        // 反复切换汇聚端时正是这个组合：reconcile() 的 isHub 分支刚下发 START
+        // （带前台义务），紧接着 hub 角色变化又下发 STOP，STOP 里的裸 stopSelf()
+        // 把 START 连人带义务一起抹掉。
+        // 所以现在无条件先履行义务，再用 stopSelfResult(startId) 停服务。
+        boolean fg = false;
+        try {
+            startForegroundNotification();
+            fg = true;
+        } catch (Throwable t) {
+            android.util.Log.e("AudioHubReceiver", "startForeground 失败: "
+                    + android.util.Log.getStackTraceString(t));
+            sStatus = "无法启动前台服务: " + t.getClass().getSimpleName();
+        }
+
+        // 接收服务也跑在主线程：这里漏一个未捕获异常就是闪退。
+        // 外面总保险后，收流起不来只会没声音 + 一条提示。
+        try {
+            return handleStartCommand(intent, startId, fg);
+        } catch (Throwable t) {
+            android.util.Log.e("AudioHubReceiver", "接收启动异常: "
+                    + android.util.Log.getStackTraceString(t));
+            sStatus = "接收启动失败（" + t.getClass().getSimpleName() + "）";
+            running = false;
+            sRunning = false;
+            try { stopAll(); } catch (Throwable ignored) {}
+            try { stopForeground(STOP_FOREGROUND_REMOVE); } catch (Throwable ignored) {}
+            stopSelfResult(startId);
+            return START_NOT_STICKY;
+        }
+    }
+
+    private int handleStartCommand(Intent intent, int startId, boolean fg) {
+        // 前台没起来就别装了：前台服务起不来，收流也活不久，直接收尾，
+        // 让界面看到「无法启动前台服务」，而不是等系统 10 秒后杀进程。
+        if (!fg) {
+            stopSelfResult(startId);
+            return START_NOT_STICKY;
+        }
+
+        // 没有 intent 就没有活干。义务已经在 onStartCommand 顶部履行完，
+        // 这里**不能**再 stopSelf —— 服务可能本来就在正常收流。
         if (intent == null) return START_NOT_STICKY;
 
         if (ReceiverService.ACTION_STOP.equals(intent.getAction())) {
             stopAll();
-            stopSelf();
+            stopForeground(STOP_FOREGROUND_REMOVE);
+            // stopSelfResult(startId)：只有当这条就是最后一次 start 请求时才真的停。
+            // 裸 stopSelf() 会连还在路上的 startForegroundService() 一起丢掉，
+            // 那条请求的前台义务就永远没人履行 → 10 秒后系统抛异常杀进程。
+            stopSelfResult(startId);
             return START_NOT_STICKY;
         }
         if (!ACTION_START.equals(intent.getAction())) return START_NOT_STICKY;
@@ -103,30 +167,6 @@ public class ReceiverService extends Service {
         final int wantPort = intent.getIntExtra(EXTRA_PORT, 47000);
         if (running && wantPort == port) return START_NOT_STICKY;
         if (running) stopAll();
-
-        // Android 12+ 对前台服务启动有严格限制，Android 14 对
-        // foregroundServiceType 也有要求；任何一项不满足都会抛异常
-        // 直接杀进程（表现就是"闪退"）。这里兜住并给出可读原因。
-        try {
-            // Android 12+ 对前台服务启动有严格限制，Android 14 对
-        // foregroundServiceType 也有要求；任何一项不满足都会抛异常
-        // 直接杀进程（表现就是"闪退"）。这里兜住并给出可读原因。
-        try {
-            startForegroundNotification();
-        } catch (Throwable t) {
-            android.util.Log.e("AudioHubReceiver", "startForeground 失败: "
-                    + android.util.Log.getStackTraceString(t));
-            sStatus = "无法启动前台服务: " + t.getClass().getSimpleName();
-            stopSelf();
-            return START_NOT_STICKY;
-        }
-        } catch (Throwable t) {
-            android.util.Log.e("AudioHubReceiver", "startForeground 失败: "
-                    + android.util.Log.getStackTraceString(t));
-            sStatus = "无法启动前台服务: " + t.getClass().getSimpleName();
-            stopSelf();
-            return START_NOT_STICKY;
-        }
 
         port = intent.getIntExtra(EXTRA_PORT, 47000);
 
@@ -303,7 +343,13 @@ public class ReceiverService extends Service {
             int active = 0;
             for (Map.Entry<Integer, JitterBuffer> e : streams.entrySet()) {
                 final JitterBuffer jb = e.getValue();
-                if (jb.occupancyFrames() < frames) continue;   // 这路还没攒够，跳过
+                // 每一路都要先攒够「启动预填」再开播。
+                //
+                // 这里的判断以前写的是 occupancyFrames() < frames（只等一块 5ms），
+                // 看上去"尽快出声"，实际是在喂 underrun：抖动缓冲的预填量是
+                // PREFILL_MS(60ms)，一块远不够，靠补静音撑过去 → 起播瞬间的杂音。
+                // 现在直接问缓冲"攒够预填了吗"，与 PREFILL_MS 始终一致。
+                if (!jb.prefilled()) continue;   // 这路还没攒够，跳过
                 jb.pull(block, frames);
                 final int streamId = e.getKey().intValue();
                 final float g = streamGain(streamId);
@@ -516,14 +562,27 @@ public class ReceiverService extends Service {
         sStreamPositions.clear();
         sStreamPeerIp.clear();
         sStreamCount = 0;
-        if (recvThread != null) { try { recvThread.join(400); } catch (Exception ignored) {} }
-        if (playThread != null) { try { playThread.join(400); } catch (Exception ignored) {} }
-        recvThread = playThread = null;
+
+        // ---- 顺序：先掐断阻塞点，再 join ----
+        //
+        // 以前是先 join(400) 再关 socket / 释放 track。但收流线程正阻塞在
+        // dataSocket.receive()、播放线程可能阻塞在 track.write()，两者都要靠
+        // 超时才能醒 —— 这一步最坏在主线程上耗 800ms。而主线程正是履行
+        // 「10 秒内 startForeground()」义务的地方（见 onStartCommand 顶部注释），
+        // 反复切换时 STOP 与 START 交错，这个空转就是在吃那 10 秒的额度。
+        // 先关资源让线程立刻从阻塞中返回，join 才有意义也才会快。
+        if (dataSocket != null) {
+            try { dataSocket.close(); } catch (Exception ignored) {}
+            dataSocket = null;
+        }
         if (track != null) {
-            try { track.stop(); track.release(); } catch (Exception ignored) {}
+            try { track.stop(); } catch (Exception ignored) {}
+            try { track.release(); } catch (Exception ignored) {}
             track = null;
         }
-        if (dataSocket != null) { dataSocket.close(); dataSocket = null; }
+        if (recvThread != null) { try { recvThread.join(200); } catch (Exception ignored) {} }
+        if (playThread != null) { try { playThread.join(200); } catch (Exception ignored) {} }
+        recvThread = playThread = null;
         releaseLocks();
         sStatus = "已停止";
     }
@@ -533,7 +592,8 @@ public class ReceiverService extends Service {
         sStatus = message;
         sRunning = false;
         stopAll();
-        stopSelf();
+        try { stopForeground(STOP_FOREGROUND_REMOVE); } catch (Throwable ignored) {}
+        stopSelfResult(pendingStartId);
     }
 
     @Override

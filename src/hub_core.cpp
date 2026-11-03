@@ -245,6 +245,20 @@ struct HubCore::Impl {
   Clock::time_point graph_next_repeat{};    // 下一次补发时刻
   Clock::time_point graph_next_periodic{};  // 下一次周期广播
 
+  // 会话已结束（用户点了「全部断开」），本机暂时退出图谱共识。
+  //
+  // 协议 §4.6 说"重置后不广播"，但只做到"不主动广播"是不够的：本机仍然在收——
+  // 对端（尤其是还没退出的那台）会周期广播它的旧图谱，本机一合并就把刚清掉的节点
+  // 全捞回来，而且带着"version 更高、hub=本机"的身份发回去，对端于是把汇聚端
+  // 认成这台已经离开的机器。用户看到的就是：
+  //   * 「一方断开就清空图谱」—— 图谱清空又被对端灌回来；
+  //   * 「退出后反复回到控制台，但只显示它自己的汇聚端」—— 捞回来的图谱让
+  //     nodes>=2 成立，界面自己跳回控制屏；
+  //   * 「反复切换时汇聚端没声音」—— 对端被这条幽灵帧抢走汇聚端，谁也不发流。
+  // 所以这里需要一个显式状态：会话结束后既不合并、也不广播，直到用户重新
+  // 邀请 / 接受邀请 / 主动切汇聚端（这些动作都会重新入网）才解除。
+  bool graph_detached = false;
+
   // ---- 房间摆位（POS）----
   // 与 graph_ 共用 mutex：数据量更小（<=32 项），读写都在 HTTP / 握手 / 混音线程。
   PlacementState placement_;
@@ -592,7 +606,25 @@ struct HubCore::Impl {
         // 已经同意过的流再次收到 CONN-REQ（对端没收到 ACK 会重试）：
         // 直接重发 ACK，绝不能再进待确认 —— 否则界面上那个"同意"按钮
         // 会一直挂在那里，点了也没用（流已经在 accepted_ids 里了）。
-        if (accepted_ids.count(stream_id) > 0) {
+        // v0.4：accepted_ids 里还留着这个 id、但 streams 里已经没有它 —— 说明上一轮
+        // 会话的流被超时清理（或桌面端点了"全部断开"）时忘了摘 accepted_ids。
+        // 这时若仍按"重发 ACK"处理，对端会以为连上了并开始推流，但这边没有一路流
+        // 能收包/混音：现象就是"重新邀请、进了控制屏却没声音"，而且不重启桌面端
+        // 永远好不了。这里把残留记录摘掉，让它走下面的正常建流逻辑。
+        bool retry_acked = false;
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          if (accepted_ids.count(stream_id) > 0) {
+            if (streams.count(stream_id) > 0) {
+              retry_acked = true;
+            } else {
+              accepted_ids.erase(stream_id);
+              Emit("[~] 清理旧会话残留: 流 " + std::to_string(stream_id) +
+                   "（将按新连接重建）");
+            }
+          }
+        }
+        if (retry_acked) {
           const std::string ack =
               "CONN-ACK|" + display_name + "|" + std::to_string(stream_id) + "\n";
           handshake_socket.SendToAddr(from_ip, from_port, ack.data(), ack.size());
@@ -708,6 +740,8 @@ struct HubCore::Impl {
           streams.erase(it);
           Emit("[-] 已断开: " + who);
         }
+        // v0.4：会话结束把"已同意"记录也摘掉，否则同一 stream id 重连只会回 ACK 不建流。
+        accepted_ids.erase(stream_id);
         pending.erase(stream_id);
       }
     }
@@ -752,6 +786,7 @@ struct HubCore::Impl {
     graph_probes.clear();
     graph_pending_repeats = 0;
     graph_next_periodic = Clock::now() + std::chrono::milliseconds(kGraphPeriodicMs);
+    graph_detached = false;   // 新进程：正常参与图谱共识
     // 摆位随进程启动从空开始：房间布局由桌面端拖拽后广播，不需要持久化在本进程里。
     placement_ = PlacementState();
     placement_seen_version = 0;
@@ -779,12 +814,22 @@ struct HubCore::Impl {
     graph_deferred.clear();
     graph_probes.clear();
     graph_pending_repeats = 0;
+    // 关键：把本机标记成"已退出图谱共识"（见 graph_detached 注释）。
+    // 只"不主动广播"不够 —— 对端还在周期广播，本机会把它的旧图谱合并回来。
+    graph_detached = true;
     // 摆位是"房间"的状态，不随会话清空；只清收发记账。
     placement_req_replied.clear();
     placement_sends.clear();
     placement_deferred.clear();
     placement_probes.clear();
     placement_pending_repeats = 0;
+  }
+
+  // 重新入网：邀请 / 接受邀请 / 主动切汇聚端时调用，解除 graph_detached。
+  // 必须在持有 mutex 时调用（与 graph_ 的其它写入同锁）。
+  void GraphReattachLocked() {
+    graph_detached = false;
+    graph_next_periodic = Clock::now() + std::chrono::milliseconds(kGraphPeriodicMs);
   }
 
   void TouchGraphIp(const std::string& ip) {
@@ -840,7 +885,9 @@ struct HubCore::Impl {
   }
 
   // 向 nodes 里除自己外的每个节点单播当前图谱，返回成功发出几个。
+  // 会话已结束（detached）时一律不发：见 graph_detached 的注释。
   int GraphBroadcastLocked() {
+    if (graph_detached) return 0;
     const std::string frame = EncodeGraphFrame(graph_);
     int sent = 0;
     for (const auto& n : graph_.nodes) {
@@ -885,6 +932,10 @@ struct HubCore::Impl {
     std::string hub_id;
     {
       std::lock_guard<std::mutex> lock(mutex);
+      // 会话已结束：本机不再参与共识，对端的图谱一律不合并。
+      // 否则对端周期广播的旧图谱会把刚清掉的节点（和它认的汇聚端）全灌回来，
+      // 界面就出现「图谱又满了 / 又跳回控制台 / 汇聚端变成别人」。
+      if (graph_detached) return;
       if (remote.version > graph_seen_version) graph_seen_version = remote.version;
 
       // 先记下这次新学到的节点：合并后要给它们各补一次 GRAPH-REQ（协议 §4.4）
@@ -922,6 +973,9 @@ struct HubCore::Impl {
   bool GraphAddPeerLocked(const std::string& ip, const std::string& name, uint16_t audio_port,
                           std::string* node_id) {
     if (ip.empty()) return false;
+    // 有新设备入网 = 会话重新开始：解除"已退出共识"状态。
+    // 否则点了「全部断开」之后再邀请/被邀请，图谱永远停在只剩自己。
+    GraphReattachLocked();
     bool added = false;
     std::string new_id;
     const GraphNode* existing = FindNodeByIp(graph_, ip);
@@ -1042,19 +1096,54 @@ struct HubCore::Impl {
   // 本地切换汇聚端（协议 §4.5）。节点不存在返回 false（HTTP 回 unknown node）。
   bool SwitchGraphHub(const std::string& node_id) {
     bool is_hub_now = false;
+    std::string hub_ip;
+    uint16_t hub_audio_port = 0;
+    // 其它节点的 ip:音频口（锁内快照，锁外发 ROLE —— 发送不能持锁）。
+    std::vector<std::pair<std::string, uint16_t>> others;
     {
       std::lock_guard<std::mutex> lock(mutex);
-      if (FindNode(graph_, node_id) == nullptr) return false;
+      const GraphNode* target = FindNode(graph_, node_id);
+      if (target == nullptr) return false;
+      // 用户主动指定汇聚端 = 会话重新开始：解除"已退出共识"状态。
+      GraphReattachLocked();
       // version = max(version, seen) + 1：SwitchHub 内部只做 +1，
       // 这里先把本地 version 抬到"见过的最大值"，避免比远端回退。
       if (graph_seen_version > graph_.version) graph_.version = graph_seen_version;
       if (!SwitchHub(&graph_, self_node_id, node_id)) return false;
       graph_seen_version = graph_.version;
+      hub_ip = NodeIpOf(target->id);
+      hub_audio_port = target->audio_port;
+      for (const auto& n : graph_.nodes) {
+        if (n.id == self_node_id) continue;
+        const std::string ip = NodeIpOf(n.id);
+        if (!ip.empty() && n.audio_port != 0) others.emplace_back(ip, n.audio_port);
+      }
       GraphScheduleDoubleLocked();   // 协议 §4.5：连发 2 次
       is_hub_now = IsHub(graph_, self_node_id);
     }
     Emit(std::string("[GRAPH] 汇聚端切换 -> ") + node_id +
          (is_hub_now ? "（本机是汇聚端）" : "（本机不是汇聚端，输出静音）"));
+
+    // 通知被选中的那台设备"你现在是汇聚端了"。
+    //
+    // 为什么必须发：GRAPH 帧只告诉所有人"谁是 hub"，但那台设备的接收服务
+    // 不会因为图谱变了就自己起来 —— 手机端的 ReceiverService 只有收到
+    // ROLE|hub 才会启动。以前这里只切图谱不发 ROLE，用户把汇聚端切到手机后
+    // 看到的就是"电脑一直在发，手机一路也收不到"（2026-10-29 报的 bug）。
+    // 反过来切回自己（本机当汇聚端）时也要告诉对端改回当音源。
+    if (!hub_ip.empty() && hub_audio_port != 0) {
+      if (hub_ip != NodeIpOf(self_node_id)) {
+        // 对端当汇聚端：让它起来收流。
+        SendRoleTo(hub_ip, hub_audio_port, true, "", 0);
+      } else {
+        // 本机当汇聚端：通知原来那台当音源的设备改回"往我这里送"。
+        // 只有对端是手机时才需要 —— 它的采集要靠这条指令驱动，桌面端
+        // 音源由界面自己按图谱 reconcile，不依赖这条。
+        for (const auto& n : others) {
+          SendRoleTo(n.first, n.second, false, hub_ip, hub_audio_port);
+        }
+      }
+    }
     return true;
   }
 
@@ -1273,6 +1362,10 @@ struct HubCore::Impl {
           const int limit = (it->second->packets == 0) ? 60 : kSourceTimeoutSec;
           if (idle > limit) {
             Emit("[-] 流掉线: id=" + std::to_string(it->first));
+            // v0.4：掉线清理必须同步摘掉 accepted_ids。只删 streams 会留下"幽灵已同意"，
+            // 对端（手机固定用流 1）重连时命中 CONN-REQ 的"重发 ACK"分支，
+            // 于是 ACK 发出去了、流却没建 —— 界面显示连上、实际一包都不混。
+            accepted_ids.erase(it->first);
             it = streams.erase(it);
           } else {
             ++it;
@@ -1800,6 +1893,35 @@ struct HubCore::Impl {
     auto_accept_ip = ip;
     auto_accept_until_ms = NowMs() + 60'000;
   }
+
+  /**
+   * 给一台设备下发角色指令（ROLE|hub 或 ROLE|source|ip:port）。
+   *
+   * 放在 Impl 里而不是 HubCore，是因为切换汇聚端发生在 SwitchGraphHub 的锁内
+   * 流程中，那里只有 Impl 成员可用；实际发送必须在锁外（UdpSocket 不要持锁调用）。
+   */
+  bool SendRoleTo(const std::string& peer_ip, uint16_t peer_audio_port, bool make_hub,
+                  const std::string& hub_ip, uint16_t hub_port) {
+    if (peer_ip.empty() || peer_audio_port == 0) return false;
+    std::string frame;
+    if (make_hub) {
+      frame = "ROLE|hub\n";
+    } else {
+      frame = "ROLE|source|" + hub_ip + ":" + std::to_string(hub_port) + "\n";
+    }
+    const uint16_t hs_port = static_cast<uint16_t>(peer_audio_port + kControlPortOffset);
+    const bool ok = handshake_socket.SendToAddr(peer_ip, hs_port, frame.data(), frame.size());
+    AllowPeer(peer_ip);
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      RememberPeer(peer_ip, "", peer_audio_port);
+    }
+    Emit("[>] 角色指令 -> " + peer_ip + ":" + std::to_string(hs_port) + "  " + frame);
+    // 被点名的设备先占位入图（协议 §4.1）；它随后的 CONN-REQ 就会走成员自动 ACK。
+    GraphAddPeer(peer_ip, "", peer_audio_port);
+    return ok;
+  }
+
   bool PeerAllowedNow(const std::string& ip) {
     return !ip.empty() && ip == auto_accept_ip && NowMs() < auto_accept_until_ms;
   }
@@ -1852,24 +1974,8 @@ bool HubCore::auto_accept() const { return impl_->auto_accept(); }
 bool HubCore::SendRoleCommand(const std::string& peer_ip, uint16_t peer_audio_port,
                               bool make_hub, const std::string& hub_ip,
                               uint16_t hub_port) {
-  if (peer_ip.empty() || peer_audio_port == 0) return false;
-  std::string frame;
-  if (make_hub) {
-    frame = "ROLE|hub\n";
-  } else {
-    frame = "ROLE|source|" + hub_ip + ":" + std::to_string(hub_port) + "\n";
-  }
-  const uint16_t hs_port = static_cast<uint16_t>(peer_audio_port + kControlPortOffset);
-  const bool ok = impl_->handshake_socket.SendToAddr(peer_ip, hs_port, frame.data(), frame.size());
-  impl_->AllowPeer(peer_ip);
-  {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    impl_->RememberPeer(peer_ip, "", peer_audio_port);
-  }
-  impl_->Emit("[>] 角色指令 -> " + peer_ip + ":" + std::to_string(hs_port) + "  " + frame);
-  // 被点名的设备先占位入图（协议 §4.1）；它随后的 CONN-REQ 就会走成员自动 ACK。
-  impl_->GraphAddPeer(peer_ip, "", peer_audio_port);
-  return ok;
+  // 单一实现放在 Impl::SendRoleTo：切换汇聚端时也要用它（见 SwitchGraphHub）。
+  return impl_->SendRoleTo(peer_ip, peer_audio_port, make_hub, hub_ip, hub_port);
 }
 
 std::vector<Peer> HubCore::SessionPeers() const {
@@ -1888,6 +1994,13 @@ std::vector<Peer> HubCore::SessionPeers() const {
 void HubCore::ClearSession() {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   impl_->session_peers.clear();
+  // v0.4：全部断开 = 真的把这一轮会话清干净。以前只清 session_peers + 图谱，
+  // streams / accepted_ids / pending 留着，下一次用相同 stream id 重连就会命中
+  // "已同意过 → 只回 ACK 不建流"的分支：界面连上了、声音永远不通，
+  // 只能重启桌面端（用户报的"两端都退出才能重连"就是这个）。
+  impl_->streams.clear();
+  impl_->accepted_ids.clear();
+  impl_->pending.clear();
   // "全部断开"同时重置图谱（协议 §4.6）：版本 +1、origin/hubId 回到自己、只留自节点。
   // 不广播：对端已经断开/不可达，广播只会在下次见面时造成一次无意义的合并。
   impl_->GraphResetLocked();

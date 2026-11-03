@@ -245,9 +245,18 @@ def main():
         render(size, circle=True).save(os.path.join(folder, 'ic_launcher_round.png'))
         print('mipmap-' + bucket + '/ic_launcher(_round).png ' + str(size))
 
-    # Android：自适应图标前景（108dp 画布 ×4 = 432；内容缩进到中心 66% 安全区）
-    fg = render(432, bg=False, safe=0.72)
-    fg.save(os.path.join(ANDROID_RES, 'mipmap-anydpi-v26', 'ic_launcher_foreground.png'))
+    # Android：自适应图标前景（108dp 画布；内容缩进到中心 66dp 安全区）
+    # 必须按密度出图放到 mipmap-<dpi>，不能放 mipmap-anydpi：
+    # anydpi 下的位图没有密度信息，系统按 mdpi(1x) 解释，
+    # 432px 会被当成 432dp 塞进 108dp 图层 -> 只露出中心 1/4，
+    # 表现就是启动器里只剩中间一团白光晕、行星全被裁掉。
+    # 自适应图标画布是 108dp，按密度换算成像素：108/162/216/324/432
+    for bucket, dp in (('mdpi', 108), ('hdpi', 162), ('xhdpi', 216),
+                       ('xxhdpi', 324), ('xxxhdpi', 432)):
+        fg = render(dp, bg=False, safe=0.62)
+        fg.save(os.path.join(ANDROID_RES, 'mipmap-' + bucket,
+                             'ic_launcher_foreground.png'))
+        print('mipmap-' + bucket + '/ic_launcher_foreground.png ' + str(dp))
 
     # Android：自适应图标背景色（与 StarSkyView 顶端同色）
     bg_xml = os.path.join(ANDROID_RES, 'values', 'ic_launcher_background.xml')
@@ -256,7 +265,7 @@ def main():
                  '<resources>\n'
                  '    <color name="ic_launcher_background">#070B1B</color>\n'
                  '</resources>\n')
-    print('mipmap-anydpi-v26/ic_launcher_foreground.png, values/ic_launcher_background.xml')
+    print('values/ic_launcher_background.xml')
 
     # 预览对照图（白底，16~256）
     sheet = Image.new('RGBA', (16 + 24 + 32 + 48 + 64 + 128 + 256 + 9 * 8, 280), (245, 246, 250, 255))

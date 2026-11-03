@@ -462,15 +462,34 @@ int main(int argc, char** argv) {
                        }
                        if (method == "POST" && path == "/api/invite") {
                          std::string sip;
-                         double v = 0;
-                         if (audiohub::JsonGetString(body, "ip", &sip) &&
-                             audiohub::JsonFindNumber(body, "audioPort", &v)) {
-                           audiohub::Peer peer;
-                           peer.ip = sip;
-                           peer.audio_port = static_cast<uint16_t>(v);
-                           return hub.InvitePeer(peer) ? "{\"ok\":true}" : "{\"ok\":false}";
+                         if (!audiohub::JsonGetString(body, "ip", &sip) || sip.empty()) {
+                           return "{\"ok\":false,\"error\":\"ip missing\"}";
                          }
-                         return "{\"ok\":false,\"error\":\"ip/audioPort missing\"}";
+                         // audioPort 可以省略，也可以写成字符串：界面上"端口可省"，
+                         // 只填 IP 是常态。老实现缺 audioPort 直接报
+                         // "ip/audioPort missing"，用户看到的就是"怎么填都发不出邀请"。
+                         double v = 0;
+                         bool got_port = audiohub::JsonFindNumber(body, "audioPort", &v);
+                         if (!got_port) {
+                           std::string port_text;
+                           if (audiohub::JsonGetString(body, "audioPort", &port_text) &&
+                               !port_text.empty()) {
+                             v = std::atof(port_text.c_str());
+                             got_port = true;
+                           }
+                         }
+                         int port = static_cast<int>(v);
+                         if (port <= 0 || port > 65535) port = 47000;   // 默认音频口
+                         // 把"到底收到什么"打出来：用户报"不加端口后缀手机上没反应、
+                         // 加了才有"，而两种写法解析出的端口都是 47000 —— 只能靠
+                         // 这行日志判断差异出在界面、IPC 还是内核。
+                         std::printf("[invite] 请求 ip=%s raw_port=%s -> audioPort=%d\n",
+                                     sip.c_str(), got_port ? std::to_string(port).c_str() : "(省略)",
+                                     port);
+                         audiohub::Peer peer;
+                         peer.ip = sip;
+                         peer.audio_port = static_cast<uint16_t>(port);
+                         return hub.InvitePeer(peer) ? "{\"ok\":true}" : "{\"ok\":false}";
                        }
                        if (method == "POST" && path == "/api/latency") {
                          double v = 0;

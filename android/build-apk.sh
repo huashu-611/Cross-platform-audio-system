@@ -27,9 +27,9 @@ BUILD_TOOLS="$(dirname "$(find "$SDK" -maxdepth 3 -name aapt2.exe | head -1)")"
 [ -n "$BUILD_TOOLS" ] || { echo "找不到 build-tools（aapt2）" >&2; exit 1; }
 
 PKG="com.audiohub.source"
-# 版本号可由环境变量覆盖，便于在手机上区分“装的是哪一版”（默认保持 0.1/1）
-VERSION_CODE="${VERSION_CODE:-1}"
-VERSION_NAME="${VERSION_NAME:-0.1}"
+# 版本号可由环境变量覆盖，便于在手机上区分“装的是哪一版”（默认 0.13/13）
+VERSION_CODE="${VERSION_CODE:-16}"
+VERSION_NAME="${VERSION_NAME:-0.16}"
 OUT=build
 rm -rf "$OUT"
 mkdir -p "$OUT/classes" "$OUT/dex"
@@ -77,7 +77,10 @@ PYEOF
 "$BUILD_TOOLS/zipalign.exe" -f -p 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"
 
 echo "==> 6/6 签名"
-KS="$OUT/audiohub-debug.keystore"
+# 签名密钥必须稳定：放在 build/ 之外。以前放在 $OUT 里，而脚本开头 rm -rf "$OUT"，
+# 每次构建都会生成一把新 key，手机上已装的旧版就无法覆盖安装（签名不一致）。
+KS="keystore/audiohub-debug.keystore"
+mkdir -p "$(dirname "$KS")"
 if [ ! -f "$KS" ]; then
   keytool -genkeypair -keystore "$KS" -alias audiohub -keyalg RSA -keysize 2048 \
     -validity 10000 -storepass android -keypass android \

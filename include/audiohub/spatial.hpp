@@ -75,9 +75,13 @@ constexpr int kSpatialHistoryFrames = 64;     // 每源历史 ≥ 最大延时 3
 constexpr int kSpatialHistoryChannels = 2;    // P0 只用 [0]（单声道化后）；P1 保留 side 用 [1]
 constexpr float kMinDistanceM = 0.25f;        // 距离下限，防除零
 // 距离就是音量（用户 2026-10-27 定稿）：取消远场下限，拖多远就衰减多少。
-//   g = min(r0 / max(d, kMinDistanceM), kMaxDistanceGain)
-//   近场仍封顶 +6 dB（防凑到脸上炸耳），远场不再截断（10 m ≈ -20 dB）。
+//   g = min((r0 / max(d, kMinDistanceM))^p, kMaxDistanceGain)，p = kDistanceExponent
+//   近场仍封顶 +6 dB（防凑到脸上炸耳），远场不再截断（10 m ≈ -32 dB）。
 constexpr float kMaxDistanceGain = 2.0f;      // +6 dB，近场封顶
+// 距离衰减指数（v0.4，用户反馈"拖远了听不出变小"）：1.0 是纯 1/d，近处变化太缓；
+// 1.6 让"距离就是音量"更直观：d=1 → 0 dB，d=2 → -9.6 dB，d=3 → -14.4 dB，
+// d=4 → -19.3 dB，近场仍封顶 +6 dB。C++/Android 必须用同一个值（跨端契约）。
+constexpr float kDistanceExponent = 1.6f;
 constexpr float kSpatialCoordLimit = 320.0f;  // 世界坐标绝对值上限 ±320 m（= POS 帧 ±32000 cm；HTTP 与内核双重校验）
 
 // ------------------------------------------------ 纯函数（全部可单测，不碰 DSP 状态）
@@ -98,10 +102,10 @@ float PanValue(float azimuth_deg, float azimuth_boost);
 // 等功率声像增益：gL=sqrt((1-pan)/2)，gR=sqrt((1+pan)/2)，0..1。
 void PanGains(float azimuth_deg, float azimuth_boost, float* gain_l, float* gain_r);
 
-// 距离衰减：线性反比振幅，参考距离 r0 = kSceneRadius（1 unit = 1 m）。
-//   g = min(r0 / max(d, kMinDistanceM), kMaxDistanceGain)
-//   d=1 -> 0 dB；d=2 -> -6 dB；d=4 -> -12 dB；d=10 -> -20 dB（远场不再截断，距离就是音量）；
-//   d<0.5 -> 上限 2.0 (+6 dB)，近场封顶。
+// 距离衰减：指数反比振幅，参考距离 r0 = kSceneRadius（1 unit = 1 m），指数 p。
+//   g = min((r0 / max(d, kMinDistanceM))^p, kMaxDistanceGain)，p=1.6
+//   d=1 -> 0 dB；d=2 -> -9.6 dB；d=3 -> -14.4 dB；d=4 -> -19.3 dB；
+//   d=10 -> -32 dB（远场不再截断，距离就是音量）；d<0.5 -> 上限 +6 dB，近场封顶。
 float DistanceGain(float distance);
 
 // 双耳时间差（秒，正 = 声源在右，右耳领先；正后方 sin(180°)=0 回落到 0，整圆连续）。

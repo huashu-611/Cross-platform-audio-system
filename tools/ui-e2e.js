@@ -40,7 +40,10 @@ const UI_EXE = process.env.AUDIOHUB_UI_EXE ? path.resolve(process.env.AUDIOHUB_U
 const PACKAGED = !!UI_EXE;
 const HUB_AUDIO_PORT = 47000;
 const HUB_HTTP_PORT = 4780;
-const DEBUG_PORT = 9333;
+// 调试端口可以覆盖：固定 9333 会被开发机上其它 Chromium 系进程（Edge、残留 Electron）
+// 占住，那时 e2e 只会得到「electron page target not found on port 9333」这种与代码无关的
+// 假红。改用 `AUDIOHUB_E2E_PORT=19333 node tools/ui-e2e.js` 即可绕开。
+const DEBUG_PORT = Number.parseInt(process.env.AUDIOHUB_E2E_PORT, 10) || 9333;
 const FAKE_ID = '127.0.0.1:47100';
 const FAKE_NAME = 'E2E-B';
 // 每次跑都用全新的 Electron profile：localStorage（节点 pin / 相机）不跨轮残留，
@@ -349,6 +352,30 @@ async function main() {
       });
       await sleep(250);
     }
+    // rAF 守卫：窗口被遮挡时 Chromium 会暂停 requestAnimationFrame，
+    // 而缩放/环绕都靠"每帧朝目标追 28%"的缓动 —— rAF 一停，dist 和 phi
+    // 就永远不动，断言会随机变红（实测：同一条链路一次全过、一次全红，
+    // 快照里 fps=0 是唯一线索）。启动时调过一次 Page.bringToFront，
+    // 但那之后窗口可能又被别的窗口盖住，所以在依赖动画的断言前再确认一次。
+    async function rafAlive (tag) {
+      for (let i = 0; i < 12; i++) {
+        const f = await cdp.eval(
+          '(window.__hubDebug && window.__hubDebug().scene) ? window.__hubDebug().scene.fps : -1');
+        if (f > 0) return true;
+        if (DBG) console.log('[dbg] raf stalled before ' + tag + ' (fps=' + f + '), bringing window to front');
+        try { await cdp.send('Page.bringToFront', {}); } catch (e) { /* 旧 CDP 忽略 */ }
+        // 空推一次鼠标，部分 Chromium 版本要收到输入事件才恢复合成器。
+        try {
+          await cdp.send('Input.dispatchMouseEvent', {
+            type: 'mouseMoved', x: wheelX, y: wheelY, buttons: 0, modifiers: 0
+          });
+        } catch (e) { /* 忽略 */ }
+        await sleep(300);
+      }
+      return false;
+    }
+    check(await rafAlive('zoom'), 'animation loop is running before zoom checks');
+
     const dist0 = await readDist();
     await wheel(120);
     const distOut = await readDist();
@@ -425,6 +452,7 @@ async function main() {
       return false;
     }
 
+    await rafAlive('orbit');
     await dragAt(cdp, orbitX, orbitY, orbitX + 90, orbitY);
     let orbitSnap = await waitDebug(cdp, (s) => s.scene && Math.abs(s.scene.view.phiDeg - phiBefore) > 15,
       3000, 'camera orbit');
@@ -576,8 +604,15 @@ async function main() {
     // Cleanup: "断开全部" clears the session graph back to this node only.
     // 「全部断开」从控制屏底部的"会话"卡片挪到了头部右侧：它必须只在控制界面出现。
     await cdp.eval("document.querySelector('#leaveBtn').click(); 'clicked'");
-    snap = await waitDebug(cdp, (s) => s.screen === 'connect', 6000, 'back to connect screen after 全部断开');
-    check(snap.screen === 'connect' && snap.nodes === 1, '「全部断开」清除会话并回到连接界面');
+    // 判据必须把 screen 和 nodes 一起等。
+    // 只用 screen 当谓词会让 waitDebug 在"已经切回连接屏、但图谱清空还没落地"的
+    // 那一帧就返回 —— nodes 仍是切换前的旧值，断言随机失败（实测 1/2 次）。
+    // 这是测试的采样竞态，不是产品行为问题：再等一个 tick 两个条件就都成立。
+    snap = await waitDebug(cdp, (s) => s.screen === 'connect' && s.nodes === 1, 6000,
+      'back to connect screen after 全部断开');
+    // 诊断信息带上实际值：不写出来就只能看到"失败了"三个字。
+    check(snap.screen === 'connect' && snap.nodes === 1,
+      '「全部断开」清除会话并回到连接界面 (screen=' + snap.screen + ', nodes=' + snap.nodes + ')');
     const leaveHiddenAgain = await cdp.eval(
       "document.querySelector('#leaveBtn') && document.querySelector('#leaveBtn').style.display === 'none'");
     check(leaveHiddenAgain === true, '「全部断开」回到连接界面后重新隐藏');

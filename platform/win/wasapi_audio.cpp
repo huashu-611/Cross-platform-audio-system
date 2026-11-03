@@ -59,6 +59,48 @@ std::string HrText(const char* what, HRESULT hr) {
   return buf;
 }
 
+// 取默认**播放**设备。优先 eMultimedia（媒体播放），退而用 eConsole。
+//
+// 为什么不是直接 eConsole：三个 role 各有一套默认设备。播放器、浏览器、系统混音
+// 都往 eMultimedia 上播；eConsole 只是"控制台提示音"的默认设备。很多机器的
+// 「耳机设成媒体默认、扬声器仍是控制台默认」就是这种状态——老实现一律取 eConsole，
+// 用户把耳机插上、甚至在设置里选成默认播放设备，声音照样从扬声器出来。
+HRESULT GetDefaultRenderDevice(IMMDeviceEnumerator* en, IMMDevice** out) {
+  if (en == nullptr || out == nullptr) return E_POINTER;
+  *out = nullptr;
+  HRESULT hr = en->GetDefaultAudioEndpoint(eRender, eMultimedia, out);
+  if (FAILED(hr) || *out == nullptr) {
+    hr = en->GetDefaultAudioEndpoint(eRender, eConsole, out);
+  }
+  return hr;
+}
+
+// 当前默认播放设备的 id（空串 = 拿不到）。用来判断"运行中设备有没有被换掉"。
+std::string DefaultRenderDeviceId() {
+  const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  std::string id;
+  IMMDeviceEnumerator* en = nullptr;
+  if (SUCCEEDED(CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
+                                 kIID_IMMDeviceEnumerator,
+                                 reinterpret_cast<void**>(&en))) &&
+      en != nullptr) {
+    IMMDevice* dev = nullptr;
+    if (SUCCEEDED(GetDefaultRenderDevice(en, &dev)) && dev != nullptr) {
+      LPWSTR wid = nullptr;
+      if (SUCCEEDED(dev->GetId(&wid)) && wid != nullptr) {
+        char narrow[512] = {0};
+        WideCharToMultiByte(CP_ACP, 0, wid, -1, narrow, sizeof(narrow) - 1, nullptr, nullptr);
+        id = narrow;
+        CoTaskMemFree(wid);
+      }
+      dev->Release();
+    }
+    en->Release();
+  }
+  if (SUCCEEDED(co)) CoUninitialize();
+  return id;
+}
+
 // 构造 48 kHz / float32 / 立体声的 WAVEFORMATEXTENSIBLE。
 // 用 EXTENSIBLE 而不是裸 WAVEFORMATEX，是因为不少板载声卡驱动
 // 会拒绝非 EXTENSIBLE 的多声道/浮点请求。
@@ -288,8 +330,8 @@ void WasapiCapture::ThreadMain() {
                                   reinterpret_cast<void**>(&enumerator));
     if (FAILED(hr)) {
       last_error_ = HrText("CoCreateInstance(MMDeviceEnumerator)", hr);
-    } else if (FAILED(hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device))) {
-      last_error_ = HrText("GetDefaultAudioEndpoint", hr);
+    } else if (FAILED(hr = GetDefaultRenderDevice(enumerator, &device))) {
+      last_error_ = HrText("GetDefaultRenderDevice", hr);
     } else if (FAILED(hr = device->Activate(kIID_IAudioClient, CLSCTX_ALL, nullptr,
                                             reinterpret_cast<void**>(&client)))) {
       last_error_ = HrText("Activate(IAudioClient)", hr);
@@ -452,7 +494,7 @@ bool SetDefaultRenderMute(bool mute, bool* previous) {
   }
   bool ok = false;
   IMMDevice* device = nullptr;
-  if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device)) &&
+  if (SUCCEEDED(GetDefaultRenderDevice(enumerator, &device)) &&
       device != nullptr) {
     IAudioEndpointVolume* volume = nullptr;
     if (SUCCEEDED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
@@ -504,7 +546,7 @@ std::string WasapiCapture::ListRenderDevices() {
   if (SUCCEEDED(CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
                                  kIID_IMMDeviceEnumerator,
                                  reinterpret_cast<void**>(&enumerator)))) {
-    if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device))) {
+    if (SUCCEEDED(GetDefaultRenderDevice(enumerator, &device))) {
       LPWSTR id = nullptr;
       if (SUCCEEDED(device->GetId(&id)) && id != nullptr) {
         char narrow[512] = {0};
@@ -544,7 +586,7 @@ void WasapiRender::Stop() {
   running_.store(false);
 }
 
-void WasapiRender::ThreadMain() {
+void WasapiRender::ThreadLoop() {
   const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
   IMMDeviceEnumerator* enumerator = nullptr;
@@ -562,7 +604,6 @@ void WasapiRender::ThreadMain() {
     if (device != nullptr) device->Release();
     if (enumerator != nullptr) enumerator->Release();
     if (SUCCEEDED(co)) CoUninitialize();
-    running_.store(false);
   };
 
   HRESULT hr = CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
@@ -572,8 +613,8 @@ void WasapiRender::ThreadMain() {
     cleanup();
     return;
   }
-  if (FAILED(hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device))) {
-    last_error_ = HrText("GetDefaultAudioEndpoint", hr);
+  if (FAILED(hr = GetDefaultRenderDevice(enumerator, &device))) {
+    last_error_ = HrText("GetDefaultRenderDevice", hr);
     cleanup();
     return;
   }
@@ -623,6 +664,7 @@ void WasapiRender::ThreadMain() {
     return;
   }
   device_latency_ms_ = latency_ms_;
+  auto device_check_at = std::chrono::steady_clock::now();
 
   // 启动前先灌满一整个缓冲，否则第一次回调之前必然 underrun，
   // 表现为启动瞬间"咔"一声。
@@ -639,6 +681,27 @@ void WasapiRender::ThreadMain() {
   started = true;
 
   while (!stop_requested_.load()) {
+    // 每约 1 秒看一眼默认播放设备变没变。
+    //
+    // 为什么要轮询：IAudioClient 一旦 Initialize 就与那台设备焊死，
+    // 插耳机 / 切蓝牙 / 在设置里改默认设备都不会让这条流改道 ——
+    // 用户体验就是"插上耳机，声音还在扬声器上"（2026-10-29 报的 bug）。
+    // 发现设备换了就跳出循环，由 ThreadMain 重建一条到新设备的流。
+    //
+    // 注意必须放在 Wait 之前、且**不依赖 Wait 的返回值**：渲染事件大约每 10ms
+    // 就来一次，WaitForSingleObject 几乎总是立刻返回 WAIT_OBJECT_0，
+    // 把检查塞进"超时分支"里等于永远不执行。
+    const auto now = std::chrono::steady_clock::now();
+    if (now - device_check_at >= std::chrono::milliseconds(1000)) {
+      device_check_at = now;
+      const std::string current = DefaultRenderDeviceId();
+      if (!current.empty() && !bound_device_id_.empty() && current != bound_device_id_) {
+        std::fprintf(stderr, "[render] 默认播放设备已切换，重建输出流\n");
+        device_switched_ = true;
+        break;
+      }
+    }
+
     if (WaitForSingleObject(event, 200) != WAIT_OBJECT_0) continue;
 
     UINT32 padding = 0;
@@ -653,6 +716,25 @@ void WasapiRender::ThreadMain() {
   }
 
   cleanup();
+}
+
+void WasapiRender::ThreadMain() {
+  // 默认播放设备可能在运行中变（插耳机、切蓝牙、用户改默认设备）。
+  // 一条 IAudioClient 与设备是焊死的，只能重建：外层循环负责这件事，
+  // 内层 ThreadLoop() 一旦检测到设备换了就带着 device_switched_=true 退出。
+  while (!stop_requested_.load()) {
+    device_switched_ = false;
+    bound_device_id_ = DefaultRenderDeviceId();
+    if (!bound_device_id_.empty()) {
+      std::fprintf(stderr, "[render] 输出设备: %s（运行中会跟随系统默认设备切换）\n",
+                   bound_device_id_.c_str());
+    }
+    ThreadLoop();
+    if (!device_switched_ || stop_requested_.load()) break;
+    // 换设备重开不 busy-loop：让音频事件自然流过去，避免设备还没就绪就重试。
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+  }
+  running_.store(false);
 }
 
 }  // namespace audiohub

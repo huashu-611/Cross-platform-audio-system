@@ -361,9 +361,22 @@ public class HubGraphView extends View {
     // 绘制
     // =====================================================================
 
+    /**
+     * onDraw 跑在 UI 线程：任何一次未捕获异常都会直接把进程带走（用户看到的就是
+     * 「一进控制界面就退出」）。绘制只是显示，出问题最多是这一帧不画，绝不能崩。
+     */
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
+        try {
+            drawScene(canvas);
+        } catch (Throwable t) {
+            android.util.Log.e("AudioHubGraph", "星图绘制异常: "
+                    + android.util.Log.getStackTraceString(t));
+        }
+    }
+
+    private void drawScene(Canvas canvas) {
         final int w = getWidth();
         final int h = getHeight();
         if (w <= 0 || h <= 0) return;

@@ -326,6 +326,31 @@ TEST(Graph_MergeSameVersionOriginTieBreak) {
   CHECK_TRUE(local2.origin == kNodeC);
 }
 
+TEST(Graph_MergeKeepsLocalHubWhenRemoteHubEmpty) {
+  // 对端「全部断开」后广播的是空 hubId：不能把本机已知的汇聚端清掉。
+  auto local = MakeGraph(5, kSelfA, kSelfA, {MakeNode(kSelfA, "PC", "pc", 47000, 4780),
+                                              MakeNode(kNodeB, "手机", "android", 47000, 0)});
+  const auto remote = MakeGraph(6, kNodeB, "", {MakeNode(kNodeB, "手机", "android", 47000, 0)});
+  const auto r = audiohub::MergeGraph(&local, remote);
+  CHECK_TRUE(r.changed);
+  CHECK_TRUE(r.nodes_changed == false);   // 节点都已存在
+  CHECK_TRUE(r.hub_changed);              // version 前进，但 hub_id 保持本地
+  CHECK_EQ(local.version, 6);
+  CHECK_TRUE(local.origin == kNodeB);
+  CHECK_TRUE(local.hub_id == kSelfA);
+}
+
+TEST(Graph_MergeAdoptsRemoteHubWhenLocalHubEmpty) {
+  // 本机还没入网（hubId 空）：任何远端 hubId 都该被采纳。
+  auto local = MakeGraph(3, kSelfA, "", {MakeNode(kSelfA, "手机", "android", 47000, 0)});
+  const auto remote = MakeGraph(2, kNodeB, kNodeB, {MakeNode(kNodeB, "PC", "pc", 47000, 4780)});
+  const auto r = audiohub::MergeGraph(&local, remote);
+  CHECK_TRUE(r.hub_changed);
+  CHECK_EQ(local.version, 3);          // 低版本也采纳 hubId，但 version 只涨不降
+  CHECK_TRUE(local.hub_id == kNodeB);
+  CHECK_TRUE(local.origin == kNodeB);
+}
+
 TEST(Graph_MergeSameVersionSameOriginIsNoop) {
   auto local = MakeGraph(5, kSelfA, kSelfA, {MakeNode(kSelfA, "PC", "pc", 47000, 4780),
                                               MakeNode(kNodeB, "手机", "android", 47000, 0)});

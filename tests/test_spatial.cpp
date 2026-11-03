@@ -55,15 +55,15 @@ TEST(SpatialPanGainsAcrossCircle) {
 }
 
 TEST(SpatialDistanceGainClamps) {
-  CHECK_NEAR(DistanceGain(1.0f), 1.0f, kTol);    // 0 dB
-  CHECK_NEAR(DistanceGain(2.0f), 0.5f, kTol);    // -6.02 dB
-  CHECK_NEAR(DistanceGain(0.5f), 2.0f, kTol);    // +6.02 dB
-  CHECK_NEAR(DistanceGain(0.25f), 2.0f, kTol);   // 近场封顶
-  CHECK_NEAR(DistanceGain(4.0f), 0.25f, kTol);   // 距离即音量：远场不再有下限
-  CHECK_NEAR(DistanceGain(10.0f), 0.1f, kTol);   // -20 dB
-  CHECK_NEAR(DistanceGain(40.0f), 0.025f, kTol); // -32 dB
-  CHECK_NEAR(DistanceGain(0.0f), 2.0f, kTol);    // 除零保护
-  CHECK_NEAR(20.0f * std::log10(DistanceGain(2.0f)), -6.0206f, 0.01f);
+  CHECK_NEAR(DistanceGain(1.0f), 1.0f, kTol);      // 0 dB
+  CHECK_NEAR(DistanceGain(2.0f), 0.329877f, kTol); // -9.63 dB（指数 1.6）
+  CHECK_NEAR(DistanceGain(0.5f), 2.0f, kTol);      // 近场封顶（2^1.6 已超过 2）
+  CHECK_NEAR(DistanceGain(0.25f), 2.0f, kTol);     // 近场封顶
+  CHECK_NEAR(DistanceGain(4.0f), 0.108819f, kTol); // -19.3 dB
+  CHECK_NEAR(DistanceGain(10.0f), 0.025120f, kTol);// -32 dB
+  CHECK_NEAR(DistanceGain(40.0f), 0.002728f, kTol);// -51.3 dB
+  CHECK_NEAR(DistanceGain(0.0f), 2.0f, kTol);      // 除零保护
+  CHECK_NEAR(20.0f * std::log10(DistanceGain(2.0f)), -9.6340f, 0.02f);
   // 单调不增，且永远不会是 0（拉得再远也不至于全哑）。
   for (float d = 0.3f; d < 300.0f; d *= 1.7f) {
     CHECK_TRUE(DistanceGain(d) > 0.0f);

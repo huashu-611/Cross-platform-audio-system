@@ -32,6 +32,16 @@ public final class InviteListener {
 
     public static final int PORT_OFFSET = 2;
 
+    /**
+     * 握手日志标签。
+     *
+     * 这个类原来一行日志都没有，于是"手机当汇聚端收不到声音"只能靠猜：
+     * logcat 里看不到 CONN-REQ 到底有没有到、判成成员还是待确认、ACK 有没有发出去。
+     * 现在关键分支各打一条（量很小：只有握手/邀请时触发，不是每包），
+     * 用 `adb logcat -s AudioHubInvite` 就能完整看到握手过程。
+     */
+    private static final String TAG = "AudioHubInvite";
+
     /** 协议 §4.4：每 3 秒向所有节点广播一次当前图谱（补偿丢包）。 */
     private static final long GRAPH_PERIOD_MS = 3000L;
     /** 协议 §4.3：同一来源 200ms 内不重复回 GRAPH。 */
@@ -239,6 +249,9 @@ public final class InviteListener {
 
         final GraphStore.Snapshot snap = GraphStore.snapshot();
         if (snap.nodes.size() <= 1) return true;   // 只有自己：没有发送目标
+        // 会话已结束（用户点了「全部断开」）：不把「只剩自己」的图谱推给对端，
+        // 否则对端会把汇聚端认成一台北经离开的机器（协议 §4.6「不广播」）。
+        if (GraphStore.isDetached()) return true;
         final String frame = GraphStore.encodeFrame();
         for (GraphStore.Node n : snap.nodes) {
             if (n.id.equals(snap.selfId)) continue;
@@ -484,6 +497,8 @@ public final class InviteListener {
                 sInviteIp = ip;
                 sInvitePort = port;
                 sInvitePending = true;
+                android.util.Log.d(TAG, "收到 CONN-INVITE 来自 " + ip + ":" + port
+                        + " 名字=" + sInviteName + "（等界面确认）");
             } else if ("ROLE".equals(parts[0])) {
                 // ROLE|hub   或   ROLE|source|ip:port
                 if (parts.length >= 2 && "hub".equals(parts[1])) {
@@ -517,10 +532,21 @@ public final class InviteListener {
                 // 协议 §5（新版）：图谱成员自动放行 —— 不论本机是不是 hub。
                 // hub 可能刚切到手机上、发现也不可靠，若按角色拒绝会挡住新设备入网。
                 // 非成员沿用 auto_accept 语义（ROLE|hub 兼容窗口；否则交界面待确认）。
+                //
+                // 2026-10-29 补一条：本机是汇聚端时必须放行。汇聚端的全部职责就是收
+                // 各家音源的声音，如果还要人为确认，用户按完「把手机设为汇聚端」会发现
+                // 声音一个都进不来。而"来源 IP 是不是成员"本身就不稳：DHCP 换了地址、
+                // 过了 NAT、或对方刚重连还没同步图谱，hasNodeIp 都会返回 false。
                 final boolean member = GraphStore.hasNodeIp(fromIp);
                 final boolean autoAccept = shouldAutoAccept(fromIp);
-                if (member || autoAccept) {
+                final boolean iAmHub = GraphStore.isHub();
+                android.util.Log.d(TAG, "CONN-REQ 来自 " + fromIp + ":" + fromPort
+                        + " 名字=" + peerName + " stream=" + streamId
+                        + " 成员=" + member + " 自动同意=" + autoAccept
+                        + " 本机是汇聚端=" + iAmHub);
+                if (member || autoAccept || iAmHub) {
                     sendText(fromIp, fromPort, "CONN-ACK|" + selfName + "|" + streamId + "\n");
+                    android.util.Log.d(TAG, "已回 CONN-ACK 给 " + fromIp + ":" + fromPort);
                     // 握手成功：对端入图谱（协议 §4.1，不 bump version）
                     if (GraphStore.upsertNode(fromIp,
                             peerAudioPort > 0 ? peerAudioPort : GraphStore.AUDIO_PORT,
@@ -531,6 +557,7 @@ public final class InviteListener {
                     sendGraphToPeer(fromIp, peerAudioPort);
                     continue;
                 }
+                android.util.Log.d(TAG, "不是成员也不是自动同意窗口，进待确认列表");
                 // 非成员：交给界面确认（旧版 PC 没有图谱时的待确认流程）
                 synchronized (sPending) {
                     boolean dup = false;

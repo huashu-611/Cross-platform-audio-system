@@ -79,6 +79,13 @@ struct Options {
   std::string exclude_name;  // 进程回环：排除这个进程树
   std::string log_path;   // 非空时把输出重定向到文件
   bool handshake = false;  // 先发 CONN-REQ，等对方确认后再发音频
+  // 本地控制口（只绑 127.0.0.1）。Electron 用它在不重启进程的前提下改投目标：
+  //   RETARGET <ip>:<port> <streamId>
+  //   STATUS
+  //   STOP
+  // 这是"切换汇聚端不断音"的关键——以前每次切换都要 kill 再 spawn，
+  // 新进程重新握手 10 秒、抖动缓冲重新蓄水，用户听到的就是"只有第一次有声音"。
+  int control_port = 0;
   // 作为音源时把本机输出静音：采集走的是回环，回环不会自动静音，
   // 不静音的话声音会同时留在本机耳机里和远端（重复 + 回声）。
   bool mute_local = false;
@@ -104,6 +111,7 @@ void PrintUsage() {
       "  --exclude <exe>     排除这个进程的声音，其它照抓（Win10 2004+）\n"
       "  --log <file>        把输出写到文件（后台运行时看统计用）\n"
       "  --handshake         先发连接请求，对方确认后再发音频\n"
+      "  --control-port <n>  本地控制口（只绑 127.0.0.1），用于运行中改投目标\n"
       "  --device-name <s>   握手时上报的设备名\n"
       "  --verbose           每包打印一次（调试用，会明显影响性能）\n",
       static_cast<unsigned>(47000));
@@ -167,6 +175,8 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
       opt->handshake = true;
     } else if (a == "--device-name") {
       opt->device_name = next("--device-name");
+    } else if (a == "--control-port") {
+      opt->control_port = std::stoi(next("--control-port"));
     } else if (a == "--verbose") {
       opt->verbose = true;
     } else if (a == "-h" || a == "--help") {
@@ -237,11 +247,45 @@ int main(int argc, char** argv) {
 
   const auto t0 = Clock::now();
 
+  // ---- 发送目标：运行中可改（这是"切换汇聚端不断音"的结构性前提）----
+  //
+  // 以前目标在启动时就烤进 data_socket（SetPeer = connect()），换目标只能
+  // kill 掉整个进程再拉一个：新进程要重新握手（最多 10 秒）、抖动缓冲重新蓄水、
+  // 采集重新起步——用户听到的就是"只有第一次有声音，之后怎么切都没有"。
+  //
+  // 现在 data_socket 不 connect（用 sendto），目标放在 Target 里由控制口改。
+  struct Target {
+    std::mutex mu;
+    std::string ip;
+    uint16_t port = 0;
+    uint32_t stream_id = 1;
+    uint32_t generation = 1;   // 每改一次 +1，发送线程据此重新握手
+  };
+  Target target;
+  target.mu.lock();
+  target.ip = opt.hub_ip;
+  target.port = opt.hub_port;
+  target.stream_id = static_cast<uint32_t>(opt.stream_id);
+  target.mu.unlock();
+
   audiohub::UdpSocket data_socket;
-  if (!data_socket.Open(0) || !data_socket.SetPeer(opt.hub_ip, opt.hub_port)) {
-    std::printf("无法连接汇聚端 %s:%u -- %s\n", opt.hub_ip.c_str(), opt.hub_port,
-                data_socket.last_error().c_str());
+  if (!data_socket.Open(0)) {
+    std::printf("无法打开发送端口 -- %s\n", data_socket.last_error().c_str());
     return 2;
+  }
+  data_socket.SetSendBufferBytes(1 << 20);
+
+  // 控制口（只绑 127.0.0.1，不对外）：RETARGET / STATUS / STOP
+  audiohub::UdpSocket control_socket;
+  const bool have_control = opt.control_port > 0;
+  if (have_control) {
+    if (!control_socket.Open(static_cast<uint16_t>(opt.control_port))) {
+      std::printf("控制口 %d 打开失败 -- %s\n", opt.control_port,
+                  control_socket.last_error().c_str());
+      return 2;
+    }
+    control_socket.SetReceiveTimeoutMs(50);
+    std::printf("控制口     : 127.0.0.1:%d（可在运行中改投目标）\n", opt.control_port);
   }
 
   // 直连中继模式没有控制通道：对端是 audio_relay_kit 的固件，只认音频包。
@@ -382,6 +426,25 @@ int main(int argc, char** argv) {
   audiohub::PacketHeader header;
   header.stream_id = static_cast<uint16_t>(opt.stream_id);
 
+  // ---- 握手状态（提升到外层：统计线程要读，发送线程要写）----
+  //
+  // 旧实现是在发送线程里跑 15 次阻塞握手，拿不到 CONN-ACK 就 `return`
+  // （整个进程退出），由 Electron 3 秒后重新 spawn。切换汇聚端时新目标往往
+  // 还没准备好（手机刚被设为汇聚端、ReceiverService 还在 bind 端口），于是
+  // 新进程反复撞 10 秒超时 → 用户听到"只有第一次有声音，之后怎么切都没有"。
+  //
+  // 现在：握手是发送循环里的一件事，没确认就每 2 秒重试，边重试边把音频发过去
+  // （对端 auto-accept 时本来就不需要握手）。进程永不因为握手失败而退出。
+  // 仍然刻意**不**用 SetPeer/connect()：UDP 的 connect() 只是让内核按对端地址
+  // 过滤入包，回包源端口被 NAT / AP 中继改写后会被静默丢掉。
+  audiohub::UdpSocket hs;
+  const bool hs_open = opt.handshake && hs.Open(0);
+  if (hs_open) hs.SetNonBlocking(true);   // 发送循环不能被握手阻塞
+  std::atomic<bool> hs_confirmed{false};
+  std::atomic<int> hs_attempts{0};
+  uint32_t hs_generation = 0;             // 已经对哪个 generation 的目标发起过握手
+  auto hs_last_send = Clock::now() - std::chrono::seconds(5);
+
   std::thread sender([&] {
     uint32_t sample_pos = 0;
     uint32_t send_errors = 0;
@@ -399,30 +462,6 @@ int main(int argc, char** argv) {
     // 均匀发送能把这段抖动直接从链路上消掉。
     std::mt19937 rng{std::random_device{}()};
 
-    // ---- 握手：请求对方确认后才开始发音频 ----
-    if (opt.handshake) {
-      audiohub::UdpSocket hs;
-      if (!hs.Open(0) || !hs.SetPeer(opt.hub_ip, static_cast<uint16_t>(opt.hub_port + 2))) {
-        std::printf("握手口连接失败\n");
-        return;
-      }
-      hs.SetReceiveTimeoutMs(1000);
-      const std::string req = "CONN-REQ|" + opt.device_name + "|" +
-                              std::to_string(opt.stream_id) + "\n";
-      bool confirmed = false;
-      for (int i = 0; i < 15 && !confirmed && running.load(); ++i) {
-        hs.SendToPeer(req.data(), req.size());
-        uint8_t rbuf[256];
-        const int n = hs.ReceiveFrom(rbuf, sizeof(rbuf), nullptr, nullptr);
-        if (n > 0 && std::memcmp(rbuf, "CONN-ACK", 8) == 0) confirmed = true;
-        else std::this_thread::sleep_for(std::chrono::milliseconds(700));
-      }
-      if (!confirmed) {
-        std::printf("对方未在 10 秒内确认连接\n");
-        return;
-      }
-      std::printf("对方已确认连接\n");
-    }
 
     auto next = Clock::now();
     const auto tick = std::chrono::microseconds(audiohub::kFramesPerPacket * 1000000 /
@@ -465,15 +504,55 @@ int main(int argc, char** argv) {
         header.seq++;
         header.sample_pos = sample_pos;
         header.capture_ts_ms = NowMs(t0);
+        // 通道号由当前目标决定（切换汇聚端后可能出现不同的 stream_id）
+        target.mu.lock();
+        header.stream_id = static_cast<uint16_t>(target.stream_id);
+        const std::string dst_ip = target.ip;
+        const uint16_t dst_port = target.port;
+        const uint32_t dst_gen = target.generation;
+        target.mu.unlock();
+        header.version = audiohub::kProtocolVersion;
 
         const size_t n = audiohub::EncodeHeader(header, datagram.data());
         std::memcpy(datagram.data() + n, payload.data(), packet_samples * sizeof(int16_t));
-        if (!data_socket.SendToPeer(datagram.data(), n + packet_samples * sizeof(int16_t))) {
+        // sendto 而不是 send：目标每次从 target 读，换目标不需要重建 socket/进程
+        if (!data_socket.SendToAddr(dst_ip, dst_port, datagram.data(),
+                                    n + packet_samples * sizeof(int16_t))) {
           if (send_errors++ < 5) {
             std::printf("发送失败: %s\n", data_socket.last_error().c_str());
           }
         } else {
           sent_packets++;
+        }
+
+        // ---- 握手（非阻塞）：目标变了就先对新目标握一次，之后每 2 秒重试 ----
+        if (hs_open) {
+          if (dst_gen != hs_generation) {
+            hs_generation = dst_gen;
+            hs_confirmed.store(false);
+            hs_attempts.store(0);
+            hs_last_send = Clock::now() - std::chrono::seconds(5);  // 立即发
+          }
+          const auto now = Clock::now();
+          if (!hs_confirmed.load() &&
+              now - hs_last_send >= std::chrono::milliseconds(2000)) {
+            hs_last_send = now;
+            const std::string req = "CONN-REQ|" + opt.device_name + "|" +
+                                    std::to_string(header.stream_id) + "\n";
+            hs.SendToAddr(dst_ip, static_cast<uint16_t>(dst_port + 2), req.data(), req.size());
+            if (hs_attempts++ == 0) {
+              std::printf("正在请求 %s:%u 确认连接…\n", dst_ip.c_str(),
+                          static_cast<unsigned>(dst_port));
+            }
+          }
+          uint8_t rbuf[256];
+          while (hs.ReceiveFrom(rbuf, sizeof(rbuf), nullptr, nullptr) > 0) {
+            if (std::memcmp(rbuf, "CONN-ACK", 8) == 0 && !hs_confirmed.load()) {
+              hs_confirmed.store(true);
+              std::printf("对方已确认连接（%s:%u）\n", dst_ip.c_str(),
+                          static_cast<unsigned>(dst_port));
+            }
+          }
         }
       }
       sample_pos += audiohub::kFramesPerPacket;
@@ -492,7 +571,83 @@ int main(int argc, char** argv) {
     }
   });
 
-  // ---- 时钟同步线程（仅汇聚端模式）----
+  // ---- 本地控制口线程：运行中改投目标（切换汇聚端不断音的关键）----
+  //
+  // 协议（一行一条，只绑 127.0.0.1）：
+  //   RETARGET <ip>:<port> <streamId>   ->  "OK <ip>:<port> <streamId>"
+  //   STATUS                            ->  "STATUS <ip>:<port> <streamId> <sent_packets>"
+  //   STOP                              ->  "OK stopping"（让进程自己走退出路径，恢复静音）
+  std::thread control_thread;
+  if (have_control) {
+    control_thread = std::thread([&] {
+      uint8_t buf[512];
+      while (running.load()) {
+        std::string from_ip;
+        uint16_t from_port = 0;
+        const int n = control_socket.ReceiveFrom(buf, sizeof(buf), &from_ip, &from_port);
+        if (n <= 0) continue;   // 50ms 超时
+        const std::string line(reinterpret_cast<char*>(buf), static_cast<size_t>(n));
+        auto reply = [&](const std::string& text) {
+          control_socket.SendToAddr(from_ip, from_port, text.data(), text.size());
+        };
+        if (line.rfind("RETARGET ", 0) == 0) {
+          // RETARGET ip:port streamId
+          std::string body = line.substr(9);
+          while (!body.empty() && (body.back() == '\n' || body.back() == '\r')) body.pop_back();
+          const size_t space = body.find(' ');
+          const std::string addr = space == std::string::npos ? body : body.substr(0, space);
+          const std::string sid_text = space == std::string::npos ? "" : body.substr(space + 1);
+          const size_t colon = addr.rfind(':');
+          if (colon == std::string::npos || colon == 0) {
+            reply("ERR bad address\n");
+            continue;
+          }
+          const std::string ip = addr.substr(0, colon);
+          int port_value = 0, sid_value = static_cast<int>(opt.stream_id);
+          try {
+            port_value = std::stoi(addr.substr(colon + 1));
+            if (!sid_text.empty()) sid_value = std::stoi(sid_text);
+          } catch (...) {
+            reply("ERR bad number\n");
+            continue;
+          }
+          if (port_value <= 0 || port_value > 65535) {
+            reply("ERR bad port\n");
+            continue;
+          }
+          {
+            std::lock_guard<std::mutex> lock(target.mu);
+            // 先给旧目标发 CONN-BYE：它手里的抖动缓冲里还压着几十毫秒，
+            // 不发的话要等 5 秒音频超时才摘流，用户会听到"两边同时在响"。
+            if (!target.ip.empty() && target.port > 0) {
+              const std::string bye = "CONN-BYE|" + std::to_string(target.stream_id) + "\n";
+              hs.SendToAddr(target.ip, static_cast<uint16_t>(target.port + 2),
+                            bye.data(), bye.size());
+            }
+            target.ip = ip;
+            target.port = static_cast<uint16_t>(port_value);
+            target.stream_id = static_cast<uint32_t>(sid_value > 0 ? sid_value : 1);
+            target.generation++;
+          }
+          std::printf("改投目标 -> %s:%d（通道 %d）\n", ip.c_str(), port_value, sid_value);
+          std::fflush(stdout);
+          reply("OK " + ip + ":" + std::to_string(port_value) + " " +
+                std::to_string(sid_value) + "\n");
+        } else if (line.rfind("STATUS", 0) == 0) {
+          std::lock_guard<std::mutex> lock(target.mu);
+          reply("STATUS " + target.ip + ":" + std::to_string(target.port) + " " +
+                std::to_string(target.stream_id) + " " +
+                std::to_string(sent_packets.load()) + "\n");
+        } else if (line.rfind("STOP", 0) == 0) {
+          reply("OK stopping\n");
+          running.store(false);
+        } else {
+          reply("ERR unknown command\n");
+        }
+      }
+    });
+  }
+
   // 中继对端不回应 PING，留着这个线程只会每 470 ms 往对端扔一个无效包。
   audiohub::ClockSync clock_sync;
   std::atomic<double> measured_offset_ms{0.0};
@@ -558,17 +713,25 @@ int main(int argc, char** argv) {
     const unsigned long long pkts = static_cast<unsigned long long>(p - last_packets);
     const double kbps = pkts * (packet_samples * 2 + audiohub::kHeaderSize) * 8.0 / 1000.0;
     const unsigned long long dropped = static_cast<unsigned long long>(dropped_samples.load());
+    // 目标 + 握手状态一起打印：排查"没声音"时第一眼要知道包到底发去哪儿了。
+    std::string dst_text;
+    {
+      std::lock_guard<std::mutex> lock(target.mu);
+      dst_text = target.ip + ":" + std::to_string(target.port) + " · 通道 " +
+                 std::to_string(target.stream_id);
+    }
+    const char* hs_text = !hs_open ? "" : (hs_confirmed.load() ? " · 已确认" : " · 待确认");
     if (opt.relay) {
       // 中继模式没有控制通道，RTT/单程没有意义，省掉这两列免得被当成 0 ms 正常。
-      std::printf("采集 %5.1f kfps 发送电平 %6.1f dBFS | 发送 %4llu pkt/s | 约 %6.1f kbps | 丢 %llu\n",
+      std::printf("采集 %5.1f kfps 发送电平 %6.1f dBFS | 发送 %4llu pkt/s | 约 %6.1f kbps | 丢 %llu | %s%s\n",
                   (f - last_frames) / 1000.0, has_level ? capture_level : -120.0, pkts, kbps,
-                  dropped);
+                  dropped, dst_text.c_str(), hs_text);
     } else {
       std::printf(
           "采集 %5.1f kfps 发送电平 %6.1f dBFS | 发送 %4llu pkt/s | 约 %6.1f kbps | RTT %5.1f ms "
-          "| 单程 %5.1f ms | 丢 %llu\n",
+          "| 单程 %5.1f ms | 丢 %llu | %s%s\n",
           (f - last_frames) / 1000.0, has_level ? capture_level : -120.0, pkts, kbps, rtt,
-          rtt * 0.5, dropped);
+          rtt * 0.5, dropped, dst_text.c_str(), hs_text);
     }
     last_frames = f;
     last_packets = p;
@@ -583,6 +746,7 @@ int main(int argc, char** argv) {
 
   running.store(false);
   capture.Stop();
+  if (control_thread.joinable()) control_thread.join();
   if (sender.joinable()) sender.join();
   if (clock_thread.joinable()) clock_thread.join();
 

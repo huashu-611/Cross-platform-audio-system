@@ -116,6 +116,7 @@ ctest --test-dir build --output-on-failure
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\build.ps1        # 编译全部 + 跑单测
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\graph-smoke.ps1  # 图谱冒烟：起两个 hub 进程互发 GRAPH，结束自动清理
 node tools\ui-e2e.js                                                       # Electron 界面端到端（开发态；打包态设 AUDIOHUB_UI_EXE=ui\dist\AudioHub-便携版.exe）
+node tools\audioflow-test.js                                               # 音频流连续性与切换验收：两个 hub + 内置正弦音源，反复切换都要出声（--rounds N）
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\build-apk.ps1    # 重新打包 Android APK
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\probe-rx.ps1 -Secs 12  # 直连源端 UDP 量时间轴空洞/丢包（排查音频卡顿、电流音）
 javac -d build\mixcheck-out tools\mixcheck\MixCheck.java; java -cp build\mixcheck-out MixCheck  # 混音标度数值对照（不需要 Android SDK）
@@ -175,7 +176,8 @@ cd ui && npm start
 汇聚端是大球。**左键只负责拖动**——拖小球 = 在地面摆位，拖空白处 = 旋转视角；
 **右键点小球**弹出节点菜单：「切换汇聚端到此设备」「位置复位」（汇聚端节点上还有
 「所有设备位置复位」）。**音量就是距离**：没有音量滑杆，把球拖远就变小、拖近就变大
-（0.25 m 内到 +6 dB 封顶，往外无限衰减，没有最大距离限制）。
+（0.25 m 内到 +6 dB 封顶，往外按 d^1.6 衰减，没有最大距离限制；
+2 m 约 -9.6 dB、4 m 约 -19.3 dB，拖远后听感变化明显）。
 切换后立即生效并带同步状态，同时把新图谱广播给所有设备；手机和另一台 PC 的界面
 会在 1~2 秒内自动跟着变，不用每台设备各点一遍。协议与合并规则见
 [docs/GRAPH-PROTOCOL.md](docs/GRAPH-PROTOCOL.md)。
@@ -360,10 +362,61 @@ stream 1  水位 56 ms (目标 60) | 比率 1.00018 | 迟到 0 溢出 0 | 欠载
    `send()` 可能阻塞（ARP 未解析、路由变化）。阻塞在采集回调里 = WASAPI 缓冲溢出 = 声音断掉。
    所以采集回调只做 float→int16 和入环，发送交给独立线程。
 
+7. **握手用 `sendto` + `recvfrom`，绝不用 UDP `connect()`**
+   UDP 的 `connect()` 不建立连接，只是让内核**按对端 ip:port 过滤入包**。
+   对端回包一旦源端口被 NAT / AP 中继改写（手机回 `CONN-ACK` 用的就是绑定在
+   `音频口+2` 上的同一个套接字），内核会**静默丢弃**：发送成功、`recvfrom` 永远超时，
+   表现为「对方未在 10 秒内确认连接」，而对方其实早就回了。
+   实测对照：未 connect 的套接字 1 秒内就收到 `CONN-ACK`，`connect()` 过的 6 次全部超时。
+   音频数据方向（`data_socket`）用 `SetPeer` 是安全的——它是单向大流量，不需要收对方的回包。
+
+8. **「全部断开」= 退出图谱共识，而不只是"不广播"**
+   协议 §4.6 原来只要求重置后不主动广播。实测这不够：对端每 3 秒还在周期广播它的旧图谱，
+   本机一合并就把刚清掉的节点全捞回来（节点是纯并集，从不删）。于是出现
+   「一方断开就清空图谱」「退出后又被拉回控制台，但只显示自己的汇聚端」「反复切换后没声音」。
+   现在两端都有显式的 `detached` 状态（C++ `graph_detached` / Java `GraphStore.detached`）：
+   会话结束期间**既不广播也不合并**，直到本机重新入网（手动连接 / 接受邀请 / 设自己为汇聚端）。
+
+9. **切换汇聚端 = 改发送目标，不是重启音源进程**
+   旧实现把目标 `connect()` 死在音源进程的启动参数上，换目标只能 kill + 重新 spawn：
+   重建要走 10 秒阻塞握手、抖动缓冲重新蓄水、采集重新起步，每次切换都掉音。
+   现在音源进程带一个本地控制口（`--control-port`），`RETARGET ip:port streamId` 就地改目标、
+   先给旧目标发 `CONN-BYE`、再重新握手；握手改成非阻塞重试（每 2 秒补 `CONN-REQ`），
+   **进程永不因为对方没准备好而退出**。手机端同理：被设为汇聚端时只 `ACTION_PAUSE`
+   关掉 `sending` 开关（**AudioRecord 与采集线程原样保留**），切回音源立刻恢复发包，
+   不再重新弹授权框（Android 14 的投屏授权是一次性的）。
+   早先试过"暂停时停掉 AudioRecord、恢复时新建一个"，在模拟器上反复
+   `releaseBuffer: mUnreleased out of range` 原生崩溃——只要还有线程阻塞在 `read()` 里，
+   `stop()/release()` 就是竞态窗口。一个会话一个 `AudioRecord`、一条线程是唯一稳定用法。
+   验收见 `tools/audioflow-test.js`。
+
+10. **汇聚端放音跟随系统默认播放设备，而不是启动时那台**
+    老实现只在 `Start()` 时 `GetDefaultAudioEndpoint(eRender, eConsole)` 解析一次，
+    `IAudioClient` 一旦 `Initialize` 就与那台设备焊死。用户后插耳机、切蓝牙、
+    或在设置里改默认播放设备，长驻的 hub 进程**不会改道** ——
+    表现就是「插上耳机，声音还在扬声器上」。
+    现在渲染线程每约 1 秒比对一次默认播放设备的 id，变了就跳出循环、
+    由 `ThreadMain()` 重建一条到新设备的流（不重启进程、不断服务）。
+    另外默认设备优先取 `eMultimedia`（媒体播放）而不是 `eConsole`（控制台提示音）：
+    「耳机设成媒体默认、扬声器仍是控制台默认」是很常见的配置，
+    一律取 `eConsole` 会让耳机永远不生效。
+
+11. **切换汇聚端时，图谱和「起来收流」的指令必须一起发**
+    `GRAPH` 帧只是让大家知道"谁是 hub"，它**不会**让那台设备启动接收服务 ——
+    手机的 `ReceiverService` 是被 `ROLE|hub` 唤起的。老实现只 `GraphScheduleDoubleLocked()`
+    广播图谱、从不发 ROLE，用户把汇聚端切到手机后会看到「电脑一直在发、手机 0 路」。
+    现在 `SwitchGraphHub()` 在解锁后按目标补发：对端当 hub → `ROLE|hub`；
+    本机当 hub → 对所有其它节点 `ROLE|source|ip:port`。
+    发送必须放在锁外，`UdpSocket` 不能持锁调用。
+
 ---
 
 ## 已知限制
 
+- **输出设备跟随是靠 1 秒轮询，不是系统事件**。正确做法是注册
+  `IMMNotificationClient` 的 `OnDefaultDeviceChanged`，但这需要在音频线程之外
+  维护一个 COM 对象并把通知搬进渲染循环，本轮先用轮询换简单可靠。
+  代价：切设备后最多 1 秒才切过去，且切换瞬间有一小段静音。
 - **单机跑真实采集必须加 `--exclude audiohub-hub.exe`**：否则 source 抓到的
   系统混音里包含 hub 自己的输出，形成环回反馈。加了这个参数就干净了
   （已实测：hub 正在播 440 Hz 时，排除后的源端抓到 −120 dBFS）。

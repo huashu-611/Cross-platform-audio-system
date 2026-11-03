@@ -46,6 +46,8 @@ public class CaptureService extends Service {
 
     public static final String ACTION_START = "com.audiohub.source.action.START";
     public static final String ACTION_STOP = "com.audiohub.source.action.STOP";
+    /** 停采集但保留投屏会话（本机暂时被设为汇聚端时用，见 stopCaptureKeepProjection）。 */
+    public static final String ACTION_PAUSE = "com.audiohub.source.action.PAUSE";
 
     public static final String EXTRA_RESULT_CODE = "resultCode";
     public static final String EXTRA_RESULT_DATA = "resultData";
@@ -58,10 +60,29 @@ public class CaptureService extends Service {
 
     // ---- 给界面轮询的静态快照。不持有 Activity 引用，避免内存泄漏。----
     public static volatile boolean sRunning = false;
+    /**
+     * 服务里是否还留着一个可复用的 MediaProjection 会话（暂停但没销毁时有）。
+     * MainActivity 用它判断"能不能不弹授权框直接恢复采集"。
+     */
+    public static volatile boolean sHasProjection = false;
     public static volatile String sStatus = "未启动";
     public static volatile long sPackets = 0;
     public static volatile int sLevelDbfs = -120;
     public static volatile double sKbps = 0;
+
+    /**
+     * 最近一次启动/运行失败的原因，MainActivity 每 400ms 轮询取走并清空。
+     * 主要用途：把「采集授权已失效，请重新授权」这种必须让用户看到的信息
+     * 从服务传到界面（服务里没有 Activity，不能直接弹 Toast）。
+     */
+    public static volatile String sLastError = null;
+
+    /** 取走并清空最近一次错误；没有错误返回 null。 */
+    public static String consumeError() {
+        final String e = sLastError;
+        sLastError = null;
+        return e;
+    }
 
     // ---- 当前采集目标。MainActivity 的 400ms reconcile 拿它和图谱比对：
     // 目标 IP / 端口 / streamId 任何一个变了，就用已保存的 MediaProjection 授权重启。----
@@ -94,12 +115,33 @@ public class CaptureService extends Service {
     private AudioRecord record;
     private Thread worker;
     private volatile boolean running;
-    private DatagramSocket socket;
-    private InetAddress address;
-    private int port;
-    private int streamId;
+    /**
+     * 本次停止是"暂停"（保留投屏会话）而不是真停。
+     * 采集线程退出时会看这个标志决定要不要 stopSelf：
+     * 一旦 stopSelf，onDestroy 会走 stopCapture() 把 projection 一起销毁，
+     * 保留会话的努力就白费了。
+     */
+    private volatile boolean pausing;
+
+    /**
+     * 发送开关。暂停（本机被设为汇聚端）时置 false：采集线程继续读 AudioRecord
+     * 但不再发包，切回音源时置 true 立刻恢复。
+     *
+     * 为什么不干脆停掉采集：AudioRecord 的 stop/release 与阻塞中的 read() 之间
+     * 有竞态，反复切换会踩到 releaseBuffer: mUnreleased out of range 的原生 abort。
+     * 保持"一条线程、一个 record、从头到尾"是唯一稳定的用法。
+     */
+    private volatile boolean sending;
+    private volatile DatagramSocket socket;
+    private volatile InetAddress address;
+    private volatile int port;
+    private volatile int streamId;
     /** CONN-BYE 只发一次；开始新会话时复位（见 onStartCommand）。 */
     private volatile boolean byeSent;
+
+    // 最近一次 onStartCommand 的 startId：收尾时用 stopSelfResult(它)，
+    // 不能用裸 stopSelf()（会把仍在路上的 startForegroundService 请求一并丢掉）。
+    private volatile int pendingStartId = -1;
 
     private WifiManager.WifiLock wifiLock;
     private PowerManager.WakeLock wakeLock;
@@ -109,44 +151,157 @@ public class CaptureService extends Service {
         return null;
     }
 
+    /**
+     * onStartCommand 运行在主线程：这里只要漏出一个未捕获异常，Android 就会把整个
+     * 进程杀掉（用户看到的就是「一进控制界面就退出」）。里面的每一步都已经各自兜住
+     * 了，外面再套一层总保险，保证采集起不来时只是没声音 + 一条 Toast，不会闪退。
+     */
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        pendingStartId = startId;
+
+        // ---- 前台义务：进前台必须排在**所有**分支之前 ----
+        //
+        // startForegroundService() 一发出，系统就开始 10 秒倒计时；到点没看到
+        // startForeground() 就抛 ForegroundServiceDidNotStartInTimeException
+        // 并把进程整个杀掉。这里原本只在 ACTION_START 分支里调用，于是
+        // intent == null / 未知 action / ACTION_STOP 三条早退路径都留着义务洞；
+        // 尤其 ACTION_STOP 的裸 stopSelf() 会把仍在路上的 startForegroundService()
+        // 请求一起丢掉，那条请求的义务就永远没人履行。
+        //
+        // 注意与 ReceiverService 的差别：采集例外地**允许**前台起不来
+        // （Android 14 复用过期授权时会抛 SecurityException），那种情况要让
+        // sLastError 把原因交给界面，而不是崩进程 —— 所以这里吞掉异常，
+        // 由 handleStartCommand 的 ACTION_START 分支再判一次。
+        boolean fg = false;
+        try {
+            startForegroundNotification();
+            fg = true;
+        } catch (Throwable t) {
+            Log.e(TAG, "进入采集前台失败: " + Log.getStackTraceString(t));
+            sLastError = "采集授权已失效，请在手机上重新点「送入」";
+            sStatus = sLastError;
+            sRunning = false;
+        }
+
+        try {
+            return handleStartCommand(intent, startId, fg);
+        } catch (Throwable t) {
+            Log.e(TAG, "采集启动异常: " + Log.getStackTraceString(t));
+            sLastError = "采集启动失败（" + t.getClass().getSimpleName() + "），请重新点「送入」";
+            sStatus = sLastError;
+            sRunning = false;
+            try {
+                stopCapture();
+            } catch (Throwable ignored) {
+            }
+            try { stopForeground(STOP_FOREGROUND_REMOVE); } catch (Throwable ignored) {}
+            stopSelfResult(startId);
+            return START_NOT_STICKY;
+        }
+    }
+
+    private int handleStartCommand(Intent intent, int startId, boolean fg) {
+        // 没有 intent 就没有活干；义务已经在 onStartCommand 顶部履行完。
         if (intent == null) return START_NOT_STICKY;
 
         if (ACTION_STOP.equals(intent.getAction())) {
             stopCapture();
-            stopSelf();
+            stopForeground(STOP_FOREGROUND_REMOVE);
+            // stopSelfResult(startId)：只在这是最后一次 start 请求时才真停，
+            // 避免把仍在路上的 startForegroundService() 请求连义务一起丢掉。
+            stopSelfResult(startId);
             return START_NOT_STICKY;
+        }
+
+        if (ACTION_PAUSE.equals(intent.getAction())) {
+            // 暂停但保住投屏会话：切回音源时能直接恢复，不用重新弹授权框。
+            pausing = true;
+            stopCaptureKeepProjection();
+            return START_STICKY;
         }
 
         if (!ACTION_START.equals(intent.getAction())) {
             return START_NOT_STICKY;
         }
+        // 重新开始采集：无论走 retarget 还是 resume，都不再是暂停态
+        pausing = false;
 
-        // 顺序不能变：先进入前台（带类型），再取 MediaProjection。
-        startForegroundNotification();
+        // 前台已在 onStartCommand 顶部尝试过；这里只判断结果。
+        // Android 14 起 startForeground 会校验进程当前是否还持有有效的采集授权，
+        // 复用上一次会话的授权时会抛 SecurityException —— 那种情况要给出可读原因
+        // 并停止采集，而不是留下一个没有前台的采集线程被系统回收。
+        if (!fg) {
+            sLastError = "采集授权已失效，请在手机上重新点「送入」";
+            sStatus = sLastError;
+            sRunning = false;
+            stopCapture();
+            try { stopForeground(STOP_FOREGROUND_REMOVE); } catch (Throwable ignored) {}
+            stopSelfResult(startId);
+            return START_NOT_STICKY;
+        }
+        sLastError = null;
 
         final int resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED);
         final Intent resultData = intent.getParcelableExtra(EXTRA_RESULT_DATA);
         final String host = intent.getStringExtra(EXTRA_HOST);
-        port = intent.getIntExtra(EXTRA_PORT, 47000);
-        streamId = intent.getIntExtra(EXTRA_STREAM_ID, 1);
+        final int wantPort = intent.getIntExtra(EXTRA_PORT, 47000);
+        final int wantStreamId = intent.getIntExtra(EXTRA_STREAM_ID, 1);
 
         // 幂等：400ms reconcile 可能重复下发同一个 START。
-        // 目标完全一样 → 直接忽略；目标变了（切换汇聚端 / streamId 变化）→ 先收尾再用
-        // 调用方保存的授权重建，避免两个 AudioRecord / 两个 socket 同时存在。
         if (running || sRunning) {
             if (host != null && host.equals(sHost)
-                    && port == sPort && streamId == sStreamId) {
+                    && wantPort == sPort && wantStreamId == sStreamId) {
                 return START_NOT_STICKY;
             }
-            stopCapture();
+            // 目标变了（切换汇聚端 / 音源通道号变了）：只换发送目标，复用当前
+            // AudioRecord 与 MediaProjection 会话。Android 14 的采集授权是一次性的，
+            // 「先 stopCapture 再用旧授权重建」必然在 startForeground /
+            // getMediaProjection 处被系统拒绝 —— 这正是 2026-10-28 闪退的根因。
+            if (host == null || host.isEmpty()) {
+                fail("没有填写汇聚端地址");
+                return START_NOT_STICKY;
+            }
+            try {
+                // 先用旧的目标地址给旧汇聚端发一次 CONN-BYE，让它立刻摘掉这一路流，
+                // 否则要等 5 秒音频超时。发完再把 byeSent 复位给新会话用。
+                sendByeBestEffort();
+                final InetAddress nextAddress = InetAddress.getByName(host);
+                final DatagramSocket nextSocket = new DatagramSocket();
+                nextSocket.setSendBufferSize(1 << 20);
+                final DatagramSocket oldSocket = socket;
+                socket = nextSocket;
+                if (oldSocket != null) oldSocket.close();
+                address = nextAddress;
+                port = wantPort;
+                streamId = wantStreamId;
+                sHost = host;
+                sPort = wantPort;
+                sStreamId = wantStreamId;
+                // 新目标：允许本次会话结束时向新汇聚端发 CONN-BYE
+                byeSent = false;
+                // 从暂停态切回音源时走的就是这条 retarget 分支（running 一直是 true），
+                // 所以这里必须把发送开关重新打开，否则采集线程还在读、但一个包都不发。
+                sending = true;
+                sRunning = true;
+                sStatus = "已连接 " + host + ":" + wantPort + " · 通道 " + wantStreamId;
+                Log.i(TAG, "采集目标已切换 → " + host + ":" + wantPort);
+            } catch (Exception e) {
+                fail("切换采集目标失败: " + e.getMessage());
+            }
+            return START_NOT_STICKY;
         }
 
         // 新会话：允许本次会话结束时再发 CONN-BYE（上一次会话的 BYE 已在 stopCapture 发过）
+        port = wantPort;
+        streamId = wantStreamId;
         byeSent = false;
 
-        if (resultCode != Activity.RESULT_OK || resultData == null) {
+        // 没有新授权不是错误：可能只是"暂停过"（本机曾被设为汇聚端）。
+        // 见下面的 resume 分支 —— Android 14 的投屏授权一次性，切回音源时
+        // 拿不到第二次授权，只能复用保留下来的投屏会话。
+        final boolean haveAuth = resultCode == Activity.RESULT_OK && resultData != null;
+        if (!haveAuth && projection == null) {
             fail("没有拿到屏幕/音频采集授权");
             return START_NOT_STICKY;
         }
@@ -170,10 +325,35 @@ public class CaptureService extends Service {
             return START_NOT_STICKY;
         }
 
+        // ---- 复用保留的采集会话恢复发送（不重新要授权）----
+        if (!haveAuth) {
+            if (projection == null) {
+                fail("没有拿到屏幕/音频采集授权");
+                return START_NOT_STICKY;
+            }
+            // 暂停期间 AudioRecord 和采集线程都还在（见 stopCaptureKeepProjection）：
+            // 这里只要重新打开 socket、设好新目标、把发送开关打开就行。
+            // 不用新建 AudioRecord，也就不会再有"两个线程抢一个 record"的竞态。
+            running = true;
+            sending = true;
+            sRunning = true;
+            sHost = host;
+            sPort = port;
+            sStreamId = streamId;
+            sPackets = 0;
+            sStatus = "已恢复 " + host + ":" + port + " · 通道 " + streamId;
+            Log.i(TAG, "复用保留的采集会话恢复发送 → " + host + ":" + port);
+            muteMediaVolume();
+            acquireLocks();
+            ensureWorkerRunning();
+            return START_NOT_STICKY;
+        }
+
         MediaProjectionManager manager =
                 (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
         try {
             projection = manager.getMediaProjection(resultCode, resultData);
+            sHasProjection = projection != null;
         } catch (Throwable t) {
             // 切换汇聚端时复用上次授权：Android 14 起部分 ROM 会在这里抛
             // SecurityException（一个授权令牌不能重开两路采集）。兜住并让用户重新授权，
@@ -191,10 +371,18 @@ public class CaptureService extends Service {
             public void onStop() {
                 // 用户在系统通知里点了"停止共享"
                 stopCapture();
-                stopSelf();
+                stopSelfResult(pendingStartId);
             }
         };
-        projection.registerCallback(projectionCallback, new Handler(Looper.getMainLooper()));
+        try {
+            projection.registerCallback(projectionCallback, new Handler(Looper.getMainLooper()));
+        } catch (Throwable t) {
+            // v0.4：个别 ROM 在注册采集回调时会抛 SecurityException/IllegalStateException。
+            // 之前这里没有兜底，异常会把 Service 主线程带走 —— 用户看到的就是
+            // “同意邀请、刚进控制屏 App 就消失”。这里改成失败即停，绝不崩进程。
+            fail("注册采集回调失败: " + t.getClass().getSimpleName());
+            return START_NOT_STICKY;
+        }
 
         if (!startRecording()) {
             return START_NOT_STICKY;
@@ -214,6 +402,23 @@ public class CaptureService extends Service {
     }
 
     // ------------------------------------------------------------ 采集
+
+    /** 采集线程应该一直在跑（暂停时只关发送），这里只在它真的没跑时补起一条。 */
+    private void ensureWorkerRunning() {
+        if (worker != null && worker.isAlive()) return;
+        final AudioRecord current = record;
+        if (current == null) {
+            fail("采集会话已失效，请重新点「送入」授权");
+            return;
+        }
+        worker = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                workerLoop(current);
+            }
+        }, "audiohub-capture");
+        worker.start();
+    }
 
     private boolean startRecording() {
         int minBytes = AudioRecord.getMinBufferSize(
@@ -264,14 +469,24 @@ public class CaptureService extends Service {
             return false;
         }
 
-        record.startRecording();
+        try {
+            record.startRecording();
+        } catch (Throwable t) {
+            // v0.4：startRecording 在部分机型上会抛（录音被占用/播放采集不可用）。
+            record.release();
+            record = null;
+            fail("启动采集失败: " + t.getMessage());
+            return false;
+        }
         running = true;
+        sending = true;   // 新会话默认就是"正在发送"，暂停由 ACTION_PAUSE 单独关
         // 用匿名内部类而不是方法引用：android.jar 里没有
         // java.lang.invoke.LambdaMetafactory，lambda/方法引用在 javac 阶段就编不过。
+        final AudioRecord startedRecord = record;   // 启动时抓死，见 workerLoop 注释
         worker = new Thread(new Runnable() {
             @Override
             public void run() {
-                workerLoop();
+                workerLoop(startedRecord);
             }
         }, "audiohub-capture");
         worker.start();
@@ -284,11 +499,14 @@ public class CaptureService extends Service {
      * 用阻塞读而不是回调：read() 凑够 240 帧才返回，天然就是 5 ms 的节拍；
      * 而回调模式下数据是系统按自己的周期送来的，反而要额外做重分块。
      */
-    private void workerLoop() {
+    private void workerLoop(final AudioRecord capture) {
         final short[] block = new short[PacketProtocol.FRAMES_PER_PACKET * PacketProtocol.CHANNELS];
         final byte[] packet = new byte[PacketProtocol.PACKET_BYTES];
-        final DatagramPacket datagram =
-                new DatagramPacket(packet, packet.length, address, port);
+        // 目标地址可以被 onStartCommand 的 retarget 分支换掉（切换汇聚端时不重建采集）。
+        // 所以每包发送前检查一次，目标变了就重建 DatagramPacket，别一直往旧地址发。
+        DatagramPacket datagram = null;
+        InetAddress datagramAddress = null;
+        int datagramPort = 0;
 
         final long t0 = SystemClock.elapsedRealtime();
         int seq = 0;
@@ -299,8 +517,14 @@ public class CaptureService extends Service {
         long levelPackets = 0;
         double levelSum = 0;
 
+        try {
         while (running) {
-            final int read = record.read(block, fill, block.length - fill, AudioRecord.READ_BLOCKING);
+            // 用线程启动时抓到的那个 record（见 workerLoop 的参数）：
+            // 恢复采集会新建 AudioRecord，字段 record 会被换掉；
+            // 如果这里读字段，旧线程就会去读新对象 —— 两个线程同时 read 同一个
+            // AudioRecord 会直接触发 releaseBuffer: mUnreleased out of range 的原生 abort
+            // （v0.11 模拟器实测：切回音源后进程 SIGABRT）。
+            final int read = capture.read(block, fill, block.length - fill, AudioRecord.READ_BLOCKING);
             if (read <= 0) {
                 if (read == AudioRecord.ERROR_INVALID_OPERATION || read == AudioRecord.ERROR_DEAD_OBJECT) {
                     sStatus = "采集中断（错误码 " + read + "）";
@@ -310,6 +534,15 @@ public class CaptureService extends Service {
             }
             fill += read;
             if (fill < block.length) continue;  // 还没凑满一包
+
+            // 暂停态：继续读（保持 AudioRecord 一直在跑），但什么都不发。
+            // 见 stopCaptureKeepProjection —— 不销毁 record 就不会有生命周期竞态。
+            if (!sending) {
+                fill = 0;
+                levelSum = 0;
+                levelPackets = 0;
+                continue;
+            }
 
             // 电平：给界面看"到底抓到声音没有"
             for (int i = 0; i < block.length; ++i) {
@@ -322,11 +555,22 @@ public class CaptureService extends Service {
                     (int) (SystemClock.elapsedRealtime() - t0));
             PacketProtocol.writePayload(packet, PacketProtocol.HEADER_BYTES, block, block.length);
 
+            final DatagramSocket target = socket;
             try {
-                socket.send(datagram);
-                sPackets++;
+                final InetAddress addr = address;
+                final int destPort = port;
+                if (target != null) {
+                    if (datagram == null || datagramAddress != addr || datagramPort != destPort) {
+                        datagramAddress = addr;
+                        datagramPort = destPort;
+                        datagram = new DatagramPacket(packet, packet.length, addr, destPort);
+                    }
+                    target.send(datagram);
+                    sPackets++;
+                }
             } catch (Exception e) {
-                sStatus = "发送失败: " + e.getMessage();
+                // 切换目标那一瞬间旧 socket 会被关掉，正常的 "Socket closed" 不要报给界面
+                if (target == socket) sStatus = "发送失败: " + e.getMessage();
             }
 
             samplePos += PacketProtocol.FRAMES_PER_PACKET;
@@ -354,14 +598,24 @@ public class CaptureService extends Service {
                 levelWindowStart = now;
             }
         }
+        } catch (Throwable t) {
+            // v0.4：采集线程的异常以前直接终止线程（甚至可能被系统当成崩溃），
+            // 现在统一记到 sLastError，由 MainActivity 轮询提示用户。
+            Log.e(TAG, "采集线程异常退出: " + t, t);
+            sLastError = "采集线程异常退出: " + t.getClass().getSimpleName();
+            sStatus = sLastError;
+        }
 
         // 采集线程自己退出（AudioRecord 错误等）：也要恢复音量，不能把用户手机留在静音。
         sRunning = false;
         restoreMediaVolume();
-        // 采集结束（错误码 / 被系统掐断）：先发 CONN-BYE 让桌面立刻掉流，再停服务释放前台通知。
-        // onDestroy 还会再走一遍 stopCapture，sendByeBestEffort 有幂等保护，不会重复发。
+        // 采集结束（错误码 / 被系统掐断）：先发 CONN-BYE 让桌面立刻掉流。
+        // 暂停态不能 stopSelf —— 那会让 onDestroy 走 stopCapture() 把投屏会话销毁掉，
+        // 切回音源时又得重新弹授权框（Android 14 一次性授权根本弹不出来）。
         sendByeBestEffort();
-        stopSelf();
+        // 用 stopSelfResult 而不是 stopSelf：若此刻还有 START/STOP 请求在排队，
+        // 裸 stopSelf 会把它们连同已计时的前台义务一起丢掉（10 秒后系统杀进程）。
+        if (!pausing) stopSelfResult(pendingStartId);
     }
 
     // ------------------------------------------------------------ 静音与自愈
@@ -477,7 +731,48 @@ public class CaptureService extends Service {
 
     // ------------------------------------------------------------ 收尾
 
+    /**
+     * 暂停发送但**保留**整个采集会话（AudioRecord + 投屏授权 + 采集线程）。
+     *
+     * 用在「本机被设为汇聚端」这条路径上：汇聚端不能再采集（会回授），可用户
+     * 下一秒可能又切回音源。Android 14 的投屏授权是一次性的 —— 如果这里走
+     * stopCapture()（它会 projection.stop() 并清掉会话），切回来就必须重新弹
+     * 系统授权框，用户看到的就是「反复切换之后再也发不出声音」。
+     *
+     * 注意这里**不**销毁 AudioRecord、也不结束采集线程：早期实现那样做过，
+     * 模拟器上反复 abort（releaseBuffer: mUnreleased out of range）—— 只要有一个
+     * 线程还阻塞在 read() 里，另一条路径去 stop()/release() 就会踩到 AudioRecord
+     * 内部未归还缓冲的记账。改成"只停发送"后，一个 record 从会话开始用到结束，
+     * 生命周期端点从"每次切换"收敛到"会话开始/结束"两次，竞态窗口消失。
+     * 代价是暂停期间仍在采集（CPU 极低，且不发送就不会回授）。
+     */
+    private void stopCaptureKeepProjection() {
+        Log.i(TAG, "暂停发送（保留投屏会话与采集线程，切回音源即恢复）");
+        final boolean wasSending = sending;
+        sending = false;
+        // 只有真在发的时候才需要通知对端；socket 还开着，这一句必须排在关 socket 之前。
+        if (wasSending) sendByeBestEffort();
+        // running 保持 true：采集线程继续读 AudioRecord（暂停只关发送）。
+        // 让它退出的唯一路径是 stopCapture()（真停会把 running 置 false）。
+        restoreMediaVolume();
+        if (socket != null) {
+            try {
+                socket.close();
+            } catch (Exception ignored) {
+            }
+            socket = null;
+        }
+        address = null;
+        port = 0;
+        sRunning = false;
+        sHost = "";
+        sPort = 0;
+        sStreamId = 0;
+        sStatus = "已暂停（投屏会话保留，切回音源即恢复）";
+    }
+
     private void stopCapture() {
+        pausing = false;   // 真停：允许 stopSelf / onDestroy 释放投屏会话
         // 先尽力让汇聚端立刻摘掉本机这一路流（协议 §5 CONN-BYE）：用户停止/采集结束/
         // 异常/服务销毁都走这里；此时 socket 还开着、streamId 还在，发出去才有效。
         // 不发的话桌面端要等 5 秒音频超时才掉流，用户看到的就是"手机退了桌面还显示在线"。
@@ -490,21 +785,29 @@ public class CaptureService extends Service {
         sPort = 0;
         sStreamId = 0;
 
-        if (worker != null) {
-            try {
-                worker.join(500);
-            } catch (InterruptedException ignored) {
-                Thread.currentThread().interrupt();
-            }
-            worker = null;
-        }
+        // 同 stopCaptureKeepProjection：必须先 stop 再 join，否则可能 release 掉
+        // 采集线程仍在使用的 AudioRecord（原生 abort: releaseBuffer out of range）。
         if (record != null) {
             try {
                 record.stop();
             } catch (Exception ignored) {
             }
-            record.release();
-            record = null;
+        }
+        final AudioRecord dying = record;
+        if (worker != null) {
+            try {
+                worker.join(800);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            worker = null;
+        }
+        if (dying != null) {
+            try {
+                dying.release();
+            } catch (Exception ignored) {
+            }
+            if (record == dying) record = null;
         }
         if (projection != null) {
             try {
@@ -513,6 +816,7 @@ public class CaptureService extends Service {
             } catch (Exception ignored) {
             }
             projection = null;
+            sHasProjection = false;
         }
         if (socket != null) {
             socket.close();
@@ -524,10 +828,14 @@ public class CaptureService extends Service {
 
     private void fail(String message) {
         Log.e(TAG, message);
-        sStatus = message;
+        // 错误原因要能被 MainActivity 取走（它负责提示用户 + 清掉失效授权），
+        // 否则 400ms 一次的 reconcile 会拿旧授权反复重试，每次都崩一次。
+        sLastError = message;
         sRunning = false;
         stopCapture();
-        stopSelf();
+        // stopCapture 会把 sStatus 覆盖成"已停止"，这里再写回失败原因。
+        sStatus = message;
+        stopSelfResult(pendingStartId);
     }
 
     /**
@@ -568,7 +876,7 @@ public class CaptureService extends Service {
         // 重新邀请也没有任何响应（手机端进程还在但已经没人应答握手）。
         Log.i(TAG, "任务被移除：停止采集并断开连接");
         stopCapture();
-        stopSelf();
+        stopSelfResult(pendingStartId);
         super.onTaskRemoved(rootIntent);
     }
 

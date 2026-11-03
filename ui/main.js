@@ -58,8 +58,24 @@ let pcSourceProcess = null
 let pcSourceTarget = null
 let pcSourceStartedAt = 0
 const PC_SOURCE_RETRY_MS = 3000
+// 新目标要连续稳定这么久才真正切换音源进程（见 ensurePcSource）。
+// 理由：图谱里有人上下线会让本机 streamId 重新排号，200ms 一次轮询下
+// 目标抖两下就会把音源进程杀两次，汇聚端那边就是"没声音"。
+const PC_SOURCE_TARGET_STABLE_MS = 900
+// 待生效的目标：{ key, since }
+let pendingTarget = null
+// 图谱里找不到汇聚端（切换中/对端 GRAPH 还没到）的起始时间，0 = 正常
+let hubUnknownSince = 0
+// 找不到汇聚端时保持现有音源进程的宽限期（切换汇聚端要让新帧有时间到达）
+const HUB_UNKNOWN_GRACE_MS = 4000
 // 音源进程的最新采集状态：界面用它回答"电脑到底采到声音没有"
 let pcSrc = { level: null, pkts: 0, kfps: 0 }
+// 音源进程的本地控制口（RETARGET / STATUS / STOP）。
+// 有了它，切换汇聚端 = 改一个目标，不再 kill + spawn：
+//   以前每次切换都要重启进程，新进程重新握手（最多 10 秒）＋ 抖动缓冲重新蓄水，
+//   用户听到的就是"只有第一次有声音，之后怎么切都没有"。
+const SOURCE_CONTROL_PORT = 47990
+let sourceControlReady = false
 
 function startPcSource (ip, port, streamId) {
   stopPcSource()
@@ -67,6 +83,7 @@ function startPcSource (ip, port, streamId) {
   const exe = sourceExePath()
   pcSourceStartedAt = Date.now()
   pcSourceTarget = { ip: ip, port: port, streamId: sid }
+  sourceControlReady = false
   console.log('[graph] 启动音源进程 -> ' + ip + ':' + port + '（stream ' + sid + '）')
   const proc = spawn(exe, [
     '--hub', ip + ':' + port,
@@ -75,26 +92,91 @@ function startPcSource (ip, port, streamId) {
     // 退出/被杀时由 restoreMute() 兜底恢复（见 stopPcSource / before-quit）。
     '--mute-local',
     '--device-name', os.hostname(),
-    '--stream-id', String(sid)
+    '--stream-id', String(sid),
+    // 运行中改投目标的入口（见 retargetPcSource）
+    '--control-port', String(SOURCE_CONTROL_PORT)
   ], { windowsHide: true, stdio: 'ignore' })
   pcSourceProcess = proc
   proc.on('exit', (code) => {
     // 旧进程的 exit 可能在新进程起来之后才到，必须比对身份再清空
     if (pcSourceProcess !== proc) return
     pcSourceProcess = null
+    sourceControlReady = false
     // 保留 pcSourceTarget：让 reconcile 冷却 3 秒后按图谱重试，而不是 200ms 一次刷屏
     console.error('[graph] 音源进程退出（code=' + code + '），稍后按图谱重试')
   })
   proc.on('error', (err) => {
     if (pcSourceProcess === proc) pcSourceProcess = null
+    sourceControlReady = false
     console.error('[graph] 音源进程启动失败: ' + err.message)
+  })
+  // 控制口是 UDP，没有"已就绪"事件；给进程一点启动时间后直接试。
+  setTimeout(() => {
+    if (pcSourceProcess === proc) sourceControlReady = true
+  }, 400)
+}
+
+/**
+ * 运行中改投目标：`RETARGET ip:port streamId`。
+ *
+ * 成功返回 true（进程不重启、采集不中断），失败返回 false 交给上层重启。
+ * 这是"切换汇聚端不断音"在 Electron 侧的那一半。
+ */
+function retargetPcSource (ip, port, streamId) {
+  if (!pcSourceProcess || !sourceControlReady) return Promise.resolve(false)
+  const text = 'RETARGET ' + ip + ':' + port + ' ' + streamId + '\n'
+  return new Promise((resolve) => {
+    let done = false
+    const finish = (ok) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      try { sock.close() } catch (e) { /* ignore */ }
+      resolve(ok)
+    }
+    let sock = null
+    const timer = setTimeout(() => finish(false), 700)
+    try {
+      const dgram = require('dgram')
+      sock = dgram.createSocket('udp4')
+      sock.on('error', () => finish(false))
+      sock.on('message', (msg) => {
+        const reply = msg.toString().trim()
+        if (reply.startsWith('OK')) {
+          console.log('[graph] 已改投目标 -> ' + ip + ':' + port + '（stream ' + streamId + '）')
+          finish(true)
+        } else {
+          console.warn('[graph] 改投目标被拒绝: ' + reply)
+          finish(false)
+        }
+      })
+      sock.send(Buffer.from(text), SOURCE_CONTROL_PORT, '127.0.0.1')
+    } catch (e) {
+      finish(false)
+    }
   })
 }
 
 function sourceExePath () {
-  return process.resourcesPath
-    ? path.join(process.resourcesPath, 'app.asar.unpacked', 'bin', 'audiohub-source.exe')
-    : path.join(__dirname, 'bin', 'audiohub-source.exe')
+  return coreExePath('audiohub-source.exe')
+}
+
+/**
+ * C++ 核心二进制的路径。
+ *
+ * 注意 `process.resourcesPath` 在**开发态也存在**（electron . 时会指向
+ * node_modules/electron/dist/resources），所以不能拿它判断"是不是打包态" —
+ * 老实现这么做，开发运行时永远解析到 app.asar.unpacked/bin 那个只有打包后才有
+ * 的目录，spawn 直接 ENOENT：界面上表现为"本机当音源"时手机一直收到 0 路，
+ * 而日志里只有一行启动失败。
+ *
+ * 判断打包态要用 app.isPackaged。开发态走仓库里的 ui/bin/，打包态走 asarUnpack。
+ */
+function coreExePath (name) {
+  if (app.isPackaged) {
+    return path.join(process.resourcesPath, 'app.asar.unpacked', 'bin', name)
+  }
+  return path.join(__dirname, 'bin', name)
 }
 
 // 取消静音。必须单独调：Electron 用 kill() 终止音源时，
@@ -110,6 +192,7 @@ function restoreMute () {
 }
 
 function stopPcSource () {
+  pendingTarget = null
   if (pcSourceProcess) {
     const proc = pcSourceProcess
     pcSourceProcess = null
@@ -192,6 +275,7 @@ function reconcileGraph (graph) {
   }
 
   if (hubId === selfId) {
+    hubUnknownSince = 0
     if (pcSourceProcess || pcSourceTarget) {
       console.log('[graph] 本机是汇聚端，停止音源进程')
       stopPcSource()
@@ -201,14 +285,24 @@ function reconcileGraph (graph) {
 
   const hubNode = hubId ? nodes.find((n) => n.id === hubId) : null
   if (!hubNode) {
-    // hubId 为空 / 指向不存在的节点：没有可发往的目标，停在空闲
+    // hubId 为空 / 指向不存在的节点：没有可发往的目标。
+    //
+    // 但**不要立刻停**：切换汇聚端的瞬间，本机图谱会先变成"hub = 还没见过的新节点"
+    // （对端 GRAPH 帧还在路上），若这一拍就把音源进程杀掉，下一拍再起来 ——
+    // 用户听到的是「反复切换之后汇聚端没声音」（每次切换都断一次流，
+    // 而汇聚端那边要重新握手 + 重建抖动缓冲，往往刚好卡在没声音的状态）。
+    // 所以给一个宽限期：这期间保持现有音源进程不动，超时才真正停。
+    const now = Date.now()
+    if (hubUnknownSince === 0) hubUnknownSince = now
+    if (now - hubUnknownSince < HUB_UNKNOWN_GRACE_MS) return
     if (pcSourceProcess || pcSourceTarget) {
-      console.log('[graph] 汇聚端未知，停止音源进程')
+      console.log('[graph] 汇聚端未知（超过 ' + HUB_UNKNOWN_GRACE_MS + 'ms），停止音源进程')
       stopPcSource()
     }
     return
   }
 
+  hubUnknownSince = 0
   const addr = nodeAddress(hubNode)
   if (!addr.ip) {
     if (pcSourceProcess || pcSourceTarget) stopPcSource()
@@ -222,10 +316,39 @@ function ensurePcSource (ip, port, streamId) {
     pcSourceTarget.ip === ip &&
     pcSourceTarget.port === port &&
     pcSourceTarget.streamId === streamId
-  if (pcSourceProcess && sameTarget) return          // 已在正确目标上，绝不重启
+  if (pcSourceProcess && sameTarget) {
+    pendingTarget = null
+    return                                          // 已在正确目标上，绝不重启
+  }
   if (!pcSourceProcess && sameTarget &&
       Date.now() - pcSourceStartedAt < PC_SOURCE_RETRY_MS) {
     return                                            // 刚退出/刚拉起，等冷却再重试
+  }
+  // 目标变了先别急着重启：图谱每次变化（有人上下线）都会让 streamId 重新排号，
+  // 200ms 一次的轮询里来回抖两下就会把音源进程杀两次 —— 汇聚端那边听到的就是
+  // 「切换/有人进出之后没声音」。要求新目标稳定一小段时间再切。
+  const key = ip + ':' + port + '#' + streamId
+  const now = Date.now()
+  if (!pendingTarget || pendingTarget.key !== key) {
+    pendingTarget = { key, since: now }
+    return
+  }
+  if (now - pendingTarget.since < PC_SOURCE_TARGET_STABLE_MS) return
+  pendingTarget = null
+  // 优先"改投目标"：进程不重启，采集与抖动缓冲都不重建 —— 这是不断音的关键。
+  // 只有控制口不可用（老进程 / 还没起来）时才回退到重启。
+  if (pcSourceProcess) {
+    retargetPcSource(ip, port, streamId).then((ok) => {
+      if (ok) {
+        if (pcSourceTarget) {
+          pcSourceTarget = { ip: ip, port: port, streamId: streamId }
+        }
+        return
+      }
+      console.warn('[graph] 改投失败，退回重启音源进程')
+      startPcSource(ip, port, streamId)
+    })
+    return
   }
   startPcSource(ip, port, streamId)
 }
@@ -570,8 +693,12 @@ ipcMain.handle('hub:scan', async () => {
 
 ipcMain.handle('hub:invite', async (_e, arg) => {
   const p = arg || {}
-  if (typeof p.ip !== 'string' || !Number.isInteger(p.audioPort)) return { ok: false }
-  return httpRequest('POST', '/api/invite', { ip: p.ip, audioPort: p.audioPort })
+  if (typeof p.ip !== 'string' || !p.ip.trim()) return { ok: false }
+  // 端口可省：界面上就写着「端口可省」，只填 IP 是最常见的用法。
+  // 这里不再强制整数，字符串/缺省都按默认 47000 处理，交给内核再兜一次。
+  let port = Number.parseInt(p.audioPort, 10)
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) port = 47000
+  return httpRequest('POST', '/api/invite', { ip: p.ip.trim(), audioPort: port })
 })
 
 ipcMain.handle('hub:accept', async (_e, arg) => {

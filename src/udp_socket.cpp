@@ -132,6 +132,12 @@ bool UdpSocket::SetReceiveBufferBytes(int bytes) {
                       sizeof(bytes)) == 0;
 }
 
+bool UdpSocket::SetSendBufferBytes(int bytes) {
+  if (!valid()) return false;
+  return ::setsockopt(handle_, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&bytes),
+                      sizeof(bytes)) == 0;
+}
+
 bool UdpSocket::SetPeer(const std::string& ipv4, uint16_t port) {
   if (!valid()) return false;
   sockaddr_in addr{};

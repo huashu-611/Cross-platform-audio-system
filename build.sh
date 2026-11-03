@@ -50,5 +50,10 @@ echo "==> 运行测试"
 mkdir -p ui/bin
 cp "$OUT/audiohub-hub.exe" ui/bin/audiohub-hub.exe
 echo "==> 已同步 ui/bin/audiohub-hub.exe（Electron 壳用）"
+# 音源端也要同步：electron 在「本机当音源」时会 spawn bin/audiohub-source.exe。
+# 以前这里只拷 hub，改过 apps/source_main.cpp（例如握手不再用 connect()）之后，
+# 桌面端仍在跑几周前的旧副本 —— 手机上看到的就是「接受了邀请但一直 0 路」。
+cp "$OUT/audiohub-source.exe" ui/bin/audiohub-source.exe
+echo "==> 已同步 ui/bin/audiohub-source.exe（Electron 壳用）"
 
 echo "==> 产物在 $OUT/"

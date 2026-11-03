@@ -305,16 +305,33 @@ GraphMergeResult MergeGraph(GraphState* local, const GraphState& remote) {
 
   // 2) 汇聚端 LWW（§3）。version 是 Lamport 时钟，本地改动由 SwitchHub 递增；
   //    merge 时"见过最大 version"就等于采纳后的 version，因为更大的值一定被采纳。
-  if (remote.version > local->version) {
+  //    空 hub_id 表示「对端还没确定汇聚端」（协议 §2.1），不是一次真实赋值：
+  //    不能用它覆盖本机已知的 hub_id，否则只要有一台设备点「全部断开」，
+  //    它广播出去的空 hubId 就会顺着 LWW 把整个网络（含汇聚端本身）清空。
+  const bool remote_has_hub = !remote.hub_id.empty();
+  if (local->hub_id.empty() && remote_has_hub) {
+    // 本机还没入网（空白会话）：任何一个带 hub_id 的帧都该把汇聚端钉住，
+    // 不受 version 门槛限制。否则本地 version 一旦被抬高（旧版 resetSession 就
+    // 是这么干的），之后汇聚端发来的每一帧都会被判"版本更低"而丢弃，
+    // 本机永远学不到 hubId。version 只涨不降，保持 Lamport 单调。
     local->hub_id = remote.hub_id;
     local->origin = remote.origin;
+    if (remote.version > local->version) local->version = remote.version;
+    r.hub_changed = true;
+  } else if (remote.version > local->version) {
     local->version = remote.version;
+    local->origin = remote.origin;
+    if (remote_has_hub || local->hub_id.empty()) {
+      local->hub_id = remote.hub_id;
+    }
     r.hub_changed = true;  // version 变了也算"汇聚端信息有变化"
   } else if (remote.version == local->version && remote.origin != local->origin &&
              remote.origin > local->origin) {
     // 同版本冲突按 origin 的逐字节字典序打破（两端算法必须一致）。
-    local->hub_id = remote.hub_id;
     local->origin = remote.origin;
+    if (remote_has_hub || local->hub_id.empty()) {
+      local->hub_id = remote.hub_id;
+    }
     r.hub_changed = true;
   }
   r.changed = r.nodes_changed || r.hub_changed;

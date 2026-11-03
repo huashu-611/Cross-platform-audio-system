@@ -68,8 +68,9 @@ void PanGains(float azimuth_deg, float azimuth_boost, float* gain_l, float* gain
 
 float DistanceGain(float distance) {
   const float d = std::max(distance, kMinDistanceM);
-  // 距离即音量：只有近场封顶，没有远场下限（用户定稿，见 spatial.hpp 注释）。
-  return std::min(kSceneRadius / d, kMaxDistanceGain);
+  // 距离即音量：只有近场封顶，没有远场下限（见 spatial.hpp 注释）。
+  // v0.4：指数 1.6（原来 1.0 太缓，用户反馈拖远后音量变化不明显）。
+  return std::min(std::pow(kSceneRadius / d, kDistanceExponent), kMaxDistanceGain);
 }
 
 float ItdSeconds(float azimuth_deg) {
