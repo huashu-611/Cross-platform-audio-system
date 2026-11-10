@@ -38,6 +38,17 @@ struct NicInfo {
   uint32_t directed = 0;   // 该网段的定向广播地址
 };
 
+// 定向广播地址的掩码上限：最多按 /24 算。
+//
+// 为什么不能照抄 DHCP 下发的前缀长度：校园网 / 企业网常见「给一个 /16 的掩码，
+// 但实际切成许多个 /24」（本机就是 10.135.129.59/16，手机在 10.135.54.0/24，
+// 两者其实隔着一台三层设备）。照 /16 算出来的定向广播是 10.135.255.255，
+// 而手机只可能收到 10.135.54.255 —— 于是「扫描不到任何设备」。
+//
+// 按 /24 算是安全的下界：同一 /24 内一定可达；跨 /24 的广播本来就跨不过路由器，
+// 发不出去也不会有损失。前缀比 /24 更短（/16、/8）时一律压到 /24。
+constexpr uint32_t kMaxDirectedPrefix = 24;
+
 // 枚举所有活动网卡的本机地址与该网段的定向广播地址。
 //
 // 为什么要"每个网卡各绑一个 socket 发"：
@@ -71,8 +82,12 @@ std::vector<NicInfo> LocalNics() {
       if ((ip & 0xFFC00000u) == 0x64400000u) continue;   // 100.64 CGNAT
 
       const uint32_t prefix = ua->OnLinkPrefixLength;
-      const uint32_t mask = (prefix == 0 || prefix > 32) ? 0xFFFFFFFFu
-                                                        : (0xFFFFFFFFu << (32 - prefix));
+      // 见 kMaxDirectedPrefix：前缀比 /24 更短时压到 /24，否则定向广播会算到
+      // 一个对端根本不在的网段上（实测：/16 → 10.135.255.255，手机在 .54 段）。
+      const uint32_t effective = (prefix == 0 || prefix > kMaxDirectedPrefix)
+                                     ? kMaxDirectedPrefix
+                                     : prefix;
+      const uint32_t mask = 0xFFFFFFFFu << (32 - effective);
       NicInfo info;
       in_addr tmp{};
       tmp.s_addr = htonl(ip);
@@ -245,7 +260,10 @@ struct Discovery::Impl {
       while (true) {
         const size_t pos = data.find('\n', start);
         const std::string line = data.substr(start, pos == std::string::npos ? std::string::npos : pos - start);
-        if (!line.empty()) HandleFrame(line, ip_text, from.sin_port);
+        // from.sin_port 是网络序，必须先转回主机序：SendBeaconTo() 里会再 htons 一次。
+        // 这里若不转，端口就被字节交换了 —— 探测方在它自己的源端口上永远收不到回信标
+        // （实测：手机绑 47300 发 WHO，回包被打到 swap(47300)=50360，"发现不了电脑"）。
+        if (!line.empty()) HandleFrame(line, ip_text, ntohs(from.sin_port));
         if (pos == std::string::npos) break;
         start = pos + 1;
       }

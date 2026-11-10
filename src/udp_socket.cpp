@@ -234,6 +234,22 @@ bool LooksVirtual(const std::string& name) {
 
 }  // namespace
 
+// WCHAR* → 窄字符串（UTF-8）。网卡友好名可能是中文，所以不能只做
+// 逐字节窄化，要走一遍 WideCharToMultiByte。
+std::string NarrowFromWide(const wchar_t* w) {
+#ifdef _WIN32
+  if (w == nullptr) return std::string();
+  const int need = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+  if (need <= 0) return std::string();
+  std::string out(static_cast<size_t>(need - 1), static_cast<char>(0));
+  WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), need, nullptr, nullptr);
+  return out;
+#else
+  (void)w;
+  return std::string();
+#endif
+}
+
 std::string LocalIPv4List() {
   // 枚举所有网卡，剔除虚拟 / TUN / 回环 / 链路本地，按"像真实局域网"排序，
   // 返回逗号分隔的候选列表（第一个是最可能可用的）。
@@ -341,6 +357,206 @@ std::string LocalIPv4List() {
   if (!first) oss << ", ";
   oss << "127.0.0.1";
   return oss.str();
+}
+
+// 本机全部 IPv4（v0.41）。与 LocalIPv4List() 的差别见头文件注释：
+// 这里**不剔除**虚拟网卡、不打分、不排序，因为判断"这个节点 id 是不是我"
+// 需要的是事实集合，而不是"该对外用哪个地址"的偏好。
+std::vector<std::string> LocalIPv4Addresses() {
+  std::vector<std::string> out;
+#ifdef _WIN32
+  ULONG size = 16384;
+  std::vector<BYTE> buf(size);
+  PIP_ADAPTER_ADDRESSES addrs = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data());
+  if (GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                                        GAA_FLAG_SKIP_DNS_SERVER, nullptr, addrs, &size) == NO_ERROR) {
+    for (PIP_ADAPTER_ADDRESSES a = addrs; a != nullptr; a = a->Next) {
+      if (a->OperStatus != IfOperStatusUp) continue;
+      for (PIP_ADAPTER_UNICAST_ADDRESS ua = a->FirstUnicastAddress; ua != nullptr;
+           ua = ua->Next) {
+        if (ua->Address.lpSockaddr == nullptr) continue;
+        if (ua->Address.lpSockaddr->sa_family != AF_INET) continue;
+        const auto* sa = reinterpret_cast<const sockaddr_in*>(ua->Address.lpSockaddr);
+        char text[INET_ADDRSTRLEN] = {0};
+        if (::inet_ntop(AF_INET, &sa->sin_addr, text, sizeof(text)) == nullptr) continue;
+        const std::string ip(text);
+        if (ip.empty()) continue;
+        if (ip.compare(0, 4, "127.") == 0) continue;   // 回环单独补
+        bool dup = false;
+        for (const auto& e : out) {
+          if (e == ip) { dup = true; break; }
+        }
+        if (!dup) out.push_back(ip);
+      }
+    }
+  }
+#endif
+  out.push_back("127.0.0.1");
+  return out;
+}
+
+//
+// v0.36：出网路径判定。
+//
+// 只读探测：用 UDP connect() + getsockname() 问内核"你会用哪个源地址发这个包"。
+// UDP 的 connect 不发任何包，只是把对端记在 PCB 上并做一次路由查询。
+//
+// 为什么要按"对端"分别问，而不是问一次就完事：路由是按目标前缀匹配的。
+// 同一台机器上，发往同网段（10.135.x）的对端走 WLAN，发往跨网段
+// （10.69.x / 192.168.43.x / 172.20.x）的对端会被 TUN 的 0.0.0.0/0 抢走。
+// 本机实测就是这种"对一半、错一半"的状态。
+EgressInfo ProbeEgress(const std::string& dst_ipv4) {
+  EgressInfo out;
+  if (dst_ipv4.empty()) return out;
+  const socket_t s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (s == kInvalidSocket) return out;
+
+  sockaddr_in dst{};
+  dst.sin_family = AF_INET;
+  dst.sin_port = htons(1);   // 端口随便：我们只要路由判定，不发包
+  if (::inet_pton(AF_INET, dst_ipv4.c_str(), &dst.sin_addr) != 1) {
+#ifdef _WIN32
+    ::closesocket(s);
+#else
+    ::close(s);
+#endif
+    return out;
+  }
+  if (::connect(s, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) != 0) {
+#ifdef _WIN32
+    ::closesocket(s);
+#else
+    ::close(s);
+#endif
+    return out;
+  }
+
+  sockaddr_in local{};
+#ifdef _WIN32
+  int len = sizeof(local);
+#else
+  socklen_t len = sizeof(local);
+#endif
+  if (::getsockname(s, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
+    char text[INET_ADDRSTRLEN] = {0};
+    ::inet_ntop(AF_INET, &local.sin_addr, text, sizeof(text));
+    out.src_ip = text;
+    out.ok = true;
+    // 源地址不在真实网卡上 → 被虚拟网卡接走了。
+    // 用 RealNicSummary 的同一套排除规则判断，避免两处口径不一致。
+    bool on_real_nic = false;
+    for (const std::string& line : RealNicSummary()) {
+      const size_t slash = line.find('/');
+      if (slash == std::string::npos) continue;
+      if (line.substr(0, slash) == out.src_ip) {
+        on_real_nic = true;
+        break;
+      }
+    }
+    // 回环不算"被劫持"：本机自测（audioflow-test 用 127.0.0.2）走的就是它。
+    const bool is_loopback = (out.src_ip.rfind("127.", 0) == 0);
+    out.hijacked = !on_real_nic && !is_loopback;
+  }
+
+#ifdef _WIN32
+  ::closesocket(s);
+#else
+  ::close(s);
+#endif
+  return out;
+}
+
+std::vector<std::string> RealNicSummary() {
+  std::vector<std::string> out;
+#ifdef _WIN32
+  ULONG size = 16384;
+  std::vector<BYTE> buf(size);
+  PIP_ADAPTER_ADDRESSES addrs = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data());
+  if (GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                                        GAA_FLAG_SKIP_DNS_SERVER, nullptr, addrs, &size) != NO_ERROR) {
+    return out;
+  }
+  for (PIP_ADAPTER_ADDRESSES a = addrs; a != nullptr; a = a->Next) {
+    if (a->OperStatus != IfOperStatusUp) continue;
+    if (a->IfType == IF_TYPE_TUNNEL || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK ||
+        a->IfType == IF_TYPE_PPP) {
+      continue;
+    }
+    // 与 LocalIPv4List 完全一致的虚拟网卡剔除规则（VMware / Clash / vEthernet）。
+    const std::string friendly = NarrowLower(a->FriendlyName);
+    const std::string desc = NarrowLower(a->Description);
+    if (LooksVirtual(friendly) || LooksVirtual(desc)) continue;
+    const bool has_gateway = a->FirstGatewayAddress != nullptr;
+
+    for (PIP_ADAPTER_UNICAST_ADDRESS ua = a->FirstUnicastAddress; ua != nullptr;
+         ua = ua->Next) {
+      if (ua->Address.lpSockaddr == nullptr) continue;
+      if (ua->Address.lpSockaddr->sa_family != AF_INET) continue;
+      const auto* sa = reinterpret_cast<const sockaddr_in*>(ua->Address.lpSockaddr);
+      const uint32_t ip = ntohl(sa->sin_addr.s_addr);
+      if ((ip >> 24) == 127) continue;
+      if ((ip & 0xFFFF0000u) == 0xA9FE0000u) continue;
+      if ((ip & 0xFFFE0000u) == 0xC6120000u) continue;
+      if ((ip & 0xFFC00000u) == 0x64400000u) continue;
+
+      char text[INET_ADDRSTRLEN] = {0};
+      in_addr tmp{};
+      tmp.s_addr = htonl(ip);
+      ::inet_ntop(AF_INET, &tmp, text, sizeof(text));
+
+      std::ostringstream line;
+      line << text << "/" << static_cast<int>(ua->OnLinkPrefixLength)
+           << " gateway=" << (has_gateway ? "yes" : "no")
+           // FriendlyName 是 WCHAR*，直接往 ostringstream 里塞会打出指针地址，
+           // 必须先按 UTF-8 转成窄字符串（这里就是 ASCII 网卡名）。
+           << " name=" << NarrowFromWide(a->FriendlyName);
+      out.push_back(line.str());
+    }
+  }
+#endif
+  return out;
+}
+
+//
+// 2026-11-03（v0.20）：Windows 上"绑定具体 IP"和"绑定通配 IP"是两件事 ——
+// 一个进程绑了 127.0.0.1:47002，另一个进程再绑 0.0.0.0:47002 **照样成功**，
+// 但发往 127.0.0.1 的包全部进前者。表现出来就是 hub 日志正常、界面正常，
+// 唯独收不到手机的任何握手帧；用户反复退出重进，偶尔某次"好了"（那次残留
+// 进程恰好退了），观感就是"多次退出重进后有遗留"。
+//
+// bind() 本身查不出来，只能在绑之前枚举一遍现有 UDP 端点。
+// 返回占用该端口的地址列表（"*" 表示通配绑定）；空 = 端口干净。
+std::vector<std::string> ProbeUdpPortOwners(uint16_t port) {
+  std::vector<std::string> owners;
+#ifdef _WIN32
+  DWORD size = 0;
+  if (::GetExtendedUdpTable(nullptr, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0) !=
+      ERROR_INSUFFICIENT_BUFFER) {
+    return owners;
+  }
+  std::vector<char> buffer(size);
+  auto* table = reinterpret_cast<PMIB_UDPTABLE_OWNER_PID>(buffer.data());
+  if (::GetExtendedUdpTable(table, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0) != NO_ERROR) {
+    return owners;
+  }
+  for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+    const MIB_UDPROW_OWNER_PID& row = table->table[i];
+    const uint16_t local_port = ntohs(static_cast<uint16_t>(row.dwLocalPort));
+    if (local_port != port) continue;
+    in_addr addr{};
+    addr.s_addr = row.dwLocalAddr;
+    char text[INET_ADDRSTRLEN] = {0};
+    if (::inet_ntop(AF_INET, &addr, text, sizeof(text)) == nullptr) continue;
+    if (row.dwLocalAddr == 0) {
+      owners.emplace_back("*");
+    } else {
+      owners.emplace_back(text);
+    }
+  }
+#else
+  (void)port;
+#endif
+  return owners;
 }
 
 }  // namespace audiohub

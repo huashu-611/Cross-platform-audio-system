@@ -1,8 +1,10 @@
 #include "audiohub/hub_core.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -71,6 +73,11 @@ constexpr int kPushStallResetMs = 1000;
 // 控制口 = 音频口 + 2（+1 是 PING/PONG 口）。握手和发现都走文本帧。
 constexpr uint16_t kControlPortOffset = 2;
 
+// v0.30：来源 IP 去重集合的上限。手机上只有一两个来源，但公网/校园网里
+// 扫端口的机器可能成千上万 —— 无上限会让这个集合无限增长（内存泄漏）。
+// 超上限后不再记新 IP，只更新 rx_last_ip，够诊断用。
+constexpr size_t kRxMaxSenders = 64;
+
 // ---- 图谱（docs/GRAPH-PROTOCOL.md）----
 // 周期保活 3 秒；本地变化连发 2 次、间隔 60 ms；同一设备 1 秒最多收 5 次，
 // 超出合并成延迟一次；同一来源的 GRAPH-REQ 200 ms 内只回一次。
@@ -79,6 +86,25 @@ constexpr int kGraphRepeatMs = 60;
 constexpr int kGraphRequestReplyMs = 200;
 constexpr int kGraphRateWindowMs = 1000;
 constexpr int kGraphRateMaxSends = 5;
+// 源地址错位（NAT/中继）时，按数据报源地址回 GRAPH 的最小间隔。
+// 对端 3 秒一帧，回得比它密没有意义；但必须远小于它 10 秒的在线超时。
+constexpr int kGraphSourceReplyMs = 1000;
+// "全部断开"之后还要不要理会对端的 GRAPH（v0.42）。
+//
+// 背景：会话清空会置 graph_detached=true，本意是"别再让对端的旧图谱把我刚清掉的
+// 节点灌回来"。但 HandleGraphFrame 首行对 detached 是无条件 return，而解除
+// detached 的只有 GraphAddPeerLocked / SwitchGraphHub —— 都要先收到 CONN-REQ
+// 或者用户手动切汇聚端。手机侧恰恰是"只广播 GRAPH、不发 CONN-REQ"，
+// 于是两边卡死：PC 永远丢弃手机图谱（nodes 只剩自己，界面上没有任何设备可选），
+// 手机也永远收不到 PC 回帧（学不到 hubId，界面显示"没有汇聚端"）。
+// 实测（真机）：hsPackets=40、hsLastCmd 恒为 GRAPH、hsLastIp 是真手机 IP，
+// 但 graph.nodes 只有 1 个 —— 帧被这一行吃掉了。
+//
+// 改法：detached 只保护"刚断开后的这一小段时间"。过了宽限期还收到对端的
+// 合法 GRAPH，说明对端确实还在线、还想跟我们组网，就重新入网。
+// 宽限期取 8 秒：够覆盖对端 3 秒一次的周期广播（2~3 轮），
+// 又短到不会让用户觉得"电脑一直看不到设备"。
+constexpr int kGraphDetachGraceMs = 8000;
 
 // ---- 房间摆位（POS，docs/GRAPH-PROTOCOL.md §13）----
 // 摆位是低频状态（只有拖拽时变），按键时连发 2 次 + 状态变化合并转发，就够了；
@@ -191,6 +217,90 @@ struct HubCore::Impl {
   std::map<uint16_t, std::unique_ptr<Stream>> streams;
   Meter bus_meter;
 
+  // ---- 渲染探针（v0.27）：设备前 vs 设备上的两段证据 ----
+  //
+  // 为什么不能用 bus_meter 判断"汇聚端有没有真的出声"：Meter::Take() 是
+  // 取走即清零，而 UI 每 200 ms 轮询一次 /api/state。诊断脚本再 curl 一下，
+  // 谁后到谁拿到 0 —— 一个正在出声的汇聚端会被读成 -120 dBFS。
+  //
+  // 所以这里用"只增不减"的计数器，直接夹在送给设备的那一帧上：
+  //   render_frames_total  渲染回调被调用的帧数（设备真的在跑）
+  //   render_ring_missed   回调要数据但环形缓冲是空的（"没混进去"）
+  //   render_audible_frames 至少有 1 个非零样本的帧数（"混进去了且非静音"）
+  //   render_peak_abs      设备前见过的最大绝对值（单调）
+  // 四个量单调递增，任意多个读者反复读都一样，不会互相抢。
+  std::atomic<uint64_t> render_frames_total{0};
+  std::atomic<uint64_t> render_ring_missed{0};
+  std::atomic<uint64_t> render_audible_frames{0};
+  std::atomic<double> render_peak_abs{0.0};
+  // 归因探针（v0.28）：见 HubStats 里的同名注释。
+  std::atomic<bool> rendering_as_hub{false};
+  std::atomic<uint64_t> mixed_sources{0};
+  std::atomic<uint64_t> mixed_frames{0};
+  std::atomic<uint64_t> mixed_audible_frames{0};
+
+  // 可选的 WAV 落盘：把"实际送给设备"的样本写出去，供用户直接播放验证。
+  // 只有开了 --dump-render 才有开销（一次 fwrite），默认零影响。
+  // mutable：Stats() 是 const 方法，但"当前落盘了多少帧"得能读到。
+  mutable std::mutex dump_mutex;
+  // 实时线程只读这个原子指针；指针的打开/关闭都在非实时线程里做。
+  std::atomic<FILE*> dump_file{nullptr};
+  // "正在写"的握手计数：关闭文件前必须等到 0，否则就是 use-after-close。
+  std::atomic<int> dump_busy{0};
+  mutable uint64_t dump_frames = 0;
+  uint32_t dump_data_bytes = 0;
+  std::string dump_path;
+
+  // 渲染回调里逐帧判"这一帧有没有波形"。必须无锁无分配（实时线程）。
+  void ProbeRenderBlock(const float* out, size_t got_samples, size_t need_samples) {
+    const uint64_t frames = static_cast<uint64_t>(need_samples / kChannels);
+    render_frames_total.fetch_add(frames, std::memory_order_relaxed);
+    if (got_samples < need_samples) {
+      const uint64_t missed =
+          static_cast<uint64_t>((need_samples - got_samples) / kChannels);
+      render_ring_missed.fetch_add(missed, std::memory_order_relaxed);
+    }
+    // 逐帧统计交给 ScanFrames（与单元测试共用同一份实现，避免"测试测的
+    // 和线上跑的不是同一段代码"这种假绿）。
+    const FrameStats fs = ScanFrames(out, got_samples, kChannels);
+    if (fs.audible) render_audible_frames.fetch_add(fs.audible, std::memory_order_relaxed);
+    if (fs.peak > 0.0) {
+      double prev = render_peak_abs.load(std::memory_order_relaxed);
+      while (fs.peak > prev &&
+             !render_peak_abs.compare_exchange_weak(prev, fs.peak, std::memory_order_relaxed)) {
+      }
+    }
+    if (dump_file.load(std::memory_order_acquire) != nullptr) {
+      dump_busy.fetch_add(1, std::memory_order_acq_rel);
+      FILE* f = dump_file.load(std::memory_order_acquire);
+      // 写"完整一帧"（need_samples），而不是只写从环形缓冲读到的 got_samples：
+      // 广播/静音期间 ring 常常是空的，只写 got 会让 WAV 的时间轴被压缩，
+      // 回放时听起来比真实快好几倍，反而误导判断。
+      if (f != nullptr) DumpRenderBlock(f, out, need_samples);
+      dump_busy.fetch_sub(1, std::memory_order_acq_rel);
+    }
+  }
+
+  // 写 WAV（16-bit PCM）：只写 data 段，收尾时补头。实时线程里只做一次 fwrite。
+  //
+  // 并发约定：dump_file 只在"设备已停"之后才被关闭（见 Stop()：render.Stop()
+  // 先于 CloseDumpFile()），所以实时线程永远不会撞上 fclose。
+  // 实时线程里因此不加锁——加锁会在锁被 HTTP 线程持有时直接卡住回调。
+  void DumpRenderBlock(FILE* f, const float* out, size_t samples) {
+    if (samples == 0) return;
+    static thread_local std::vector<int16_t> pcm;
+    pcm.resize(samples);
+    for (size_t i = 0; i < samples; ++i) {
+      float v = out[i];
+      if (v > 1.0f) v = 1.0f;
+      if (v < -1.0f) v = -1.0f;
+      pcm[i] = static_cast<int16_t>(v * 32767.0f);
+    }
+    std::fwrite(pcm.data(), sizeof(int16_t), samples, f);
+    dump_data_bytes += static_cast<uint32_t>(samples * sizeof(int16_t));
+    dump_frames += samples / kChannels;
+  }
+
   // 事件回调必须用独立的锁：Emit() 会在"已经持有 streams mutex"的接收线程里
   // 被调用（新流接入、流掉线），复用同一把 std::mutex 就是死锁——
   // 而且症状极具迷惑性：banner 打完之后整个程序静默，没有任何报错。
@@ -200,7 +310,36 @@ struct HubCore::Impl {
   std::atomic<uint64_t> received_packets{0};
   std::atomic<uint64_t> received_bytes{0};
   std::atomic<uint64_t> malformed{0};
+
+  // v0.30：接收侧证据。received_packets/received_bytes 以前只加不读，等于死计数器；
+  // 现在一并接进 /api/state，让"包有没有到我这儿"变成可观测事实。
+  std::atomic<uint64_t> rx_first_at_ms{0};
+  std::atomic<uint64_t> rx_bad_packets{0};
+  mutable std::mutex rx_mutex;                  // 保护下面几个非原子字段
+  std::set<std::string> rx_senders;             // 见过的来源 IP（上限 kRxMaxSenders）
+  std::string rx_last_ip;
+  uint16_t rx_last_port = 0;
+  std::string rx_last_reject;
   std::atomic<uint64_t> render_underruns{0};
+
+  // v0.32：接收侧证据必须覆盖**所有**入口，不然"没收到包"会骗人。
+  //
+  // v0.30 的 rx_* 只记了音频口（47000）。但握手（CONN-REQ/ACK/INVITE）、
+  // 图谱帧（GRAPH/POS）走的是 audioPort+2（47002），发现信标走 47300。
+  // 于是出现一种极坏的情形：握手口被防火墙单独挡住、音频口也没包进来，
+  // 界面只显示"未收到包"，看起来像"什么都没到"，实际上可能是
+  // "握手包到了、但被别的规则拦在解码前"或"发现包到了、握手包没到"。
+  // 用户的真实反馈正是这样：双方在图谱里互相可见（说明发现口是通的），
+  // 却都说"对方没回应"（说明握手口不通）。必须能分辨这三个口。
+  std::atomic<uint64_t> hs_packets{0};
+  std::atomic<uint64_t> hs_recent{0};       // 最近 10 秒内的握手包数（粗略，按拍衰减）
+  std::atomic<uint64_t> hs_first_at_ms{0};
+  std::atomic<uint64_t> hs_discarded{0};    // 收到了但没匹配任何命令的行
+  mutable std::mutex hs_mutex;
+  std::string hs_last_ip;
+  uint16_t hs_last_port = 0;
+  std::string hs_last_cmd;                  // 最近一条命令的首段（CONN-REQ / GRAPH / POS …）
+  std::string hs_last_line;                 // 最近一条原文（截断，便于肉眼看）
 
   int raw_dump_budget = 0;
 
@@ -234,10 +373,25 @@ struct HubCore::Impl {
   GraphState graph_;
   std::string graph_self_ip;        // 本机 IP（AUDIOHUB_LOCAL_IP 可覆盖）
   std::string self_node_id;         // 本机节点 id = <IP>:<音频口>
+  // v0.41：本机**所有**网卡地址（含 self_node_id 里那个）。
+  //
+  // 为什么要记全：IsHub() 一直是 `graph_.hub_id == self_node_id` 的字符串比较，
+  // 而别的设备在它自己那侧看到的"本机地址"未必等于我们选中的那张网卡 ——
+  // 多网卡（WLAN + 以太网 + VMware）、多出口 NAT（手机看到的 10.0.2.2 其实是
+  // 宿主）、以及 hostname 解析顺序都可能不一样。对端把这个地址写进 hubId 广播
+  // 回来，本机就认不出"那是我自己"，于是：
+  //   1) /api/state 的 isHub=false（界面把汇聚端标到一条陌生节点上）；
+  //   2) MixerLoop 里 rendering_as_hub=false → 混音输出被整块清空 → 不出声。
+  // 现象就是「手机上有特效、电脑上没声音」，而且怎么重连都没用。
+  std::vector<std::string> self_ips;  // 本机全部 IPv4（启动时枚举一次）
   uint16_t graph_http_port = 0;     // 自节点要广播的 HTTP 口
   uint64_t graph_seen_version = 0;  // 见过的最大 version（本地改动取 max+1）
   std::map<std::string, Clock::time_point> graph_last_seen;   // ip -> 最近收到数据报
   std::map<std::string, Clock::time_point> graph_req_replied; // ip -> 上次回 GRAPH-REQ
+  // 源地址错位时按数据报源地址回帧的限速（与 graph_req_replied 分开记：
+  // 两者一个由 GRAPH-REQ 触发、一个由普通 GRAPH 触发，共用会互相把对方
+  // 的窗口占掉，结果两边都回不出来）。
+  std::map<std::string, Clock::time_point> graph_src_replied;  // ip -> 上次按源回帧
   std::map<std::string, std::vector<Clock::time_point>> graph_sends;  // ip -> 发送时刻
   std::map<std::string, Clock::time_point> graph_deferred;    // ip -> 被限速合并后的补发
   std::vector<std::pair<std::string, uint16_t>> graph_probes; // 待发的 GRAPH-REQ
@@ -258,6 +412,9 @@ struct HubCore::Impl {
   // 所以这里需要一个显式状态：会话结束后既不合并、也不广播，直到用户重新
   // 邀请 / 接受邀请 / 主动切汇聚端（这些动作都会重新入网）才解除。
   bool graph_detached = false;
+  // detached 的起始时刻（v0.42）：只有"刚断开"这段时间才真正拦对端 GRAPH，
+  // 见 kGraphDetachGraceMs 的注释。
+  Clock::time_point graph_detached_at = Clock::now();
 
   // ---- 房间摆位（POS）----
   // 与 graph_ 共用 mutex：数据量更小（<=32 项），读写都在 HTTP / 握手 / 混音线程。
@@ -327,17 +484,53 @@ struct HubCore::Impl {
     http_port_for_discovery = opts.http_port;
     stop_requested.store(false);
 
-    if (!data_socket.Open(port)) {
+    // 固定端口必须独占绑定（reuse_addr = false）。
+    //
+    // 2026-11-03（v0.20）：Windows 上 UDP 允许两个 socket 绑同一端口，
+    // 内核把入包随机分给其中一个 —— 之前默认 reuse_addr = true，于是
+    // 上一个没退干净的 audiohub-hub.exe 还能继续抢 47000/47002 的包，
+    // 新进程看起来"起来了"却只收到一半数据。真实现象就是用户报的
+    // "电脑连接手机后一直显示无反应，多次退出重进后有遗留"。
+    // 独占绑定后，第二个进程会直接在 bind() 失败并退出，而不是静默分走数据。
+    //
+    // 但 reuse_addr = false 只管住了"两个都绑通配地址"的情况：Windows 允许
+    // "具体 IP 的绑定"（如 127.0.0.1:47002）与"通配绑定"（0.0.0.0:47002）共存，
+    // 后者 bind 照样成功，而发往 127.0.0.1 的包全进前者。这就是本机实测到的
+    // 场景：hub 日志一切正常、界面正常，唯独收不到手机的任何握手帧。
+    // 因此绑之前先问系统这个端口上还有谁。
+    {
+      const uint16_t check_ports[3] = {port, static_cast<uint16_t>(port + 1),
+                                       static_cast<uint16_t>(port + kControlPortOffset)};
+      for (const uint16_t p : check_ports) {
+        const auto owners = ProbeUdpPortOwners(p);
+        if (!owners.empty()) {
+          std::string who;
+          for (size_t i = 0; i < owners.size(); ++i) {
+            if (i) who += ", ";
+            who += owners[i];
+          }
+          if (error) {
+            *error = "端口 " + std::to_string(p) + " 已被占用（" + who +
+                     "）。多半是上一个 AudioHub 进程没退干净：请先在任务管理器里" +
+                     "结束 audiohub-hub.exe / audiohub-source.exe 再重启。";
+          }
+          return false;
+        }
+      }
+    }
+    if (!data_socket.Open(port, false)) {
       if (error) *error = "绑定端口 " + std::to_string(port) + " 失败: " + data_socket.last_error();
       return false;
     }
-    if (!ctrl_socket.Open(static_cast<uint16_t>(port + 1))) {
+    if (!ctrl_socket.Open(static_cast<uint16_t>(port + 1), false)) {
       if (error) *error = "绑定控制口 " + std::to_string(port + 1) + " 失败";
       return false;
     }
     ctrl_socket.SetReceiveTimeoutMs(30);
 
-    if (!handshake_socket.Open(static_cast<uint16_t>(port + kControlPortOffset))) {
+    // 握手口同理独占：UDP 没有 TIME_WAIT，上一进程真的退出后端口立刻可用；
+    // 绑不上就说明还有别的实例活着，必须报错而不是悄悄分掉一半邀请帧。
+    if (!handshake_socket.Open(static_cast<uint16_t>(port + kControlPortOffset), false)) {
       if (error) *error = "绑定握手口 " + std::to_string(port + kControlPortOffset) + " 失败";
       return false;
     }
@@ -350,6 +543,9 @@ struct HubCore::Impl {
             std::memset(out + got, 0, (need - got) * sizeof(float));
             render_underruns++;
           }
+          // v0.27：把"实际送给设备的那一帧"记进单调探针。
+          // 放在 Read/补零之后，量到的就是设备真正会播的东西。
+          ProbeRenderBlock(out, got, need);
         }, render_latency_ms)) {
       if (error) *error = "启动输出设备失败: " + render.last_error();
       return false;
@@ -398,6 +594,20 @@ struct HubCore::Impl {
       graph_self_ip = FirstIp(local_ip_for_invite);
       if (graph_self_ip.empty()) graph_self_ip = "127.0.0.1";
       graph_http_port = opts.http_port;
+      // v0.41：把本机所有地址都记下来，供 IsSelfIdLocked() 判断"这个 id 是我自己"。
+      // 见 self_ips 的成员注释：对端写回来的 hubId 可能是本机的另一张网卡，
+      // 只比 self_node_id 会把它当成别人，导致本机让出汇聚端并静音。
+      {
+        // 用 LocalIPv4Addresses()（含虚拟网卡），不是 LocalIPv4List()：
+        // 后者回答"该对外通告哪个地址"，会剔掉 VMware/WSL；而手机看到的电脑
+        // 地址完全可能就是 192.168.x。判断"是不是我"必须用全集。
+        self_ips = LocalIPv4Addresses();
+        bool has_self = false;
+        for (const auto& e : self_ips) {
+          if (e == graph_self_ip) { has_self = true; break; }
+        }
+        if (!has_self) self_ips.push_back(graph_self_ip);
+      }
       std::lock_guard<std::mutex> lock(mutex);
       GraphInitLocked();
     }
@@ -417,7 +627,8 @@ struct HubCore::Impl {
     if (control.joinable()) control.join();
     if (handshake.joinable()) handshake.join();
     if (mixer.joinable()) mixer.join();
-    render.Stop();
+    render.Stop();   // 先停设备：回调彻底不再跑，之后关文件才安全
+    CloseDumpFile();
     running.store(false);
     if (discovery) discovery->Stop();
     std::lock_guard<std::mutex> lock(mutex);
@@ -426,6 +637,70 @@ struct HubCore::Impl {
   }
 
   // ------------------------------------------------------------ 接收线程
+
+  // v0.30：接收侧记账。名字里的 Locked 是历史习惯（rx_mutex 很短，只保护
+  // 一个 set 和几个小字段），绝不与 streams 的 mutex 嵌套 —— 否则接收线程
+  // 会在持锁路径里再拿一把锁，出问题时极难看出。
+  void NoteRxPacketLocked(const std::string& ip, uint16_t port, size_t bytes) {
+    const uint64_t now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    if (rx_first_at_ms.load(std::memory_order_relaxed) == 0) {
+      rx_first_at_ms.store(now_ms, std::memory_order_relaxed);
+    }
+    received_packets.fetch_add(1, std::memory_order_relaxed);
+    received_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    {
+      std::lock_guard<std::mutex> lock(rx_mutex);
+      rx_last_ip = ip;
+      rx_last_port = port;
+      if (rx_senders.size() < kRxMaxSenders) rx_senders.insert(ip);
+    }
+  }
+
+  void NoteRxReject(const std::string& why) {
+    std::lock_guard<std::mutex> lock(rx_mutex);
+    rx_last_reject = why;
+  }
+
+  // v0.32：握手口记账。和解码无关 —— 只要 datagram 到了就记，
+  // 这样"握手口到底有没有包进来"不再依赖它是否是一条合法命令。
+  void NoteHandshakePacket(const std::string& ip, uint16_t port) {
+    const uint64_t now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    if (hs_first_at_ms.load(std::memory_order_relaxed) == 0) {
+      hs_first_at_ms.store(now_ms, std::memory_order_relaxed);
+    }
+    hs_packets.fetch_add(1, std::memory_order_relaxed);
+    hs_recent.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(hs_mutex);
+    hs_last_ip = ip;
+    hs_last_port = port;
+  }
+
+  void NoteHandshakeCmd(const std::string& cmd, const std::string& line) {
+    std::lock_guard<std::mutex> lock(hs_mutex);
+    hs_last_cmd = cmd;
+    // 只留前 120 字节：够看清是哪种帧，又不会把日志/JSON 撑爆
+    hs_last_line = line.size() > 120 ? line.substr(0, 120) : line;
+  }
+
+  // 每拍衰减一次「最近 10 秒」的近似速率：GraphTick 是 50ms 一拍，
+  // 200 拍 = 10 秒。这里用整数衰减，不追求精确，只要能回答
+  // "握手口现在还活着吗"这一个问题。
+  void DecayHandshakeRecent() {
+    const uint64_t v = hs_recent.load(std::memory_order_relaxed);
+    if (v == 0) return;
+    // 每 200 拍清零一次（10 秒无包 -> 归零）
+    if (++hs_decay_tick >= 200) {
+      hs_decay_tick = 0;
+      hs_recent.store(0, std::memory_order_relaxed);
+    }
+  }
+  int hs_decay_tick = 0;
 
   void ReceiverLoop() {
     std::vector<uint8_t> buffer(2048);
@@ -439,6 +714,12 @@ struct HubCore::Impl {
         std::this_thread::sleep_for(std::chrono::microseconds(200));
         continue;
       }
+      // v0.30：**在这行之后的任何判断都不影响这四个量**。
+      // 先记账再解码：只有这样，"一个包都没收到"和"收到了但全解析失败"
+      // 才能被区分开。解码失败时 rx_bad_packets 涨、rx_packets 也涨；
+      // 防火墙挡住时两个都不涨。
+      NoteRxPacketLocked(from_ip, from_port, static_cast<size_t>(n));
+
       // 音频包也算活标志（协议 §8）：只对图谱里已有的 IP 生效
       TouchGraphIp(from_ip);
 
@@ -456,12 +737,16 @@ struct HubCore::Impl {
       PacketHeader header;
       if (!DecodeHeader(buffer.data(), static_cast<size_t>(n), &header)) {
         malformed++;
+        rx_bad_packets.fetch_add(1, std::memory_order_relaxed);
+        NoteRxReject("头部解码失败（长度 " + std::to_string(n) + "）");
         continue;
       }
       const size_t payload_bytes = static_cast<size_t>(n) - kHeaderSize;
       if (payload_bytes == 0 ||
           payload_bytes % (kChannels * sizeof(int16_t)) != 0) {
         malformed++;
+        rx_bad_packets.fetch_add(1, std::memory_order_relaxed);
+        NoteRxReject("载荷长度非法（" + std::to_string(payload_bytes) + " 字节）");
         continue;
       }
       const int frames =
@@ -492,6 +777,24 @@ struct HubCore::Impl {
         }
         it = streams.emplace(header.stream_id, std::move(created)).first;
         Emit("[+] 新流接入: id=" + std::to_string(header.stream_id));
+        // v0.26：只发音频、不发 CONN-REQ 的源（手机 CaptureService 就是这条路）
+        // 也必须能把本机从"已退出共识"里拉回来。
+        //
+        // 以前这里只建流、不解除 graph_detached，于是一旦收摊过（对端 CONN-BYE
+        // 退出 / 流超时掉线 / 用户点「全部断开」），后续纯数据包重连永远不 reattach：
+        // HandleGraphFrame 首行的 `if (graph_detached) return;` 把对端所有 GRAPH
+        // 帧丢掉，GraphBroadcastLocked 也不发 —— 两端各自守着自己那份图谱，
+        // 各自都以为汇聚端是自己，于是都不送音，现象就是【两端都听不到对方】。
+        //
+        // 判据是"收到真实音频"= 对端确实在线，等价于握手成功，所以复用
+        // GraphAddPeerLocked：它首行就是 GraphReattachLocked()，还会把该节点
+        // 补进图谱并立刻互发一次 GRAPH，让共识在下一次合并里自愈。
+        // audio_port 传 0 让它回落默认 47000（与 Android GraphStore.AUDIO_PORT、
+        // 手机自节点 id 的约定一致）；非默认端口时会被后续 GRAPH 帧纠正。
+        // 只在 detached 时做，正常收流路径的行为一个字节都不动。
+        if (graph_detached && !from_ip.empty()) {
+          GraphAddPeerLocked(from_ip, "", 0, nullptr);
+        }
       }
       // 源端采集重启：同一个 stream_id 的 sample_pos 从 0 重新开始。
       // 这里必须先把抖动缓冲/重采样器清空——旧的读指针在几十亿帧的位置上，
@@ -539,12 +842,20 @@ struct HubCore::Impl {
       // 图谱的周期广播/补发/回探全挂在这条线程上：本来就是 50 ms 一拍的循环，
       // 再开一条定时线程只会多一份竞态。
       GraphTick();
+      DecayHandshakeRecent();
       if (n <= 0) continue;
+      // v0.32：先记账再解析。这一行之前没有任何判断，
+      // 所以"握手口收到几个包"是可信的，"界面说没回应"才有对照。
+      NoteHandshakePacket(from_ip, from_port);
       // 任何一条数据报都算"这个 IP 还活着"（协议 §4.2/§8 的活标志）
       TouchGraphIp(from_ip);
 
       std::string line(reinterpret_cast<const char*>(buf.data()), static_cast<size_t>(n));
       while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+      {
+        const size_t bar = line.find('|');
+        NoteHandshakeCmd(bar == std::string::npos ? line.substr(0, 24) : line.substr(0, bar), line);
+      }
 
       // 图谱帧与握手命令共用 audioPort+2 这个口，必须先判断
       if (IsGraphRequestFrame(line)) {
@@ -552,7 +863,7 @@ struct HubCore::Impl {
         continue;
       }
       if (line.compare(0, 6, "GRAPH|") == 0) {
-        HandleGraphFrame(from_ip, line);
+        HandleGraphFrame(from_ip, from_port, line);
         continue;
       }
       // 摆位帧（§13）与 GRAPH 共用一个口；先判请求帧再判数据帧。
@@ -585,8 +896,14 @@ struct HubCore::Impl {
           const int v = std::atoi(parts[3].c_str());
           if (v > 0 && v < 65536) peer_audio = static_cast<uint16_t>(v);
         }
+        // v0.19：判断"是不是老朋友"必须在 RememberPeer 之前 ——
+        // RememberPeer 就在下一行，写完 session_peers 里必然有它，
+        // 放行判断若查 session_peers 就变成"任何陌生设备第一次连入都自动 ACK"，
+        // 待确认弹窗彻底失效（实测 S1 陌生 IP 直接被 ACK）。
+        bool was_known_peer = false;
         {
           std::lock_guard<std::mutex> lock(mutex);
+          was_known_peer = session_peers.count(from_ip) > 0;
           RememberPeer(from_ip, parts[1], peer_audio);
         }
         const std::string peer_name = parts[1];
@@ -638,10 +955,19 @@ struct HubCore::Impl {
         // 协议 §5：图谱成员 IP 的连接请求，任何角色都自动 ACK（不弹窗）；
         // 非成员沿用 auto_accept / 待确认弹窗。非 hub 也必须能放新设备入网，
         // 否则新设备只能靠发现 hub，而 hub 可能已经切到手机上。
+        //
+        // v0.19：session_peers（历史连过、还没被 TTL 清掉的设备）也算成员。
+        // 手机在"设备列表 / 手动 IP"主动连入时，PC 端图谱里没有它的节点、
+        // invited_peers 里也没有它（那两条只在"PC 发邀请"时写入）——
+        // CONN-REQ 会掉进待确认弹窗，手机 respondToInvite 30 秒拿不到
+        // CONN-ACK 就报「对方还没有同意连接」退回连接屏，可与此同时
+        // 音源进程已经在"边握手边推流"，手机其实已经出声了（用户实测：
+        // 「显示对方还没同意，但桌面端的音频已经传递到手机里了」）。
+        // 连过一次的设备是用户亲自建立的信任关系，再连不应再弹窗。
         bool graph_member = false;
         {
           std::lock_guard<std::mutex> lock(mutex);
-          graph_member = FindNodeByIp(graph_, from_ip) != nullptr;
+          graph_member = FindNodeByIp(graph_, from_ip) != nullptr || was_known_peer;
         }
         if (auto_accept_.load() || !require_handshake || PeerAllowedNow(from_ip) ||
             graph_member) {
@@ -743,6 +1069,8 @@ struct HubCore::Impl {
         // v0.4：会话结束把"已同意"记录也摘掉，否则同一 stream id 重连只会回 ACK 不建流。
         accepted_ids.erase(stream_id);
         pending.erase(stream_id);
+        // v0.21：对端是最后一路 → 本机也收摊，图谱删干净（下次连上重建）。
+        EndSessionIfAloneLocked();
       }
     }
   }
@@ -770,6 +1098,26 @@ struct HubCore::Impl {
     return me;
   }
 
+  // v0.41：判断某个节点 id 是否指向本机。
+  //
+  // 不能只比 self_node_id（见 self_ips 的注释）：只要 id 里的 IP 是本机任意一张
+  // 网卡的地址、端口是本机的音频口，就应该算"本机"。这样手机把它看到的
+  // 宿主地址写进 hubId 时，本机仍然认得出自己是汇聚端，不会静音。
+  bool IsSelfIdLocked(const std::string& id) const {
+    if (id.empty()) return false;
+    if (id == self_node_id) return true;
+    const size_t colon = id.rfind(':');
+    if (colon == std::string::npos) return false;
+    const std::string ip = id.substr(0, colon);
+    const std::string port_text = id.substr(colon + 1);
+    if (port_text != std::to_string(static_cast<unsigned>(port))) return false;
+    if (ip == "127.0.0.1" || ip == "localhost") return true;
+    for (const auto& own : self_ips) {
+      if (own == ip) return true;
+    }
+    return false;
+  }
+
   // 启动时初始化：PC 默认自己当汇聚端（协议 §1）。
   void GraphInitLocked() {
     graph_ = GraphState();
@@ -781,12 +1129,14 @@ struct HubCore::Impl {
     graph_seen_version = 1;
     graph_last_seen.clear();
     graph_req_replied.clear();
+    graph_src_replied.clear();
     graph_sends.clear();
     graph_deferred.clear();
     graph_probes.clear();
     graph_pending_repeats = 0;
     graph_next_periodic = Clock::now() + std::chrono::milliseconds(kGraphPeriodicMs);
     graph_detached = false;   // 新进程：正常参与图谱共识
+    graph_detached_at = Clock::now();
     // 摆位随进程启动从空开始：房间布局由桌面端拖拽后广播，不需要持久化在本进程里。
     placement_ = PlacementState();
     placement_seen_version = 0;
@@ -810,6 +1160,7 @@ struct HubCore::Impl {
     graph_seen_version = next_version;
     graph_last_seen.clear();
     graph_req_replied.clear();
+    graph_src_replied.clear();
     graph_sends.clear();
     graph_deferred.clear();
     graph_probes.clear();
@@ -817,6 +1168,7 @@ struct HubCore::Impl {
     // 关键：把本机标记成"已退出图谱共识"（见 graph_detached 注释）。
     // 只"不主动广播"不够 —— 对端还在周期广播，本机会把它的旧图谱合并回来。
     graph_detached = true;
+    graph_detached_at = Clock::now();
     // 摆位是"房间"的状态，不随会话清空；只清收发记账。
     placement_req_replied.clear();
     placement_sends.clear();
@@ -830,6 +1182,39 @@ struct HubCore::Impl {
   void GraphReattachLocked() {
     graph_detached = false;
     graph_next_periodic = Clock::now() + std::chrono::milliseconds(kGraphPeriodicMs);
+  }
+
+  // 「全部断开」的加锁版本：清流 / 清放行 / 重置图谱，必须在持有 mutex 时调用。
+  void ClearSessionLocked() {
+    session_peers.clear();
+    streams.clear();
+    accepted_ids.clear();
+    pending.clear();
+    invited_peers.clear();
+    GraphResetLocked();
+  }
+
+  // v0.21：最后一路也断了 → 本机跟着收摊，把图谱删干净。
+  //
+  // 用户要的语义是「对端一走，图谱里就只剩我一个，那我自己也不该还挂着这张
+  // 半空的图；下次连上重新建」。以前只有用户手动点「断开所有连接」才会清，
+  // 于是对端正常退出（CONN-BYE）或超时掉线后，本机留着一幅只有自节点的图，
+  // hub 也还指着自己 —— 界面停在控制屏、节点残留，下次连接进的是"旧房间"。
+  //
+  // **不能靠"图谱里还有没有别的节点"判断**：图谱协议是只并集、从不删节点
+  // （见 graph.cpp UpsertNode 的"字段会话内不变：只增不改"），对端走了它的
+  // 节点仍然留在表里。所以判据看的是"还有没有一个活着的关系"：
+  //   ① 没有活跃流（streams 空）；② 没有待确认的接入请求（那是"正要连上"）；
+  //   ③ 没有会话关系（session_peers 空 —— 对端进过会话就被记在这，比图谱可靠）。
+  // 三者同时成立才算"没人了"，随后 GraphResetLocked() 会把图谱重建为只含自节点。
+  // 必须在持有 mutex 时调用。
+  bool EndSessionIfAloneLocked() {
+    if (graph_detached) return false;          // 已经收摊过，别重复
+    if (!streams.empty() || !pending.empty()) return false;
+    if (!session_peers.empty()) return false;
+    Emit("[~] 图谱只剩本机：结束本轮会话，下次连接时重建");
+    ClearSessionLocked();
+    return true;
   }
 
   void TouchGraphIp(const std::string& ip) {
@@ -923,7 +1308,8 @@ struct HubCore::Impl {
 
   // 收到 GRAPH：merge → 更新活标志 → 只有 changed 才广播（防 ping-pong，协议 §4.2）。
   // 未变化绝对不回发，否则两端会互相触发一轮广播风暴。
-  void HandleGraphFrame(const std::string& from_ip, const std::string& line) {
+  void HandleGraphFrame(const std::string& from_ip, uint16_t from_port,
+                        const std::string& line) {
     GraphState remote;
     if (!DecodeGraphFrame(line, &remote)) return;   // 非法帧整帧丢弃
 
@@ -935,7 +1321,21 @@ struct HubCore::Impl {
       // 会话已结束：本机不再参与共识，对端的图谱一律不合并。
       // 否则对端周期广播的旧图谱会把刚清掉的节点（和它认的汇聚端）全灌回来，
       // 界面就出现「图谱又满了 / 又跳回控制台 / 汇聚端变成别人」。
-      if (graph_detached) return;
+      //
+      // v0.42：但这道闸门必须有寿命。以前它是无条件的，而解除 detached 的
+      // 只有 GraphAddPeerLocked（要 CONN-REQ）和 SwitchGraphHub（要用户点），
+      // 手机侧只广播 GRAPH、不发 CONN-REQ —— 于是 PC 永久处于 detached，
+      // 把手机关在门外：图谱里永远只有自己，界面上连可选设备都没有。
+      // 现在只拦"刚断开后的 kGraphDetachGraceMs"，过了就重新入网。
+      if (graph_detached) {
+        const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now() - graph_detached_at).count();
+        if (since < kGraphDetachGraceMs) return;
+        if (remote.nodes.empty()) return;   // 空图谱不值得一提
+        GraphReattachLocked();
+        Emit("[GRAPH] 收摊已过 " + std::to_string(since / 1000) +
+             " 秒，收到对端图谱，重新入网");
+      }
       if (remote.version > graph_seen_version) graph_seen_version = remote.version;
 
       // 先记下这次新学到的节点：合并后要给它们各补一次 GRAPH-REQ（协议 §4.4）
@@ -949,10 +1349,78 @@ struct HubCore::Impl {
 
       const GraphMergeResult result = MergeGraph(&graph_, remote);
       changed = result.changed;
+      // v0.41：对端报回来的 hubId 可能就是"本机的另一个地址"。
+      //
+      // 场景：手机在它那侧看到的电脑地址是 10.0.2.2（QEMU NAT 网关）或
+      // 192.168.x（另一张网卡），于是它把 hubId 写成 `<那个地址>:47000`。
+      // 本机 self_node_id 却是 10.135.129.59:47000 —— 字符串不等，
+      // IsHub() 返回 false，MixerLoop 把混音整块清空 → 电脑没声音。
+      //
+      // 这里把它归一到 self_node_id：语义上"汇聚端是我"，只是名字不同。
+      // 只在确实指向本机时才改，且要递增 version，让这个更正能传播出去
+      // （否则对端会一直以为自己那侧的地址才是汇聚端）。
+      if (IsSelfIdLocked(graph_.hub_id) && graph_.hub_id != self_node_id) {
+        const std::string before = graph_.hub_id;
+        graph_.hub_id = self_node_id;
+        graph_.origin = self_node_id;
+        if (graph_.version <= graph_seen_version) graph_.version = graph_seen_version + 1;
+        graph_seen_version = graph_.version;
+        changed = true;
+        Emit("[GRAPH] 汇聚端地址归一: " + before + " -> " + self_node_id + "（都是本机）");
+      }
       // 判活要放在合并之后：第一次收到某台设备的 GRAPH 时，它的节点就是
       // 这一帧才学到的，合并前 TouchGraphIpLocked 找不到节点会直接返回，
       // 结果"刚广播过"的设备反而显示离线（真机上要等它 3 秒后再发一帧才好）。
       TouchGraphIpLocked(from_ip);
+      // v0.38：源地址不可信时的判活兜底。
+      //
+      // 数据报的源地址不一定等于发送方自己的节点 IP：QEMU 用户态 NAT（仿真机
+      // 10.0.2.15 到宿主这边源地址变成 127.0.0.1）、AP 中继、多出口都会造成
+      // 这种错位。一旦错位，FindNodeByIp(from_ip) 要么落空、要么命中一条
+      // "以源地址命名"的伪节点，真正那台设备永远 online=false —— 界面据此
+      // 判成"网络不在"，一直停在连接屏，而对方其实每 3 秒都在广播 GRAPH。
+      //
+      // 判据（v0.39）：数据报源地址**不在帧内那张节点表里**，就说明源地址
+      // 不是发送方自己的节点 IP，此时只有"帧内的节点表"是可用证据 —— 把表里
+      // 所有非自节点都记一次活跃。
+      //
+      // 为什么不用帧里的 origin：本机从未学到过汇聚端时 origin 本来就是空串
+      // （手机刚启动、或对端还没收到过我们的帧），此时 origin 判据永远不成立，
+      // 兜底形同虚设（v0.38 实测：帧是 `GRAPH|0|||...`，origin 为空，节点仍然
+      // 全部 online=false）。
+      //
+      // 副作用是：一台真掉线的机器只要还被别人列在帧里就会显示在线（手机端
+      // v0.22 出于同样理由也是这么做的），可接受 —— 界面"在线"本来就只是
+      // 提示，真正判活还有音频流与 discovery 两条独立证据。
+      {
+        bool from_matches_node = false;
+        for (const auto& rn : remote.nodes) {
+          if (NodeIpOf(rn.id) == from_ip) { from_matches_node = true; break; }
+        }
+        if (!from_matches_node) {
+          for (const auto& rn : remote.nodes) {
+            if (rn.id == self_node_id) continue;
+            TouchGraphIpLocked(NodeIpOf(rn.id));
+          }
+          // v0.39：还要**按数据报源地址回一帧**。
+          //
+          // 对端发来的帧里如果没写我们（它在自己的图谱里还不认识本机），它就
+          // 永远学不到 hubId —— 表现就是「手机界面没有汇聚端」：本机这边早就是
+          // 汇聚端了，但对端一个能用的 GRAPH 都没收到过。
+          // 正常情况下 GraphBroadcastLocked() 会按图谱里的节点 IP 单播回去，
+          // 而源地址错位时（NAT/中继）那张表里根本没有这个源地址，广播打不到它。
+          // 这里直接按 from_ip:from_port 回一帧，走的是真实收包路径，一定到得了。
+          const auto replied = graph_src_replied.find(from_ip);
+          const bool due = replied == graph_src_replied.end() ||
+                           Clock::now() - replied->second >=
+                               std::chrono::milliseconds(kGraphSourceReplyMs);
+          if (due) {
+            graph_src_replied[from_ip] = Clock::now();
+            const std::string back = EncodeGraphFrame(graph_);
+            handshake_socket.SendToAddr(from_ip, from_port, back.data(), back.size());
+          }
+        }
+      }
       if (changed) {
         if (graph_.version > graph_seen_version) graph_seen_version = graph_.version;
         GraphScheduleOnceLocked();   // 合并变化：立即 1 次
@@ -1328,6 +1796,77 @@ struct HubCore::Impl {
     }
   }
 
+  // ------------------------------------------------------- 渲染落盘（诊断）
+
+  // 把"实际送给输出设备"的样本写成 16-bit PCM WAV。
+  //
+  // 为什么值得做：用户需要的是"我这边到底有没有出声"的可验证证据。电平数字
+  // 已经能回答"有没有信号"，但只有一段能直接播放的音频能排除"是软件静音还是
+  // 耳朵听不见"。文件用标准 44 字节头，双击就能播。
+  bool StartDumpFile(const std::string& path, std::string* error) {
+    std::lock_guard<std::mutex> lock(dump_mutex);
+    CloseDumpFileLocked();  // 已在录就先收尾（换文件不该丢前一段）
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) {
+      if (error) *error = "打不开输出文件: " + path;
+      return false;
+    }
+    // 先写 44 字节占位头，收尾时回填长度。WAV 头必须知道总长度，
+    // 而我们是边录边写，所以只能先占位。
+    unsigned char header[44] = {0};
+    std::fwrite(header, 1, sizeof(header), f);
+    std::fflush(f);
+    dump_frames = 0;
+    dump_data_bytes = 0;
+    dump_path = path;
+    dump_file.store(f, std::memory_order_release);  // 最后才发布给实时线程
+    return true;
+  }
+
+  void CloseDumpFile() {
+    std::lock_guard<std::mutex> lock(dump_mutex);
+    CloseDumpFileLocked();
+  }
+
+  void CloseDumpFileLocked() {
+    FILE* f = dump_file.exchange(nullptr, std::memory_order_acq_rel);
+    if (f == nullptr) return;
+    // 摘掉指针后，实时线程最多只有一个"已经取到指针、正在 fwrite"的窗口。
+    // 等它离开再 fclose，否则就是经典的 use-after-close（会直接崩）。
+    while (dump_busy.load(std::memory_order_acquire) != 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    // 回填 WAV 头：RIFF/WAVE + fmt(16) + data
+    const uint32_t byte_rate = kSampleRate * kChannels * 2;
+    const uint32_t riff_size = 36 + dump_data_bytes;
+    unsigned char h[44];
+    std::memcpy(h + 0, "RIFF", 4);
+    std::memcpy(h + 4, &riff_size, 4);
+    std::memcpy(h + 8, "WAVE", 4);
+    std::memcpy(h + 12, "fmt ", 4);
+    const uint32_t fmt_size = 16;
+    std::memcpy(h + 16, &fmt_size, 4);
+    const uint16_t audio_format = 1;  // PCM
+    std::memcpy(h + 20, &audio_format, 2);
+    const uint16_t channels = kChannels;
+    std::memcpy(h + 22, &channels, 2);
+    const uint32_t sample_rate = kSampleRate;
+    std::memcpy(h + 24, &sample_rate, 4);
+    std::memcpy(h + 28, &byte_rate, 4);
+    const uint16_t block_align = kChannels * 2;
+    std::memcpy(h + 32, &block_align, 2);
+    const uint16_t bits = 16;
+    std::memcpy(h + 34, &bits, 2);
+    std::memcpy(h + 36, "data", 4);
+    std::memcpy(h + 40, &dump_data_bytes, 4);
+    std::fseek(f, 0, SEEK_SET);
+    std::fwrite(h, 1, sizeof(h), f);
+    std::fflush(f);
+    std::fclose(f);
+    Emit("[DUMP] 渲染输出已保存: " + dump_path + "（" + std::to_string(dump_frames) +
+         " 帧 / " + std::to_string(dump_frames * 100 / kSampleRate / 100.0) + " 秒）");
+  }
+
   // ------------------------------------------------------------ 混音线程
 
   void MixerLoop() {
@@ -1353,6 +1892,7 @@ struct HubCore::Impl {
 
         // 掉线的流及时清掉，否则手机上按了停止，这边还留着一个死行
         const auto now = Clock::now();
+        bool dropped_any = false;
         for (auto it = streams.begin(); it != streams.end();) {
           const auto idle =
               std::chrono::duration_cast<std::chrono::seconds>(now - it->second->last_packet)
@@ -1367,10 +1907,14 @@ struct HubCore::Impl {
             // 于是 ACK 发出去了、流却没建 —— 界面显示连上、实际一包都不混。
             accepted_ids.erase(it->first);
             it = streams.erase(it);
+            dropped_any = true;
           } else {
             ++it;
           }
         }
+        // v0.21：超时掉线也可能让图谱只剩自己（对端崩溃、没发 BYE 就断电），
+        // 与正常断开一样收摊。放在循环外，避免边遍历边改 streams。
+        if (dropped_any) EndSessionIfAloneLocked();
 
         mix_inputs.clear();
         for (auto& kv : streams) {
@@ -1535,7 +2079,42 @@ struct HubCore::Impl {
         // 协议 §6.1：本机不是汇聚端时混音输出静音。
         // 上面的取水循环照常跑——不取水的话切回汇聚端的瞬间缓冲已被抽干，
         // 会有几百毫秒的杂音/欠载。
-        if (!IsHub(graph_, self_node_id)) mix_inputs.clear();
+        //
+        // v0.41：加一条"收到音频就出声"的兜底。
+        //
+        // 为什么需要：`IsHub()` 是 `graph_.hub_id == self_node_id` 的字符串比较，
+        // 而 hub_id 是别的设备按**它自己那侧看到的地址**写进图谱的。多网卡
+        // （WLAN + 以太网 + VMware）、多出口 NAT、hostname 解析顺序都会让这个
+        // 字符串和我们选的网卡对不上。一旦对不上，本机就"认不出自己是汇聚端"，
+        // 把好不容易送到手边的音频整块清掉 —— 现象正是「手机上有特效、
+        // 电脑上一点声音都没有」，而且重连多少次都一样。
+        //
+        // 判据：**只要有一路已确认的流在给我送音频**，就说明对方把我当汇聚端
+        // （它是 switchHub(我) 之后才开始推流的，否则根本不会有 confirmed 流）。
+        // 这时"我是不是 hub"已经不是问题——音频都在手上了，不播才是错的。
+        // 这不会让非汇聚端乱出声：非汇聚端收到的是未确认流，不会进 confirmed_streams。
+        bool hub_now = IsHub(graph_, self_node_id);
+        if (!hub_now) {
+          for (const auto& kv : streams) {
+            if (kv.second && kv.second->confirmed) { hub_now = true; break; }
+          }
+        }
+        rendering_as_hub.store(hub_now, std::memory_order_relaxed);
+        if (!hub_now) mix_inputs.clear();
+      }
+
+      // 归因探针（v0.28）：把"这一拍实际混入几路"记下来。
+      // mix_inputs 里可能还有 active=false 的条目（未确认 / 已静音），真正出声的
+      // 只有 active 的，所以只数 active 的，否则"混入 1 路"会骗人。
+      {
+        size_t active_inputs = 0;
+        for (const auto& in : mix_inputs) {
+          if (in.active && in.data != nullptr && in.gain != 0.0f) ++active_inputs;
+        }
+        mixed_sources.store(static_cast<uint64_t>(active_inputs), std::memory_order_relaxed);
+        if (active_inputs > 0) {
+          mixed_frames.fetch_add(static_cast<uint64_t>(block), std::memory_order_relaxed);
+        }
       }
 
       MixBlock(mix_buffer.data(), mix_inputs.data(), static_cast<int>(mix_inputs.size()),
@@ -1549,6 +2128,13 @@ struct HubCore::Impl {
       }
 
       SoftLimit(mix_buffer.data(), static_cast<int>(block_samples), 0.85f);
+      {
+        // 有流参与混音的这一拍，混出来的到底有没有声音。
+        const FrameStats fs = ScanFrames(mix_buffer.data(), block_samples, kChannels);
+        if (fs.audible > 0) {
+          mixed_audible_frames.fetch_add(static_cast<uint64_t>(block), std::memory_order_relaxed);
+        }
+      }
       bus_meter.Add(mix_buffer.data(), block_samples);
       output_ring.Write(mix_buffer.data(), block_samples);
 
@@ -1607,6 +2193,54 @@ struct HubCore::Impl {
     st.render_underruns = render_underruns.load();
     double level = -120.0;
     if (bus_meter.Take(&level)) st.bus_level_dbfs = level;
+    // 渲染探针：只读，不影响上面 Take 的节奏，也不会被任何轮询取走。
+    st.render_frames_total = render_frames_total.load(std::memory_order_relaxed);
+    st.render_ring_missed = render_ring_missed.load(std::memory_order_relaxed);
+    st.render_audible_frames = render_audible_frames.load(std::memory_order_relaxed);
+    const double peak = render_peak_abs.load(std::memory_order_relaxed);
+    st.render_peak_dbfs = 20.0 * std::log10(peak + 1e-12);
+    // 归因探针（v0.28）：这三个量回答"audible 为什么是 0"。
+    st.rendering_as_hub = rendering_as_hub.load(std::memory_order_relaxed);
+
+    // v0.30：接收侧证据（锁 rx_mutex，与 streams 的锁不嵌套）
+    st.rx_packets = received_packets.load(std::memory_order_relaxed);
+    st.rx_bytes = received_bytes.load(std::memory_order_relaxed);
+    st.rx_bad_packets = rx_bad_packets.load(std::memory_order_relaxed);
+    st.rx_first_at_ms = rx_first_at_ms.load(std::memory_order_relaxed);
+    {
+      size_t unconfirmed = 0;
+      for (const auto& kv : streams) {
+        if (!kv.second->confirmed) ++unconfirmed;
+      }
+      st.rx_pending_streams = unconfirmed;
+    }
+    {
+      std::lock_guard<std::mutex> rx_lock(rx_mutex);
+      st.rx_distinct_senders = static_cast<uint32_t>(rx_senders.size());
+      st.rx_last_ip = rx_last_ip;
+      st.rx_last_port = rx_last_port;
+      st.rx_last_reject = rx_last_reject;
+    }
+    // v0.32：握手口证据（与音频口分开，见 HubStats 里的注释）
+    st.hs_packets = hs_packets.load(std::memory_order_relaxed);
+    st.hs_recent = hs_recent.load(std::memory_order_relaxed);
+    st.hs_first_at_ms = hs_first_at_ms.load(std::memory_order_relaxed);
+    {
+      std::lock_guard<std::mutex> hs_lock(hs_mutex);
+      st.hs_last_ip = hs_last_ip;
+      st.hs_last_port = hs_last_port;
+      st.hs_last_cmd = hs_last_cmd;
+      st.hs_last_line = hs_last_line;
+    }
+    // 发现口证据：能给"图谱里为什么看得见对方"一个直接答案。
+    st.discovery_peers = static_cast<uint64_t>(DiscoveredPeers().size());
+    st.mixed_sources = static_cast<size_t>(mixed_sources.load(std::memory_order_relaxed));
+    st.mixed_frames = mixed_frames.load(std::memory_order_relaxed);
+    st.mixed_audible_frames = mixed_audible_frames.load(std::memory_order_relaxed);
+    {
+      std::lock_guard<std::mutex> dlock(dump_mutex);
+      st.render_dump_frames = dump_frames;
+    }
     return st;
   }
 
@@ -1807,7 +2441,16 @@ struct HubCore::Impl {
   // 对方确认后会主动发 CONN-REQ，走正常握手；音频流向不变（手机→PC）。
   bool InvitePeer(const std::string& peer_ip, uint16_t peer_audio_port) {
     if (peer_ip.empty() || peer_audio_port == 0) return false;
-    const std::string invite = "CONN-INVITE|" + display_name + "|" + local_ip_for_invite + ":" +
+    // 第 3 段必须是**单个** ip:port。手机端 InviteListener 用 lastIndexOf(':')
+    // 切开就直接交给 InetAddress.getByName —— 拿到 "a, b" 这种逗号列表会立刻
+    // 抛异常，respondToInvite 的 catch 直接 return false，用户看到
+    // 「对方还没有同意连接」。
+    // mDNS 信标带全列表是**故意的**（对端自己挑同网段那个最稳，见下方注释），
+    // 但握手帧不是信标：它是一份"请连我这里"的地址，只能有一个。
+    // 之前这里直接用 local_ip_for_invite，双网卡机器（WiFi + 网线）必踩。
+    const std::string invite_ip = FirstIp(local_ip_for_invite);
+    const std::string invite = "CONN-INVITE|" + display_name + "|" +
+                               (invite_ip.empty() ? std::string("127.0.0.1") : invite_ip) + ":" +
                                std::to_string(port) + "|" +
                                std::to_string(invite_seq_++) + "\n";
     const uint16_t hs_port = static_cast<uint16_t>(peer_audio_port + kControlPortOffset);
@@ -1819,9 +2462,12 @@ struct HubCore::Impl {
         RememberPeer(peer_ip, "", peer_audio_port);
       }
       Emit("[>] 已发出邀请: " + peer_ip + ":" + std::to_string(hs_port));
-      // 邀请即占位入图（协议 §4.1）：这样对端随后发 CONN-REQ 时
-      // 已经算"图谱成员"，会走成员自动 ACK，不用用户再点一次。
-      GraphAddPeer(peer_ip, "", peer_audio_port);
+      // v0.18：不再"邀请即占位入图"。占位节点会被 /api/state 的 mDNS 证据
+      // 判成 online=true（手机只要在广播信标就算"在线"），renderer 的
+      // networkUp 立刻成立 → PC 还没连上就跳进控制台（用户实测：
+      // 「邀请手机没反应，但进入控制台」）。对端真正的节点等它发
+      // CONN-REQ 时再入图（自动同意分支里有 GraphAddPeerLocked）。
+      // 放行改由 AllowPeer 的 invited 集合保证，与占位节点无关。
     }
     return ok;
   }
@@ -1886,12 +2532,15 @@ struct HubCore::Impl {
   // 如果这一刻还要用户在 PC 上再点一次"同意"，就变成"两头都要点"，
   // 而且 PC 端此时往往已经切到音源模式，待确认列表还被界面忽略了。
   // 对端既然是被本机点名的，放行它的连接是合理的。
-  std::string auto_accept_ip;
-  uint64_t auto_accept_until_ms = 0;
+  // v0.18：从"单 IP + 60 秒过期"改成"集合 + 会话内不过期"。
+  // 旧窗口的两个坑：① 用户在手机上读弹窗超过 60 秒才点同意，CONN-REQ 到时
+  // 窗口已过期，只能掉进 pending 等界面确认——没人点就 30 秒超时，手机端
+  // 报「对方还没有同意连接」；② 连续邀请两台设备时后者会覆盖前者。
+  // 集合只在 ClearSession（全部断开）时清空。
+  std::set<std::string> invited_peers;
 
   void AllowPeer(const std::string& ip) {
-    auto_accept_ip = ip;
-    auto_accept_until_ms = NowMs() + 60'000;
+    if (!ip.empty()) invited_peers.insert(ip);
   }
 
   /**
@@ -1923,7 +2572,7 @@ struct HubCore::Impl {
   }
 
   bool PeerAllowedNow(const std::string& ip) {
-    return !ip.empty() && ip == auto_accept_ip && NowMs() < auto_accept_until_ms;
+    return !ip.empty() && invited_peers.count(ip) > 0;
   }
   std::string local_ip_for_invite;
   uint32_t invite_seq_ = 1;
@@ -1944,6 +2593,16 @@ void HubCore::SetSourceGain(uint16_t id, float gain) { impl_->SetSourceGain(id, 
 void HubCore::SetSourceMuted(uint16_t id, bool muted) { impl_->SetSourceMuted(id, muted); }
 void HubCore::SetMasterGain(float gain) { impl_->SetMasterGain(gain); }
 float HubCore::master_gain() const { return impl_->master_gain.load(); }
+
+bool HubCore::StartRenderDump(const std::string& path, std::string* error) {
+  return impl_->StartDumpFile(path, error);
+}
+
+void HubCore::StopRenderDump() { impl_->CloseDumpFile(); }
+
+bool HubCore::render_dump_active() const {
+  return impl_->dump_file.load(std::memory_order_acquire) != nullptr;
+}
 void HubCore::SetLatency(int ms) { impl_->SetLatency(ms); }
 int HubCore::latency() const { return impl_->latency_ms; }
 
@@ -1993,17 +2652,15 @@ std::vector<Peer> HubCore::SessionPeers() const {
 
 void HubCore::ClearSession() {
   std::lock_guard<std::mutex> lock(impl_->mutex);
-  impl_->session_peers.clear();
   // v0.4：全部断开 = 真的把这一轮会话清干净。以前只清 session_peers + 图谱，
   // streams / accepted_ids / pending 留着，下一次用相同 stream id 重连就会命中
   // "已同意过 → 只回 ACK 不建流"的分支：界面连上了、声音永远不通，
   // 只能重启桌面端（用户报的"两端都退出才能重连"就是这个）。
-  impl_->streams.clear();
-  impl_->accepted_ids.clear();
-  impl_->pending.clear();
+  // v0.18：被邀请过的对端也一并解除放行——「全部断开」之后不该再有免确认的 CONN-REQ。
   // "全部断开"同时重置图谱（协议 §4.6）：版本 +1、origin/hubId 回到自己、只留自节点。
   // 不广播：对端已经断开/不可达，广播只会在下次见面时造成一次无意义的合并。
-  impl_->GraphResetLocked();
+  // v0.21：逻辑收敛到 ClearSessionLocked()，自动收摊路径共用同一份实现。
+  impl_->ClearSessionLocked();
 }
 
 std::vector<Peer> HubCore::Invites() const {
@@ -2045,6 +2702,10 @@ std::string HubCore::graph_self_id() const {
 
 bool HubCore::graph_is_hub() const {
   std::lock_guard<std::mutex> lock(impl_->mutex);
+  // v0.41：先按"任意本机地址 + 本机端口"认一次，再回落到严格相等。
+  // 对端写回来的 hubId 可能是本机的另一张网卡（或多出口 NAT 后的地址），
+  // 只比 self_node_id 会让界面把汇聚端标成一台陌生设备。
+  if (impl_->IsSelfIdLocked(impl_->graph_.hub_id)) return true;
   return IsHub(impl_->graph_, impl_->self_node_id);
 }
 

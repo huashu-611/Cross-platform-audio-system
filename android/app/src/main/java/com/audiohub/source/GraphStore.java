@@ -165,6 +165,60 @@ public final class GraphStore {
     /** 重新入网：解除 detached，并允许立刻广播。 */
     public static synchronized void reattach() { detached = false; }
 
+    /**
+     * v0.21：图谱里是否只剩本机（或干脆已经空了）。
+     *
+     * 判据只数**非自节点**：图谱节点是从不删除的并集，断开后对方的残留节点会
+     * 一直躺在表里，所以"没人了"只能靠本机主动收拾（见 {@link #resetSession()}），
+     * 不能指望它自己消失。
+     */
+    public static synchronized boolean isAlone() {
+        for (Node n : nodes) {
+            if (n == null) continue;
+            if (selfId.isEmpty() || !selfId.equals(n.id)) return false;
+        }
+        return true;
+    }
+
+    /**
+     * 这幅图谱里有没有"别的设备"（哪怕它已经离线）。
+     *
+     * v0.21：「最后一路断开后自动收摊」需要区分两种"只有自节点"：
+     * ① 刚建立连接、对端 GRAPH 还没到 —— 不能收摊；
+     * ② 对端真的走了 —— 要收摊。
+     * 用 isAlone() 分不开这两者，所以额外提供这个"曾经有对端"的判据。
+     */
+    public static synchronized boolean hasPeerNode() {
+        for (Node n : nodes) {
+            if (n == null) continue;
+            if (!selfId.isEmpty() && !selfId.equals(n.id)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 当前**在线**的对端数量（不含本机）。
+     *
+     * v0.21 收摊判据必须用它，不能用 nodes.size() 或 isAlone()：
+     * 图谱协议只做并集、从不删节点（见 graph.cpp UpsertNode），对端走了它的
+     * 节点仍留在表里 —— isAlone() 在对端离线后就永远为 false，收摊逻辑形同
+     * 虚设；反过来刚连上时若还没有任何节点，isAlone() 又为 true，会把"正要
+     * 连上"当成"没人了"。所以真正的判据是"曾经有对端，现在一个在线的都没有"。
+     */
+    public static synchronized int onlinePeerCount() {
+        final long now = System.currentTimeMillis();
+        int n = 0;
+        for (Node node : nodes) {
+            if (node == null) continue;
+            if (!selfId.isEmpty() && selfId.equals(node.id)) continue;
+            // v0.22：和 snapshot()/isOnline() 用同一口径（effectiveLastSeen）。
+            // 只看 node.lastSeenMs 会漏掉"节点 id 里的 ip 与数据报源 ip 不同"
+            // 时 markSeen 记在 seenByIp 里的那次刷新。
+            if (now - effectiveLastSeen(node, now) < ONLINE_TIMEOUT_MS) n++;
+        }
+        return n;
+    }
+
     /** 始终按 id 升序（协议 §1 的规范序）。 */
     private static final List<Node> nodes = new ArrayList<>();
 
@@ -266,6 +320,29 @@ public final class GraphStore {
             nodesChanged = true;
         }
         if (nodesChanged) sortLocked();
+
+        // v0.22：收到一帧 GRAPH 本身就是"发送方还活着"的证据 —— 把帧里出现的
+        // 每个对端节点都标活。
+        //
+        // 以前的活标志只靠 markSeen(数据报源 IP)（协议 §8），但在两种常见情况下
+        // 源 IP 对不上图谱里的节点 ip：
+        //   ① 模拟器 / NAT / 代理转发把源地址改写（手机看到的是 127.0.0.1，
+        //      图里的 PC 却是 10.x.x.x）；
+        //   ② 帧是别的设备中继过来的，源 IP 是那个中继而不是帧里的节点。
+        // 对不上 → 节点 lastSeenMs 停在握手那一刻 → 10 秒后 onlinePeerCount()==0
+        // → reconcile 误判"图谱只剩本机"直接收摊（v0.21 引入），清掉 hubIp、
+        // 退回连接屏、停掉采集 —— 用户看到的就是"刚连上就没声了、还弹回连接屏"。
+        //
+        // 反过来也对：对端真的走了就不会再发帧，它的节点自然会过期，
+        // 收摊逻辑照样按预期触发，所以这里不会把"该收的摊"挡住。
+        final long frameNow = System.currentTimeMillis();
+        for (Node rn : remote.nodes) {
+            if (rn == null) continue;
+            if (!selfId.isEmpty() && selfId.equals(rn.id)) continue;
+            final Node local = findLocked(rn.id);
+            if (local != null) local.lastSeenMs = frameNow;
+            seenByIp.put(rn.ip, frameNow);
+        }
 
         // 见过的最大 version 只增（即使本帧没被采纳，协议 §3 补充规则）
         if (remote.version > seenVersion) seenVersion = remote.version;
@@ -389,7 +466,22 @@ public final class GraphStore {
 
     /** 编码当前图谱（含结尾 '\n'，帧总长 < 1000 字节）。 */
     public static synchronized String encodeFrame() {
-        final String head = "GRAPH|" + version + "|" + safeIdField(origin)
+        // v0.42：origin 空着不能发出去。
+        //
+        // resetSession() 会把 version/origin/hubId 一起清成 0/""/""（那是"还没入网"
+        // 的空白态）。而 pickRemoteHub() 紧接着会 reattach() + upsertNode() 把目标
+        // 设备写进 nodes ——于是本机在"version=0、origin 空、hubId 空、但 nodes 里有
+        // 两台设备"的状态下开始周期广播，线上帧长这样：
+        //     GRAPH|0|||10.135.129.59:47000,shuihui,other,47000,0;10.135.54.72:47000,PHZ110,android,47000,0
+        // 对端（PC）收到后：节点能并进来，但这个帧里没有任何"我是谁"的身份信息，
+        // 也就没有任何可信的汇聚端线索；实机现场 hsPackets=40、hsLastCmd 恒为 GRAPH，
+        // 而 PC 的 graph.nodes 里始终只有它自己。
+        //
+        // 修法：origin 是"这一帧是谁说的"，空串没有意义 —— 本机发的帧，origin 就是
+        // 本机 id。version 为 0 时抬到 1（0 只作为内部"还没入网"的哨兵，不该上线路）。
+        final String wireOrigin = origin == null ? "" : origin.trim();
+        final String head = "GRAPH|" + (version > 0 ? version : 1) + "|"
+                + safeIdField(wireOrigin.isEmpty() ? selfId : wireOrigin)
                 + "|" + safeIdField(hubId) + "|";
 
         // 节点按 id 升序发送（nodes 已是规范序）；帧装不下时从尾部裁，保证确定性

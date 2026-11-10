@@ -17,11 +17,12 @@ if (typeof electronModule === 'string') {
   process.exit(1)
 }
 
-const { app, BrowserWindow, ipcMain } = electronModule
+const { app, BrowserWindow, ipcMain, dialog } = electronModule
 const path = require('path')
-const { spawn } = require('child_process')
+const { spawn, execFile } = require('child_process')
 const os = require('os')
 const http = require('http')
+const fs = require('fs')
 
 const DATA_PORT = 47000   // 音频 UDP 口，手机上填的就是它
 const HTTP_PORT = 4780    // 本地控制口，只绑 127.0.0.1
@@ -394,6 +395,121 @@ ipcMain.handle('hub:setRole', async (_e, arg) => {
   return { ok: true }
 })
 
+// ---------------------------------------------------------------- 入站放行（v0.44）
+//
+// Windows 防火墙按**可执行文件的完整路径**放行入站 UDP，不是按进程名、也不是
+// 按端口。而我们是 spawn 一个独立的 audiohub-hub.exe，它的路径随运行方式变：
+//
+//   开发态 : <仓库>uildudiohub-hub.exe                    —— 跑过很多次，早有放行规则
+//   便携版 : %TEMP%\AudioHub\...inudiohub-hub.exe        —— 固定解包目录，从未授权过
+//
+// 本机 InboundUserNotification 是禁用的，所以连"是否允许"的弹框都不会出现，
+// 入站包被**静默丢弃**。表现就是：手机 send() 全部成功、界面显示"发送 91000 包"，
+// 而电脑侧 rxPackets 恒 0、界面显示对方"没响应" —— 看上去像"没联网"，
+// 实际上是"包到了网卡，但没交给这个 exe"。
+//
+// 实测证据（同一份字节 4b85310d...，只换路径，各跑 8 秒，不发任何注入包）：
+//   buildudiohub-hub.exe          rxPackets +3200  sources=1
+//   %TEMP%\...udiohub-hub.exe    rxPackets +0     hsPackets +0
+//   build\_diag\hub_copy\...       15 秒全零
+//
+// 结论：这是"我们把监听器放到了一个系统不认识的路径上，而且从不自查"的问题，
+// 属于代码该负责的部分 —— 所以在这里自查并补上，不让用户去点防火墙设置。
+// 用户拒绝 UAC 也不会坏：只是收不到网络音频，本地功能照常，界面会给出提示。
+function firewallRuleCount (exe, done) {
+  if (process.platform !== 'win32') return done(0)
+  // 只让 PowerShell 把"指向 hub 的全部路径"吐出来，路径比对在 Node 里做。
+  //
+  // 两个坑都在这里踩过：
+  //   1. 不能用 -eq '<路径>' 把路径塞进命令行 —— 含中文的路径经
+  //      powershell -Command 传参会变成乱码，永远匹配 0 条，于是
+  //      "明明有规则也判定为没有"，把正常状态误判成故障。
+  //   2. 必须先把 OutputEncoding 设成 UTF8，否则中文路径按 GBK 输出、
+  //      Node 按 UTF-8 解码，比对同样永远不相等。
+  const ps = '$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8; ' +
+    'Get-NetFirewallApplicationFilter | ' +
+    "Where-Object { $_.Program } | Select-Object -ExpandProperty Program"
+  execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps],
+    { windowsHide: true, timeout: 10000, maxBuffer: 1 << 20, encoding: 'utf8' },
+    (err, stdout) => {
+      if (err) return done(null)            // 查不到就别乱下结论
+      const want = String(exe).toLowerCase()
+      const suffix = 'hub.exe'
+      let hit = 0
+      for (const raw of String(stdout).split(String.fromCharCode(10))) {
+        const line = raw.replace(/\s+$/, '').toLowerCase()
+        if (!line) continue
+        if (line.endsWith(suffix) && line === want) hit += 1
+      }
+      done(hit)
+    })
+}
+
+function addFirewallRule (exe) {
+  // 用临时 .bat 承载 netsh，避免 PowerShell 里的多层引号转义出错。
+  const bat = path.join(os.tmpdir(), 'audiohub-fw-' + Date.now() + '.bat')
+  const lines = [
+    '@echo off',
+    'netsh advfirewall firewall delete rule name="AudioHub Hub" >nul 2>&1',
+    'netsh advfirewall firewall add rule name="AudioHub Hub" dir=in action=allow ' +
+      'program="' + exe + '" enable=yes profile=any protocol=udp',
+    'netsh advfirewall firewall add rule name="AudioHub Hub" dir=in action=allow ' +
+      'program="' + exe + '" enable=yes profile=any protocol=tcp'
+  ]
+  try { fs.writeFileSync(bat, lines.join('\r\n'), 'utf8') } catch (e) { return false }
+  // -Verb RunAs 会弹一次 UAC；-Wait 保证后面的端口确认能立刻看到结果。
+  execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command',
+    "Start-Process -FilePath '" + bat.replace(/'/g, "''") + "' -Verb RunAs -WindowStyle Hidden -Wait"],
+  { windowsHide: true, timeout: 30000 }, () => {
+    try { fs.unlinkSync(bat) } catch (e) {}
+  })
+  return true
+}
+
+// 启动核心后调用一次：缺规则就补，补不上就把原因**明确告诉用户**。
+//
+// v0.44：只在控制台打一行等于没说 —— 便携版没有控制台，用户看到的现象是
+// "手机明明在发、电脑没声"，和网络故障一模一样。所以补完必须复查一次，
+// 没成功就用对话框讲清楚该做什么。
+function ensureInboundRule (exe) {
+  firewallRuleCount(exe, (count) => {
+    if (count === null) {
+      console.log('[AudioHub] 无法查询防火墙规则，若收不到网络音频请运行 tools/修复防火墙-管理员运行.bat')
+      return
+    }
+    if (count > 0) { console.log('[AudioHub] 入站放行规则已存在（' + count + ' 条）'); return }
+    console.log('[AudioHub] 这个 exe 路径没有入站放行规则：', exe)
+    console.log('[AudioHub] 正在申请管理员权限添加（会弹一次 UAC）…')
+    addFirewallRule(exe)
+    // 复查：UAC 被拒、或被组策略拦下时，addFirewallRule 本身不会报错。
+    setTimeout(() => {
+      firewallRuleCount(exe, (after) => {
+        if (after !== null && after > 0) {
+          console.log('[AudioHub] 已放行（' + after + ' 条）')
+          return
+        }
+        console.error('[AudioHub] 入站放行没有生效，收不到手机的音频包')
+        if (!mainWindow || mainWindow.isDestroyed()) return
+        const detail = [
+          'Windows 防火墙按程序的完整路径放行。当前路径没有规则，手机的音频包会被系统直接丢掉 ——',
+          '手机上会显示"正在发送"，电脑这边却一个包都收不到。',
+          '',
+          '解决办法（任选其一）：',
+          '1. 右键以管理员身份运行仓库里的 tools' + String.fromCharCode(92) + '修复防火墙-管理员运行.bat',
+          '2. 安装 0.44 及以后的安装包（安装时会自动放行）'
+        ].join(String.fromCharCode(10))
+        dialog.showMessageBox(mainWindow, {
+          type: 'warning',
+          title: 'AudioHub 收不到网络音频',
+          message: '这台电脑还没有允许 AudioHub 接收网络数据。',
+          detail: detail,
+          buttons: ['知道了']
+        }).catch(() => {})
+      })
+    }, 4000)
+  })
+}
+
 function startHub () {
   const exe = hubExePath()
   hubProcess = spawn(exe, [
@@ -403,16 +519,31 @@ function startHub () {
     '--latency', String(LATENCY_MS)
   ], { stdio: ['ignore', 'pipe', 'pipe'] })
 
+  // v0.44：核心一起来就自查入站放行。放在 spawn 之后、不阻塞启动。
+  ensureInboundRule(exe)
+
   // 音频核心的输出必须能看到：端口被占、设备打不开、握手异常
   // 都只在这里体现。之前用 stdio:'ignore' 等于把唯一的线索丢了。
+  //
+  // v0.20：把 stderr 的最后一行记下来。核心进程退出时（最典型的就是
+  // "端口已被占用，多半是上一个进程没退干净"）只有这句话能说清原因，
+  // 否则界面只能显示一个 code=1，用户完全不知道该去做什么。
+  let lastError = ''
   hubProcess.stdout.on('data', (d) => process.stdout.write('[hub] ' + d))
-  hubProcess.stderr.on('data', (d) => process.stderr.write('[hub] ' + d))
+  hubProcess.stderr.on('data', (d) => {
+    process.stderr.write('[hub] ' + d)
+    const text = String(d).trim()
+    if (text) lastError = text.split('\n').pop().trim() || text
+  })
 
   hubProcess.on('exit', (code) => {
     hubProcess = null
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('hub:push', { error: '音频核心已退出（code=' + code + '）' })
-    }
+    if (!mainWindow || mainWindow.isDestroyed()) return
+    // 把核心自己的说明原样带给用户：它比"音频核心已退出（code=1）"有用得多。
+    const detail = lastError
+      ? lastError
+      : '音频核心已退出（code=' + code + '）'
+    mainWindow.webContents.send('hub:push', { error: detail })
   })
   hubProcess.on('error', (err) => {
     if (mainWindow && !mainWindow.isDestroyed()) {

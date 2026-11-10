@@ -55,6 +55,24 @@ public class ReceiverService extends Service {
     public static volatile boolean sRunning = false;
     public static volatile String sStatus = "未启动";
     public static volatile double sBusLevel = -120.0;
+
+    // ---- 渲染探针（v0.27）：判断"手机作为汇聚端到底有没有真的出声" ----
+    //
+    // 为什么不能只看 sBusLevel：它是每 500ms 重算的窗口均值，看起来能用，
+    // 但只能回答"混音缓冲里有没有信号"，回答不了"这些样本有没有真的交给
+    // AudioTrack 并且非静音"。下面三个量从服务启动起单调递增，任何读者
+    // 反复读都一样，不会被界面刷新抢走：
+    //   sRenderFrames   已写入 AudioTrack 的帧数（音频通路真的在跑）
+    //   sRenderAudible  其中至少一个声道非零的帧数（真的在出声）
+    //   sRenderPeak    见过的最大绝对值（dBFS，单调）
+    // 判读：frames 涨而 audible 不涨 = 混音后就是静音（没混进去）；
+    //       audible 涨但听不见 = 数据到了设备，问题在音量/路由/输出设备。
+    // v0.28 归因探针：光知道"有声帧 = 0"没法判断原因，还得知道这一拍到底混进了几路。
+    // 与 C++ 端 HubStats.mixed_sources 同一个含义：只数真正参与混音的流。
+    public static volatile int sMixedSources = 0;
+    public static volatile long sRenderFrames = 0;
+    public static volatile long sRenderAudible = 0;
+    public static volatile double sRenderPeakDbfs = -120.0;
     public static volatile int sOccupancyMs = 0;
     public static volatile int sStreamCount = 0;
     // 累计欠载帧数：持续增长说明缓冲在饿（时钟偏差或丢包）
@@ -387,6 +405,8 @@ public class ReceiverService extends Service {
                 active++;
             }
             sStreamCount = streams.size();
+            // 归因探针（v0.28）：active 就是这一拍真正参与混音的流数（上面循环里累加的）。
+            sMixedSources = active;
 
             // 软限幅：**与 C++ 端 SoftLimitSample 完全同一个公式**。
             //   threshold + headroom * tanh((|x| - threshold) / headroom)
@@ -413,6 +433,23 @@ public class ReceiverService extends Service {
                     out[i] = (short) Math.max(-32768, Math.min(32767, mix[i] * 32767f));
                 }
                 track.write(out, 0, out.length);
+                // 探针只统计"真的写进了 AudioTrack 的那一段"，且放在 write 之后：
+                // 万一 write 抛异常，帧数就不该被算进去。
+                long audible = 0;
+                int peakAbs = 0;
+                for (int i = 0; i < frames; i += 2) {
+                    final int l = Math.abs((int) out[i]);
+                    final int r = (i + 1 < out.length) ? Math.abs((int) out[i + 1]) : 0;
+                    final int a = Math.max(l, r);
+                    if (a != 0) ++audible;
+                    if (a > peakAbs) peakAbs = a;
+                }
+                sRenderFrames += frames;
+                sRenderAudible += audible;
+                if (peakAbs > 0) {
+                    final double pk = 20.0 * Math.log10(peakAbs / 32768.0 + 1e-12);
+                    if (pk > sRenderPeakDbfs) sRenderPeakDbfs = pk;
+                }
             }
 
             for (int i = 0; i < mix.length; ++i) levelSum += mix[i] * mix[i];
@@ -520,6 +557,14 @@ public class ReceiverService extends Service {
      * @return true = 对方已确认
      */
     public static boolean respondToInvite(String pcIp, int pcAudioPort, String deviceName) {
+        // 防御：老版本 PC 的握手帧第 3 段可能是 "a, b" 逗号列表（多网卡）。
+        // InetAddress.getByName 遇到它会立刻抛异常 → catch 直接 return false，
+        // 用户看到「对方还没有同意连接」。这里取第一个并去空白。
+        if (pcIp != null) {
+            pcIp = pcIp.trim();
+            final int comma = pcIp.indexOf(',');
+            if (comma > 0) pcIp = pcIp.substring(0, comma).trim();
+        }
         DatagramSocket s = null;
         try {
             s = new DatagramSocket();
@@ -528,24 +573,42 @@ public class ReceiverService extends Service {
             // 就必须知道本机在哪个端口收流（老版本不带，对端回落到 47000）。
             final String req = "CONN-REQ|" + deviceName + "|1|" + 47000 + "\n";
             final byte[] data = req.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            // v0.19：以前这里 30 次静默失败，界面上只看到「对方还没有同意连接」，
+            // 完全不知道是包没发出去、还是 ACK 没回来。现在每一步都留痕：
+            // 发往哪里、发了几次、收到什么。排查握手问题全靠这几行。
+            java.net.InetAddress target = null;
+            try {
+                target = InetAddress.getByName(pcIp);
+            } catch (Exception e) {
+                android.util.Log.w(TAG, "握手目标解析失败 pcIp=" + pcIp + " : " + e);
+                return false;
+            }
+            android.util.Log.d(TAG, "开始握手 -> " + target.getHostAddress() + ":"
+                    + (pcAudioPort + 2) + " 本机 " + deviceName);
             // 等 30 秒：对方要在界面上点"同意"，10 秒往往不够
             for (int i = 0; i < 30; ++i) {
-                s.send(new DatagramPacket(data, data.length,
-                        InetAddress.getByName(pcIp), pcAudioPort + 2));
+                s.send(new DatagramPacket(data, data.length, target, pcAudioPort + 2));
                 byte[] rbuf = new byte[256];
                 DatagramPacket r = new DatagramPacket(rbuf, rbuf.length);
                 try {
                     s.receive(r);
-                    if (r.getLength() >= 8
-                            && new String(rbuf, 0, 8).equals("CONN-ACK")) {
+                    final String text = new String(rbuf, 0, Math.min(r.getLength(), 256),
+                            java.nio.charset.StandardCharsets.UTF_8);
+                    android.util.Log.d(TAG, "握手收到回包 #" + i + " from "
+                            + r.getAddress().getHostAddress() + ":" + r.getPort()
+                            + " = " + text.trim());
+                    if (text.startsWith("CONN-ACK")) {
+                        android.util.Log.d(TAG, "握手成功，用时约 " + i + " 秒");
                         return true;
                     }
                 } catch (java.net.SocketTimeoutException ignored) {
                     // 继续重试
                 }
             }
+            android.util.Log.w(TAG, "握手超时 30 秒：对方没回 CONN-ACK");
             return false;
         } catch (Exception e) {
+            android.util.Log.w(TAG, "握手异常: " + android.util.Log.getStackTraceString(e));
             return false;
         } finally {
             if (s != null) s.close();

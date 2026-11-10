@@ -27,9 +27,9 @@ BUILD_TOOLS="$(dirname "$(find "$SDK" -maxdepth 3 -name aapt2.exe | head -1)")"
 [ -n "$BUILD_TOOLS" ] || { echo "找不到 build-tools（aapt2）" >&2; exit 1; }
 
 PKG="com.audiohub.source"
-# 版本号可由环境变量覆盖，便于在手机上区分“装的是哪一版”（默认 0.13/13）
-VERSION_CODE="${VERSION_CODE:-17}"
-VERSION_NAME="${VERSION_NAME:-0.17}"
+# 版本号可由环境变量覆盖，便于在手机上区分“装的是哪一版”（默认 0.36/36）
+VERSION_CODE="${VERSION_CODE:-36}"
+VERSION_NAME="${VERSION_NAME:-0.36}"
 OUT=build
 rm -rf "$OUT"
 mkdir -p "$OUT/classes" "$OUT/dex"

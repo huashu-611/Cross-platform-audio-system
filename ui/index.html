@@ -100,6 +100,9 @@
     <!-- 切换后的同步状态：已切换，正在同步… / 已同步（vN） -->
     <div id="graphStatus" class="graphstatus" style="display:none"></div>
 
+    <!-- v0.24：音源已接入但采集到的是静音时，明确告诉用户「不是没收到 / 没渲染」 -->
+    <div id="silentWarn" class="silent-warn hidden" role="status"></div>
+
     <!-- 节点右键菜单（左键只拖动；切换汇聚端 / 位置复位 / 所有设备位置复位都在这里；
          v1.6 起音量滑块已删除 —— 距离即音量，拖远即变轻）。
          内容由 renderer.js 动态生成，位置 fixed 跟随鼠标并夹在视口内。 -->

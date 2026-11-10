@@ -6,9 +6,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <ctime>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -22,6 +25,11 @@
 #include "audiohub/udp_socket.hpp"
 
 namespace {
+
+// 版本标记：与 APK versionName / ui/package.json 保持一致。
+// 启动横幅会打出来，现场排查时第一件事就是确认"跑的是不是修好的那一版"。
+// 以前没有版本号，只能靠 md5 去猜，多台机器、多个打包产物时特别容易搞混。
+const char* const kVersionTag = "0.43";
 
 // --log 的路径可能是 UTF-8 中文。Windows 的 CRT 会用 ANSI 代码页解释窄路径，
 // 中文路径直接打不开；这里统一按 UTF-8 解码成宽字符再 _wfopen，然后 _dup2
@@ -113,6 +121,33 @@ bool ParseArgs(int argc, char** argv, Options* opt) {
 }
 
 // 图谱 JSON（docs/GRAPH-PROTOCOL.md §7.1）：节点上的"流字段"按 source.peer_ip
+// v0.36：出网路径判定带缓存。
+//
+// 为什么要缓存：/api/state 每 200 ms 被 UI 轮询一次，而 ProbeEgress 要建
+// 一个 socket 并做一次路由查询。节点数是"几台"，不是"几百台"，但按 200ms
+// 的频率建 socket 仍然多余。路由表不会 200 ms 变一次，2 秒的缓存足够。
+//
+// 为什么按 IP 分别判：路由是按目标前缀匹配的，同一台机器上"发往同网段"
+// 与"发往跨网段"可能走完全不同的网卡 —— 本机实测就是这样。
+struct EgressCacheEntry {
+  audiohub::EgressInfo info;
+  std::chrono::steady_clock::time_point at;
+};
+audiohub::EgressInfo CachedEgress(const std::string& ip) {
+  static std::map<std::string, EgressCacheEntry> cache;
+  static std::mutex mu;
+  if (ip.empty()) return audiohub::EgressInfo();
+  std::lock_guard<std::mutex> lock(mu);
+  const auto now = std::chrono::steady_clock::now();
+  const auto it = cache.find(ip);
+  if (it != cache.end() && now - it->second.at < std::chrono::seconds(2)) {
+    return it->second.info;
+  }
+  audiohub::EgressInfo fresh = audiohub::ProbeEgress(ip);
+  cache[ip] = EgressCacheEntry{fresh, now};
+  return fresh;
+}
+
 // 与节点 IP 匹配，没有流的节点给默认值，界面就不用判断 null 了。
 // 只放在 hub_main 里：HubCore 保持平台无关，不依赖 JSON。
 std::string GraphStateJson(const audiohub::HubCore& hub,
@@ -126,6 +161,8 @@ std::string GraphStateJson(const audiohub::HubCore& hub,
   o << "{\"version\":" << g.version << ",\"origin\":\"" << audiohub::JsonEscape(g.origin)
     << "\",\"hubId\":\"" << audiohub::JsonEscape(g.hub_id) << "\",\"selfId\":\""
     << audiohub::JsonEscape(self_id) << "\",\"isHub\":"
+    // v0.41：graph_is_hub() 只比 self_node_id；这里用同一条"任意本机地址"规则，
+    // 否则界面会把汇聚端标到一条看着像陌生设备的节点上（其实是本机的另一张网卡）。
     << (hub.graph_is_hub() ? "true" : "false")
     << ",\"placementVersion\":" << placement.version << ",\"nodes\":[";
   for (size_t i = 0; i < g.nodes.size(); ++i) {
@@ -189,6 +226,15 @@ std::string GraphStateJson(const audiohub::HubCore& hub,
       o << ",\"x\":" << (static_cast<double>(pos->x_cm) / 100.0)
         << ",\"z\":" << (static_cast<double>(pos->z_cm) / 100.0);
     }
+    // v0.36：本机发往这个节点时会走哪张网卡。
+    // hijacked=true 是决定性证据：路由被代理 TUN 接走，包永远到不了对端，
+    // 而 mDNS 广播因为在同网段内还能通，界面照样显示"在线"。
+    {
+      const audiohub::EgressInfo eg = CachedEgress(ip);
+      o << ",\"egressSrc\":\"" << audiohub::JsonEscape(eg.src_ip) << "\""
+        << ",\"egressOk\":" << (eg.ok ? "true" : "false")
+        << ",\"egressHijacked\":" << (eg.hijacked ? "true" : "false");
+    }
     o << ",\"level\":" << (src != nullptr ? src->level_dbfs : -120.0)
       << ",\"occupancy\":" << (src != nullptr ? src->occupancy_ms : 0)
       << ",\"gain\":" << (src != nullptr ? src->gain : 1.0)
@@ -196,6 +242,22 @@ std::string GraphStateJson(const audiohub::HubCore& hub,
   }
   o << "]}";
   return o.str();
+}
+
+// 渲染落盘的默认路径：程序目录下带时间戳，不覆盖上一次。
+// 用户拿到这个 WAV 直接双击就能听，是"汇聚端到底有没有出声"最硬的证据。
+static std::string DefaultDumpPath() {
+  auto now = std::chrono::system_clock::now();
+  const std::time_t t = std::chrono::system_clock::to_time_t(now);
+  std::tm tm_buf{};
+#ifdef _WIN32
+  localtime_s(&tm_buf, &t);
+#else
+  localtime_r(&t, &tm_buf);
+#endif
+  char stamp[32] = {0};
+  std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm_buf);
+  return std::string("render-dump-") + stamp + ".wav";
 }
 
 }  // namespace
@@ -303,6 +365,57 @@ int main(int argc, char** argv) {
                            << ",\"kbps\":" << smoothed_kbps
                            << ",\"malformed\":" << stats.malformed_packets
                            << ",\"renderUnderruns\":" << stats.render_underruns
+                           // 渲染探针（v0.27）：这几个量单调递增，反复读也一样，
+                           // 不会被 UI 的 200ms 轮询抢走 —— 判断"汇聚端到底有没有
+                           // 真的出声"只能看它们，不能看 busLevel（那个是取走即清零）。
+                           << ",\"renderFrames\":" << stats.render_frames_total
+                           << ",\"renderRingMissed\":" << stats.render_ring_missed
+                           << ",\"renderAudibleFrames\":" << stats.render_audible_frames
+                           << ",\"renderPeakDbfs\":" << stats.render_peak_dbfs
+                           << ",\"renderDumpFrames\":" << stats.render_dump_frames
+                           << ",\"renderDumpActive\":" << (hub.render_dump_active() ? "true" : "false")
+                           // 归因探针（v0.28）：光有 renderAudibleFrames=0 没法判断原因，
+                           // 这三个量把"为什么"直接摆出来（详见 HubStats 里的注释）。
+                           << ",\"renderingAsHub\":" << (stats.rendering_as_hub ? "true" : "false")
+                           << ",\"mixedSources\":" << stats.mixed_sources
+                           << ",\"mixedFrames\":" << stats.mixed_frames
+                           << ",\"mixedAudibleFrames\":" << stats.mixed_audible_frames
+                           // 接收侧证据（v0.30）：sources 为空时说清"包有没有到我这儿"。
+                           // rxPackets==0 就是网络层没通（防火墙/地址错/发送端没发）；
+                           // rxPackets 涨而 streams 空，是包到了但没建成流。
+                           << ",\"rxPackets\":" << stats.rx_packets
+                           << ",\"rxBytes\":" << stats.rx_bytes
+                           << ",\"rxBadPackets\":" << stats.rx_bad_packets
+                           << ",\"rxPendingStreams\":" << stats.rx_pending_streams
+                           << ",\"rxDistinctSenders\":" << stats.rx_distinct_senders
+                           << ",\"rxFirstAtMs\":" << stats.rx_first_at_ms
+                           << ",\"rxLastIp\":\"" << audiohub::JsonEscape(stats.rx_last_ip) << "\""
+                           << ",\"rxLastPort\":" << stats.rx_last_port
+                           << ",\"rxLastReject\":\"" << audiohub::JsonEscape(stats.rx_last_reject) << "\""
+                           << ",\"listenPort\":" << opt.port
+                           // v0.36：本机真实网卡清单 + 默认路由那张网卡是谁。
+                           // 出问题时用户一眼就能看到"我的包从哪张卡出去"。
+                           << ",\"localNics\":[";
+                         {
+                           const std::vector<std::string> nics = audiohub::RealNicSummary();
+                           for (size_t i = 0; i < nics.size(); ++i) {
+                             if (i) o << ",";
+                             o << "\"" << audiohub::JsonEscape(nics[i]) << "\"";
+                           }
+                         }
+                         o << "]"
+                           // v0.32：握手口 + 发现口的独立证据。
+                           // rx* 只覆盖音频口，而"图谱里看得见对方、却说没回应"
+                           // 恰恰是发现口通、握手口不通的特征 —— 必须分开看。
+                           << ",\"hsPackets\":" << stats.hs_packets
+                           << ",\"hsRecent\":" << stats.hs_recent
+                           << ",\"hsFirstAtMs\":" << stats.hs_first_at_ms
+                           << ",\"hsLastIp\":\"" << audiohub::JsonEscape(stats.hs_last_ip) << "\""
+                           << ",\"hsLastPort\":" << stats.hs_last_port
+                           << ",\"hsLastCmd\":\"" << audiohub::JsonEscape(stats.hs_last_cmd) << "\""
+                           << ",\"hsLastLine\":\"" << audiohub::JsonEscape(stats.hs_last_line) << "\""
+                           << ",\"hsPort\":" << (opt.port + 2)
+                           << ",\"discoveryPeers\":" << stats.discovery_peers
                            << ",\"autoAccept\":" << (hub.auto_accept() ? "true" : "false")
                            << ",\"peers\":[";
                          {
@@ -384,6 +497,30 @@ int main(int argc, char** argv) {
                            hub.SetSourceMuted(id, b);
                          }
                          return "{\"ok\":true}";
+                       }
+                       // ---- 渲染落盘（诊断）----
+                       // 起一段"设备前"的录音：用户拿到 WAV 就能确定汇聚端是否
+                       // 真的在出声，不必再靠轮询电平猜。
+                       if (method == "POST" && path == "/api/render-dump/start") {
+                         std::string path_out;
+                         audiohub::JsonGetString(body, "path", &path_out);
+                         if (path_out.empty()) {
+                           // 默认落到程序目录，文件名带时间戳，不覆盖上一次
+                           path_out = DefaultDumpPath();
+                         }
+                         std::string dump_error;
+                         if (!hub.StartRenderDump(path_out, &dump_error)) {
+                           return std::string("{\"ok\":false,\"error\":\"") +
+                                  audiohub::JsonEscape(dump_error) + "\"}";
+                         }
+                         return std::string("{\"ok\":true,\"path\":\"") +
+                                audiohub::JsonEscape(path_out) + "\"}";
+                       }
+                       if (method == "POST" && path == "/api/render-dump/stop") {
+                         hub.StopRenderDump();
+                         const auto st = hub.Stats();
+                         return std::string("{\"ok\":true,\"frames\":") +
+                                std::to_string(st.render_dump_frames) + "}";
                        }
                        if (method == "POST" && path == "/api/master") {
                          double v = 0;
@@ -489,7 +626,8 @@ int main(int argc, char** argv) {
                          audiohub::Peer peer;
                          peer.ip = sip;
                          peer.audio_port = static_cast<uint16_t>(port);
-                         return hub.InvitePeer(peer) ? "{\"ok\":true}" : "{\"ok\":false}";
+                         if (hub.InvitePeer(peer)) return "{\"ok\":true}";
+                         return "{\"ok\":false,\"error\":\"邀请帧发送失败：请确认对方 IP/端口正确、对方 App 在前台且与本机在同一网络\"}";
                        }
                        if (method == "POST" && path == "/api/latency") {
                          double v = 0;
@@ -624,7 +762,7 @@ int main(int argc, char** argv) {
   }
 
   std::printf("\n");
-  std::printf("  audiohub-hub 已启动\n");
+  std::printf("  audiohub-hub 已启动  (v%s)\n", kVersionTag);
   std::printf("  监听       : 0.0.0.0:%u（控制口 %u）\n", opt.port, opt.port + 1);
   std::printf("  目标延迟   : %d ms\n", opt.latency_ms);
   {

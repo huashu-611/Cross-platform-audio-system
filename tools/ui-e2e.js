@@ -284,6 +284,14 @@ async function main() {
     // 窗口被遮挡时 Chromium 会暂停 requestAnimationFrame，250ms 布局插值就永远走不完；
     // 把页面提到最前，保证动画/重绘在无人值守的 CI 里也能跑。
     try { await cdp.send('Page.bringToFront', {}); } catch (e) { /* 旧 CDP 无此命令时忽略 */ }
+    // 仅仅 bringToFront 不够：本机同时跑着 DSH 自己的 Electron 窗口，
+    // 用户一切到别的窗口，被盖住的渲染进程会整体降级（rAF 停摆、fps=0），
+    // 于是「每帧朝目标追 28%」的缓动断言（滚轮缩放、相机环绕）随机变红。
+    // 这里让 Chromium 认为页面始终是"前台可见"的：
+    //  - setFocusEmulationEnabled：焦点模拟，页面永远算 focused
+    //  - setWebLifecycleState('active')：禁止进入 hidden/frozen
+    try { await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true }); } catch (e) { /* 旧 CDP 忽略 */ }
+    try { await cdp.send('Page.setWebLifecycleState', { state: 'active' }); } catch (e) { /* 旧 CDP 忽略 */ }
 
     await waitDebug(cdp, (s) => typeof s.screen === 'string', 15000, 'renderer boot');
     let snap = await waitDebug(cdp, (s) => s.selfId, 15000, 'hub graph state');
@@ -364,6 +372,9 @@ async function main() {
         if (f > 0) return true;
         if (DBG) console.log('[dbg] raf stalled before ' + tag + ' (fps=' + f + '), bringing window to front');
         try { await cdp.send('Page.bringToFront', {}); } catch (e) { /* 旧 CDP 忽略 */ }
+        // 每次都重新钉"前台可见"，否则一次遮挡就会让整个动画断言序列失败
+        try { await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true }); } catch (e) { /* 旧 CDP 忽略 */ }
+        try { await cdp.send('Page.setWebLifecycleState', { state: 'active' }); } catch (e) { /* 旧 CDP 忽略 */ }
         // 空推一次鼠标，部分 Chromium 版本要收到输入事件才恢复合成器。
         try {
           await cdp.send('Input.dispatchMouseEvent', {

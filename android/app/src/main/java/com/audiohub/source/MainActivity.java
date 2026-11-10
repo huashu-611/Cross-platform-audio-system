@@ -57,6 +57,10 @@ public class MainActivity extends Activity {
     private TextView hubSub;
     private TextView sourceState;
     private Button sourceToggle;
+    /** v0.44：控制屏的「送入 / 停止」。见 buildUi() 里的长注释 —— 以前控制屏没有这个入口。 */
+    private Button sourceToggleControl;
+    /** v0.44：控制屏「本机声音」那行的状态文字。 */
+    private TextView ctrlSrcLabel;
     private TextView scanHint;
     // 主界面只放摘要；完整设备列表 / 待确认请求都在弹窗里（一屏装完、不滚动）
     private TextView devSummary;
@@ -80,6 +84,12 @@ public class MainActivity extends Activity {
     private Intent projectionResultData;
     /** 用户希望本机在采集（点过"送入"或连接成功后自动开始）。 */
     private boolean sourceIntent = false;
+    /**
+     * v0.21：这幅图谱里是否出现过"别的设备"。
+     * 只在它真的变成"只剩自己"时才收摊回连接屏 —— 否则刚连上的那一瞬
+     * （对端 GRAPH 还没到、服务还没起）会被误判成"没人了"而立刻退屏。
+     */
+    private boolean sawPeer = false;
     /** 切换汇聚端后的提示状态。 */
     private String pendingSwitchTarget = "";
     private long switchSyncedAt = 0;
@@ -87,6 +97,9 @@ public class MainActivity extends Activity {
     private int selectedStreamId = 0;
     /** 一次性提示（只 toast 一次，避免每 400ms 刷屏）。 */
     private String hintText = "";
+    /** v0.24：连续采集到静音的起始时间（0 = 当前不静音 / 还没开始计时）。
+     *  只有持续 3 秒以上才提示，避免刚接入、抖动缓冲没填满时闪一下假警。 */
+    private long silentSinceMs = 0;
 
     private HubGraphView graph;
 
@@ -155,8 +168,13 @@ public class MainActivity extends Activity {
     /** 文字光晕（星空底上直接写字时的深空色描边）。 */
     private static final int COLOR_TEXT_HALO = 0xCC04060F;
 
+    /** v0.24：低于此电平视为「采集到的是静音」（与 CaptureService.MUTE_SILENT_DBFS 一致）。 */
+    private static final int SILENT_DBFS = -100;
+    /** 连续静音多久才提示（避免刚接入 / 抖动缓冲没填满时闪假警）。 */
+    private static final long SILENT_WARN_DELAY_MS = 3000L;
+
     /** 构建标记：与 APK versionName 保持一致，用于在手机上确认装的是哪一版。 */
-    private static final String BUILD_TAG = "0.17";
+    private static final String BUILD_TAG = "0.44";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -636,6 +654,52 @@ public class MainActivity extends Activity {
         ctrlDevRow.addView(ctrlAdd);
         screenControl.addView(ctrlDevRow);
 
+        // ===== v0.44：控制屏必须有「送入 / 停止」=====
+        //
+        // 这是「手机在广播、电脑也认得出手机，但一个音频包都收不到」的真正原因。
+        //
+        // 以前「送入」按钮只挂在连接屏（screenConnect，见 srcCard），而
+        // showScreen() 是**互斥**切换：一旦进入控制屏，screenConnect 就被
+        // setVisibility(GONE)。而进控制屏的条件（refreshInner 里 showControl）
+        // 是 `hubRunning || srcRunning || (onlinePeers >= 1 && hasHub)` ——
+        // 只要图谱里有**一台在线设备**就成立。
+        //
+        // 于是出现这个闭环：
+        //   手机连上 → 手机节点进图谱且 online → 手机在连接屏点过「送入」或
+        //   同意过邀请（此时确实会开始送音）→ 电脑进控制屏 →
+        //   用户把手机 App 杀过/切走后想重新送音 → 电脑这边一切正常，
+        //   但**手机上已经没有任何能重新开始采集的入口了**：
+        //   控制屏上只有「静音 / 添加设备 / 断开所有连接」，点星球是切汇聚端，
+        //   双击星球也是切汇聚端 —— 没有一条路会去 startCapture()。
+        //   用户唯一的出路是点「断开所有连接」退回连接屏，但他根本不知道要这么干。
+        //
+        // 现场数据完全吻合：hsPackets 每 3 秒 +1（Phone 的 InviteListener 活着、
+        // GraphStore 正常、hubId 正确），但 rxPackets=0、sources=[]、
+        // hsLastCmd 恒 GRAPH（从未出现 CONN-REQ）—— 采集服务压根没被启动过。
+        final LinearLayout ctrlSrcRow = new LinearLayout(this);
+        ctrlSrcRow.setOrientation(LinearLayout.HORIZONTAL);
+        ctrlSrcRow.setGravity(Gravity.CENTER_VERTICAL);
+        ctrlSrcRow.setPadding(dp(12), dp(6), dp(12), dp(6));
+        ctrlSrcRow.setBackground(glassCard());
+        LinearLayout.LayoutParams csr = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        csr.setMargins(0, dp(4), 0, dp(4));
+        ctrlSrcRow.setLayoutParams(csr);
+        ctrlSrcLabel = new TextView(this);
+        ctrlSrcLabel.setText("本机声音 · 未发送");
+        ctrlSrcLabel.setTextSize(13.5f);
+        ctrlSrcLabel.setTextColor(COLOR_TEXT);
+        ctrlSrcLabel.setLayoutParams(new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        ctrlSrcRow.addView(ctrlSrcLabel);
+        sourceToggleControl = textButton("送入", COLOR_ACCENT);
+        sourceToggleControl.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) { toggleSource(); }
+        });
+        ctrlSrcRow.addView(sourceToggleControl);
+        screenControl.addView(ctrlSrcRow);
+
         // 汇聚端信息：切换靠点图谱里的球（协议 §9.3），不再有下拉/切换按钮
         LinearLayout hubBar = card();
         LinearLayout hubRowC = new LinearLayout(this);
@@ -661,6 +725,7 @@ public class MainActivity extends Activity {
             public void onClick(View v) {
                 // 协议 §4.6：清空图谱（不广播），两个服务都停，回连接界面
                 GraphStore.resetSession();
+                sawPeer = false;          // v0.21：会话归零，"曾经有对端"也一起忘掉
                 PlacementStore.reset();   // 人工摆位表一起清掉；重连后再向 hub 要 POS
                 startService(new Intent(MainActivity.this, ReceiverService.class)
                         .setAction(ReceiverService.ACTION_STOP));
@@ -818,39 +883,136 @@ public class MainActivity extends Activity {
         setUserLeft(false);
         GraphStore.reattach();   // 重新入网：解除「全部断开」留下的退网状态
         hintText = "";
-        startService(new Intent(this, ReceiverService.class)
-                .setAction(ReceiverService.ACTION_STOP));
+        // v0.19：本机是汇聚端时绝不能 ACTION_STOP —— 那会把正在收流/混音的
+        // ReceiverService 停掉（这个调用原本只是"切换要连的汇聚端，先把旧的
+        // 接收服务清干净"，前提是"本机不是汇聚端"）。用户在手机上被邀请、
+        // 或从设备列表连入时若本机正被别的设备选为汇聚端，旧代码会直接停掉
+        // 它自己的汇聚端服务，声音立刻断。
+        if (!GraphStore.isHub()) {
+            startService(new Intent(this, ReceiverService.class)
+                    .setAction(ReceiverService.ACTION_STOP));
+        }
         refresh();
+
+        // v0.23：**不要**把手动连接 / 设备列表连接押在那个"hub 式握手"上。
+        //
+        // 这条路径的语义是"本机连上一台汇聚端"，也就是说**本机要当音源、把声音送过去**。
+        // 送声音唯一必需的授权是系统的一次性录屏/录音授权（MediaProjection + RECORD_AUDIO），
+        // 而真正把音频推过去的是 CaptureService 自己发的 CONN-REQ + 数据流
+        // （见 CaptureService.handleStartCommand），跟下面那个
+        // respondToInvite 的探测握手没有任何关系 —— 那个只是"问问对方 hub 在不在"。
+        //
+        // 以前授权请求埋在握手的成功分支里，于是：电脑没回应 → 30 秒超时 →
+        // 走 !ok 分支只弹一句"等待对方确认连接" → ensurePermissionsThenStart()
+        // 压根没调 → **连录屏授权框都不出现**，用户看到的就是"点了没反应"。
+        // 用户原话：「手机上一直显示等待对方确认连接，并且还是没出现确认录制屏幕的窗口」。
+        //
+        // 现在改成：只要本机不是汇聚端，立刻把授权流程走起来，
+        // 握手在后台自己跑，成功了再补图谱信息。
+        // v0.40：用户明确选了"连到这台设备"= 本机要让位成音源。
+        //
+        // 以前这里不看角色，直接问 GraphStore.isHub()：手机如果刚和另一台手机
+        // 跑过（自己当过汇聚端，hubId == selfId），就会出现：
+        //   · wantSendAudio = false  → 连录屏授权框都不弹；
+        //   · 后台线程 localIsHub = true → **连 CONN-REQ 都不发**（见下方 :881）。
+        // 电脑那边一个包都收不到，自然永远进不了控制界面，而手机上只闪一句提示。
+        // 用户反馈的「电脑邀请、手机点了同意、电脑却进不了控制界面」正是这条路。
+        //
+        // 语义上没有问题：用户点了「同意/连入」，就是要「把本机声音送到那台设备」，
+        // 汇聚端理应搬到目标设备身上（协议 §4.5）。先搬再走正常音源流程。
+        final String targetId = d.ip + ":" + audioPort;
+        if (GraphStore.isHub() && !targetId.equals(GraphStore.selfId())) {
+            if (GraphStore.switchHub(targetId)) {
+                pendingSwitchTarget = targetId;
+                switchSyncedAt = 0;
+                InviteListener.broadcastGraph();   // 本地变化：2 次 / 60ms
+                // 角色变了：本机不再是汇聚端，接收服务该收了（否则它会一直占着
+                // 47000 的接收侧，和下面要起的采集线程抢同一份音频）。
+                startService(new Intent(this, ReceiverService.class)
+                        .setAction(ReceiverService.ACTION_STOP));
+            }
+        }
+
+        final boolean wantSendAudio = !GraphStore.isHub();
+        if (wantSendAudio) {
+            sourceIntent = true;
+            ensurePermissionsThenStart();
+        }
 
         new Thread(new Runnable() {
             @Override
             public void run() {
+                // v0.19：只有"对方是汇聚端"时，握手这条路径才有意义 ——
+                // CONN-REQ 发给对方 hub 的握手口（音频口 + 2），由对方 hub 回 ACK。
+                // 但 pickRemoteHub 也是"同意邀请 / 从设备列表连入"的唯一入口，
+                // 而这两种情况下对方可能只是个音源、甚至本机才是汇聚端：
+                // 那时对端根本没有 hub 握手口，respondToInvite 一定 30 秒超时，
+                // 于是界面报「对方还没同意连接」，可对端音源的 CONN-REQ 早被
+                // InviteListener 自动 ACK 了、声音已经通了（用户反馈原话：
+                // 「显示对方还没同意，但桌面端的音频已经传递到手机里了」）。
+                // 所以：本机是汇聚端时直接跳过；否则握手失败也只当"对方还没回"，
+                // 真正的判据交给图谱/音频证据（refresh 里的 onlinePeers）。
+                final boolean localIsHub = GraphStore.isHub();
+                if (localIsHub) {
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            hintText = "";
+                            refresh();
+                        }
+                    });
+                    return;
+                }
                 final boolean ok = ReceiverService.respondToInvite(
                         d.ip, audioPort, android.os.Build.MODEL);
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
                         if (!ok) {
-                            // 没握手成功就不算进过会话：把「已断开」状态写回去，
-                            // 否则下次冷启动可能又被远端残留图谱拉进控制屏。
-                            setUserLeft(true);
+                            // v0.19：不再 setUserLeft(true) 退回连接屏 —— 对端很可能
+                            // 已经在放声音了（音源进程从来都是"边握手边推流"），
+                            // 此刻退屏 + 停接收服务，用户看到的就是
+                            // 「提示没同意，声音却通了，然后断掉」。
+                            // 现在改成：留在界面等图谱证据，提示去电脑上点确认。
+                            //
+                            // v0.20：把"电脑端没起来"这条最可能的原因说出来。实测最常见
+                            // 的不是对方不点同意，而是电脑上的 hub 根本没在收包：上一个
+                            // audiohub-hub.exe 没退干净、或者别的程序占着 47000/47002，
+                            // 于是本机发的 CONN-REQ 石沉大海，两端就互相干等。
+                            // v0.23：文案必须诚实。30 秒一条 ACK 都没回来，说明
+                            // **电脑那边根本没收到我们的包**（hub 未运行 / 防火墙拦了 /
+                            // 不在同一网段），而不是"对方收到请求、等人去点同意"。
+                            // 以前写"等待对方确认连接"，用户会以为是电脑上弹了窗要人点。
+                            // 现在采集授权已经在后台要过了，音频可能照样在走，
+                            // 所以这里也不能退屏，只把原因摆出来。
+                            hintText = "电脑 " + d.ip + ":" + audioPort + " 没有回应";
                             refresh();
                             Toast.makeText(MainActivity.this,
-                                    "对方还没有同意连接，请稍后再试",
+                                    "电脑 " + d.ip + ":" + audioPort + " 没有回应（30 秒内没收到确认）。"
+                                            + "请检查：① 电脑上的 AudioHub 是否在运行；"
+                                            + "② Windows 防火墙是否放行了 AudioHub；"
+                                            + "③ 两台设备是否连在同一个网络",
                                     Toast.LENGTH_LONG).show();
                             return;
                         }
                         // 收到 ACK = 握手成功（协议 §4.1）：对端入图谱 + 立刻单播 GRAPH
                         GraphStore.upsertNode(d.ip, audioPort, d.name, GraphStore.KIND_OTHER);
+                        // v0.20：握手成功就等于"对端确实是汇聚端"——只有 hub 的握手口
+                        // 会回 CONN-ACK，回包本身就是这份证明。这里必须直接把 hubId
+                        // 落到图谱上，不能等对端广播 GRAPH 帧来校正：
+                        //   · 对端广播里的 hubId 是**它自己看到的地址**（PC 视角的 IP），
+                        //     而本机看到的可能是 NAT / 多网卡之后的另一个地址；
+                        //   · 两者对不上时 hubNode() 永远返回 null，refreshInner 的
+                        //     showControl 条件不成立，界面就卡在连接屏 —— 明明已经连上、
+                        //     声音也在走，用户看到的却是"没连上"。
+                        GraphStore.switchHub(d.ip + ":" + audioPort);
                         InviteListener.sendGraphTo(d.ip, audioPort + GraphStore.PORT_OFFSET);
                         InviteListener.requestSync();
                         Toast.makeText(MainActivity.this, "已连接 " + d.name,
                                 Toast.LENGTH_SHORT).show();
-                        // 音源目标交给 reconcile：图谱里的 hub 才是真正的汇聚端
-                        if (!GraphStore.isHub()) {
-                            sourceIntent = true;
-                            ensurePermissionsThenStart();
-                        }
+                        // 授权流程在进这个线程之前就已经发起（见上面的 wantSendAudio）：
+                        // 这里只补图谱，不再重复请求授权 —— 重复调 ensurePermissionsThenStart()
+                        // 会叠出第二个系统弹窗。
                     }
                 });
             }
@@ -884,7 +1046,16 @@ public class MainActivity extends Activity {
             stopSource();
         } else {
             final GraphStore.Snapshot g = GraphStore.snapshot();
-            final GraphStore.Node hub = g.hubNode();
+            GraphStore.Node hub = g.hubNode();
+            // v0.22：图谱里 hubId 指向的节点暂时缺失（对端 GRAPH 还没到、节点 id
+            // 对不上、或者上一轮收摊把 hubId 清掉了）时，回落到上次记住的
+            // hubIp/hubPort —— 和 onActivityResult / reconcile 的兜底口径一致。
+            //
+            // 以前这里直接 Toast「请先连接一台设备」就 return，于是「点送入」
+            // 什么也不弹（连录屏授权框都不出现）：用户看到的就是"点了没反应"，
+            // 而 hub 信息其实还在 prefs 里、完全能连上。点「送入」是用户明确的
+            // 开始采集意愿，只要知道往哪儿送就一定要把授权流程走下去。
+            if (hub == null) hub = rememberedHub();
             if (g.isHub()) {
                 Toast.makeText(this, "本机是汇聚端，声音由其它设备送过来",
                         Toast.LENGTH_SHORT).show();
@@ -892,6 +1063,13 @@ public class MainActivity extends Activity {
                 Toast.makeText(this, "请先连接一台设备，它会告诉我们谁是汇聚端",
                         Toast.LENGTH_SHORT).show();
             } else {
+                // 记回 hub 指针：收摊分支可能已把它清空，这里重新钉住
+                if (hubIp == null || hubIp.isEmpty()) {
+                    hubIp = hub.ip;
+                    hubPort = hub.audioPort;
+                    if (hubName == null || hubName.isEmpty()) hubName = hub.name;
+                    saveHub();
+                }
                 sourceIntent = true;
                 setUserLeft(false);   // 用户主动「送入」= 明确发起新连接
                 GraphStore.reattach();   // 重新入网：解除「全部断开」留下的退网状态
@@ -899,6 +1077,12 @@ public class MainActivity extends Activity {
             }
         }
         refresh();
+    }
+
+    /** 当前发送目标，未定时返回「未定」。v0.33 起两处状态行共用。 */
+    private String sendTargetOf() {
+        if (CaptureService.sHost == null || CaptureService.sHost.isEmpty()) return "未定";
+        return CaptureService.sHost + ":" + CaptureService.sPort;
     }
 
     private void stopSource() {
@@ -1055,6 +1239,30 @@ public class MainActivity extends Activity {
         final boolean srcRunning = CaptureService.sRunning;
         final boolean hubRunning = ReceiverService.sRunning;
 
+        // v0.24：手机正在「发包」不代表对方能听到 —— AudioPlaybackCapture 抓的是
+        // 手机正在播放的媒体声音（音乐/视频/游戏），不是麦克风。手机没放音时
+        // AudioRecord.read() 返回全 0，包照发、对端照收照渲染，但渲染出来是静音。
+        // 以前 -120 dBFS 和「发送 N 包」混在一行，用户误判成「没收到 / 没渲染」。
+        // 这里连续静音 3 秒就把控制屏 / 连接屏的状态文案换成醒目提示。
+        final int levelDbfs = CaptureService.sLevelDbfs;
+        final boolean silentNow = srcRunning && levelDbfs <= SILENT_DBFS;
+        if (!silentNow) {
+            silentSinceMs = 0;
+        } else if (silentSinceMs == 0) {
+            silentSinceMs = System.currentTimeMillis();
+        }
+        final boolean silentWarn = silentNow
+                && (System.currentTimeMillis() - silentSinceMs >= SILENT_WARN_DELAY_MS);
+        final String silentHint = "⚠ 采集到的是静音：本功能送的是手机正在播放的声音"
+                + "（音乐/视频/游戏），不是麦克风，请先在手机上播放音频"
+                // v0.38：把"为什么仍然可能是静音"直接写出来。采集端已经把
+                // matching usage 放宽到 12 类，但系统仍可能拒绝其中一部分
+                // （AudioPlaybackCapture 不允许抓通话类 usage 的情况是存在的），
+                // 这时只有"换一个 App 播音乐"能验证。以前这句话不给，
+                // 用户只能反复点「送入」。
+                + "；若已在播放仍为静音，说明该声音的音频类型被系统禁止采集，"
+                + "换一个音乐/视频 App 试试";
+
         // 汇聚端显示：图谱是唯一依据
         if (isHub) {
             hubValue.setText("本机（" + android.os.Build.MODEL + "）");
@@ -1069,20 +1277,88 @@ public class MainActivity extends Activity {
               .append(g.nodes.size()).append(" 台设备");
             if (isHub && hubRunning) {
                 sb.append(" · 已接收 ").append(ReceiverService.sStreamCount).append(" 路");
+                // "出声判定"：把渲染探针的三个数直接摊在状态行上。
+                // 这是我唯一能给出的、不靠耳朵也不靠轮询抢数的证据：
+                //   有声 = 已写进 AudioTrack 且非静音的帧数
+                //   峰值 = 实际送进设备的最高电平
+                // 全零就说明"混音后就是静音"，问题在上游（没混进去）。
+                final long frames = ReceiverService.sRenderFrames;
+                final long audible = ReceiverService.sRenderAudible;
+                sb.append(" · 出声 ").append(audible).append("/").append(frames)
+                  .append(" 帧 · 峰值 ")
+                  .append(String.format(java.util.Locale.US, "%.1f",
+                                        ReceiverService.sRenderPeakDbfs)).append(" dBFS");
+                if (frames > 0 && audible == 0) {
+                    // v0.28：把"为什么是 0"直接写出来。这两种的下一步完全不同，
+                    // 以前都只显示"全是静音"，用户无从下手。
+                    final int mixed = ReceiverService.sMixedSources;
+                    if (mixed == 0) {
+                        sb.append("（没有音源混进来）");
+                    } else {
+                        sb.append("（混入了 ").append(mixed).append(" 路，但混出来是静音）");
+                    }
+                }
             } else if (srcRunning) {
-                sb.append(" · 发送 ").append(CaptureService.sPackets).append(" 包");
+                // v0.33：包数之外必须带上「发到哪」和「失败几次」。
+                // UDP 的 send() 成功不代表包到了，而 send() 抛异常时 sPackets
+                // 根本不涨 —— 这三种情况以前都只显示一个「发送 N 包」。
+                sb.append(" · 发送 ").append(CaptureService.sPackets).append(" 包")
+                  .append(" → ").append(sendTargetOf()).append(" · 采集 ")
+                  .append(CaptureService.sReadTotal).append(" 采样");
+                if (CaptureService.sSendErrors > 0) {
+                    sb.append(" · 发送失败 ").append(CaptureService.sSendErrors).append(" 次");
+                }
+                if (silentWarn) sb.append(" · ").append(silentHint);
             }
             if (!hintText.isEmpty()) sb.append(" · ").append(hintText);
             hubSub.setText(sb.toString());
+            hubSub.setTextColor(silentWarn ? COLOR_WARN : COLOR_DIM);
         }
 
         // 本机声音
         sourceToggle.setText(srcRunning ? "停止" : "送入");
+        if (sourceToggleControl != null) sourceToggleControl.setText(srcRunning ? "停止" : "送入");
+        if (ctrlSrcLabel != null) {
+            // 控制屏那一行必须如实显示"到底有没有在送"，否则用户看不出区别
+            ctrlSrcLabel.setText(srcRunning ? "本机声音 · 正在发送" : "本机声音 · 未发送");
+            ctrlSrcLabel.setTextColor(srcRunning ? COLOR_ACCENT : COLOR_TEXT);
+        }
+        // v0.31：把「往哪个地址发」写出来。UDP 的 send() 成功只证明本机没抛异常，
+        // 完全不代表包到了对端 —— 手机最容易犯的错是记着上次的旧 IP，
+        // 还在对着一个已经换了网段的地址发。不显示目标地址，用户根本无从发现。
+        // v0.33：这是本轮真正的修复。以前 silentWarn 时整行被 silentHint 替换掉，
+        // 于是用户报「采集到的是静音」的那一刻，屏幕上恰好没有「发送几包 / 发到哪」——
+        // 而那两个数才是唯一能判断「包到底有没有出去、地址有没有错」的依据。
+        // 现在静音提示只当装饰挂在后面，关键数字永远在场。
+        final String sendTarget = sendTargetOf();
+        final StringBuilder sendFacts = new StringBuilder();
+        sendFacts.append("发送 ").append(CaptureService.sPackets).append(" 包 → ")
+                 .append(sendTarget)
+                 .append(" · ").append(CaptureService.sLevelDbfs).append(" dBFS")
+                 .append(" · 通道 ").append(CaptureService.sStreamId)
+                 .append(" · 采集 ").append(CaptureService.sReadTotal).append(" 采样");
+        if (CaptureService.sSendErrors > 0) {
+            sendFacts.append(" · 发送失败 ").append(CaptureService.sSendErrors).append(" 次")
+                     .append(CaptureService.sLastSendError.isEmpty()
+                             ? "" : "（" + CaptureService.sLastSendError + "）");
+        }
+        if (CaptureService.sReadTotal == 0 && CaptureService.sReadZero == 0) {
+            sendFacts.append(" · 采集还没开始读");
+        } else if (CaptureService.sReadTotal == 0) {
+            sendFacts.append(" · 采集一直读到 0（抓不到该应用的声音）");
+        }
+        // 发送目标与图谱里的汇聚端不是同一个 = 典型的「记着上次的旧 IP」。
+        // 这种情况 sPackets 会照涨，但对端一个包也收不到，必看不出来。
+        if (srcRunning && hub != null && !hub.ip.isEmpty()
+                && (CaptureService.sHost == null || !hub.ip.equals(CaptureService.sHost))) {
+            sendFacts.append(" · ⚠ 图谱里的汇聚端是 ").append(hub.ip)
+                     .append("，实际却发往 ").append(sendTarget);
+        }
         sourceState.setText(srcRunning
-                ? ("发送中 · " + CaptureService.sPackets + " 包 · "
-                   + CaptureService.sLevelDbfs + " dBFS · 通道 " + CaptureService.sStreamId)
+                ? (silentWarn ? silentHint + "\n" + sendFacts : sendFacts.toString())
                 : (isHub ? "本机是汇聚端"
                          : (hub != null ? "尚未开始发送" : "未连接")));
+        sourceState.setTextColor(silentWarn ? COLOR_WARN : COLOR_DIM);
 
         // 控制界面显示条件：图谱里至少两台设备，或本机正在采集 / 接收。
         // userLeft 只在「用户明确发起新连接」时清除（本机声音送入 / 接受待确认请求 /
@@ -1308,6 +1584,53 @@ public class MainActivity extends Activity {
         final boolean hubRunning = ReceiverService.sRunning;
         final boolean srcRunning = CaptureService.sRunning;
 
+        // v0.21：图谱里已经一个人都不剩 → 本机跟着收摊，回连接屏，下次重连重建。
+        //
+        // 用户要的语义：「一方断开后，如果图谱中已经只有一个设备，就应该同步退出
+        // 最后一个设备然后删除图谱，下次建立连接时重新创建」。以前只有手动点
+        // 「断开所有连接」才会清；对端正常退出或超时掉线后，本机原地留着一张
+        // 只有自节点的图 + 一个指向自己的 hubId —— 界面停在控制屏、节点残留，
+        // 下次连接进的是"旧房间"，图谱版本号还压在别人之上。
+        //
+        // 判据与 C++ 端一致（EndSessionIfAloneLocked）：只剩自节点、没有活跃的
+        // 采集/接收、且本机不是汇聚端（本机是 hub 时图里天然只有自己，那是在等
+        // 别人进来，不是"没人了"）。
+        //
+        // **必须带"曾经真的有过对端"这个前提**（v0.21 实测踩到）：刚建立连接时
+        // 图谱里本来就只有自节点（对端的 GRAPH 帧还在路上），hubId 也可能刚清空、
+        // 服务还没起。若只看 isAlone + 服务状态，就会把"正要连上"当成"已经没人了"，
+        // 立刻 resetSession + 回连接屏 —— 用户看到连接一闪就退回连接界面。
+        // 所以用 sawPeer 记住"这幅图里出现过别的节点"，真的全部消失后才收摊。
+        //
+        // 判据用 onlinePeerCount() 而不是 isAlone()：图谱只并集不删节点，
+        // 对端离线后它的节点还在表里，isAlone() 会永远 false（收摊永不触发）；
+        // 而图谱还没同步下来时 isAlone() 又为 true（刚连上就被踢回连接屏，
+        // 实测复现过）。真正要判的是"曾经有对端，现在一个在线的都没有"。
+        if (GraphStore.hasPeerNode()) sawPeer = true;
+        // v0.23：正在送音时**绝不收摊**（多一个 `&& !sourceIntent`）。
+        // 收摊会把 hubId 一起清空，而"在线计数为 0"经常只是因为本机收不到
+        // 对端广播（NAT/防火墙），不代表对端走了 —— 那时候用户明明还在
+        // 往那个地址发音频（hub 侧包数在涨），本机却把地址忘了，
+        // 于是回连接屏、再点也没反应。真正的收摊由用户主动断开或对端 CONN-BYE 驱动。
+        if (sawPeer && !g.isHub() && GraphStore.onlinePeerCount() == 0
+                && !srcRunning && !hubRunning && !sourceIntent
+                && !userLeft && !GraphStore.isDetached()) {
+            GraphStore.resetSession();
+            sawPeer = false;     // 收摊后重新计数：下次连接重新判断"曾经有对端"
+            PlacementStore.reset();
+            manualPeers.clear();
+            // v0.22：**不再**清 hubIp/hubName，也不清 sourceIntent。
+            //
+            // 清掉它们以后，用户点「送入」会因为 hubNode()==null 直接早退
+            // （连录屏授权框都不弹），而端到端复测发现这个收摊判据本身会被
+            // NAT 改写源 IP 误触发 —— v0.21 时一清就等于"再也接不回来"。
+            // 收摊的语义是"这轮会话结束、图谱重建"，不是"忘记这台电脑"：
+            // 记住的地址是用户建的连接关系，下次一键重连要用它。
+            setUserLeft(true);   // 回连接屏，并落盘（进程重启后仍停在连接屏）
+            refresh();
+            return;
+        }
+
         if (g.isHub()) {
             // 汇聚端：本机负责收流放音，不能同时采集（回授）。
             //
@@ -1363,7 +1686,9 @@ public class MainActivity extends Activity {
                     hintText = "";
                     startCapture(hub, streamId);
                 } else {
-                    graphHint("本机已设为音源，开始采集后生效");
+                    // v0.44：把"到底该按哪儿"直接说出来。以前只写"开始采集后生效"，
+                    // 而控制屏上根本没有开始采集的按钮 —— 用户按提示去找也找不到。
+                    graphHint("本机已设为音源：点下面的「送入」授权后开始发送");
                 }
             }
             return;
@@ -1373,10 +1698,27 @@ public class MainActivity extends Activity {
         // 先给 HUB_MISSING_GRACE_MS 宽限期，期间用上次记住的 hubIp 兜底继跑；
         // 超时还没同步到才停。
         final GraphStore.Node remembered = rememberedHub();
-        final boolean withinGrace = System.currentTimeMillis() - hubMissingSinceMs < HUB_MISSING_GRACE_MS;
-        if (remembered != null && withinGrace && (srcRunning || hubRunning)) {
+        // v0.23：只要用户明确要送音（sourceIntent）并且知道往哪儿送（记住过地址），
+        // 就一直送下去，**不再因为"图谱里暂时找不到这个节点"而停**。
+        //
+        // 以前这里有 HUB_MISSING_GRACE_MS 的宽限期，超时就 stopSourceKeepingAuth()。
+        // 但"图谱里找不到 hub 节点"完全不代表"汇聚端没了"：
+        //   · 对端广播 GRAPH 可能到不了（NAT/防火墙/跨网段，手机看到的源 IP 与
+        //     图谱里的节点 IP 对不上很常见），于是本机永远等不到那次校正；
+        //   · 手动填 IP 连上时，能连上这件事本身就是最强的证据 ——
+        //     那个地址刚刚回过 CONN-ACK。
+        // 这条链路一旦把采集停掉，srcRunning 变 false，紧接着 v0.21 的收摊判据
+        // 会把 hubId 一起清空，之后再也找不到汇聚端 —— 用户看到的就是
+        // 「授权完弹了一下又没了，一直显示等待对方确认」。
+        //
+        // 所以：有记住的地址就继续往那儿送；只有连记住的地址都没有时才停。
+        if (remembered != null && (srcRunning || hubRunning || sourceIntent)) {
             if (srcRunning) {
                 // 只是 retarget（服务内目标没变就直接返回），不重建采集会话
+                startCapture(remembered, g.streamIdForSelf());
+            } else if (sourceIntent && (hasProjectionAuth() || CaptureService.sHasProjection)) {
+                // 服务被暂停过（比如刚被设为汇聚端又切回来）：直接恢复发送
+                hintText = "";
                 startCapture(remembered, g.streamIdForSelf());
             }
             return;
@@ -1385,7 +1727,15 @@ public class MainActivity extends Activity {
             startService(new Intent(this, ReceiverService.class)
                     .setAction(ReceiverService.ACTION_STOP));
         }
-        if (srcRunning) stopSource();
+        // v0.21：这里**不能**走 stopSource()。它是"彻底结束"，会
+        //   ACTION_STOP → CaptureService.stopCapture() → projection.stop()
+        // 并清掉 sHasProjection，而 Android 14 的投屏授权是一次性的 ——
+        // 一旦在这里销毁，下次切回音源就再也拿不到授权，用户看到的就是
+        // 「切到电脑再切回来，手机显示已生效但一直没有声音」。
+        // "汇聚端暂时未知"在切换过程中是常态（对端正在广播新图谱、
+        // 或者本机刚被设为 hub 又切回去），它不是"用户要停止送音"。
+        // 所以只暂停发送、把投屏会话和采集线程保住，等 hub 回来直接 resume。
+        if (srcRunning) stopSourceKeepingAuth();
     }
 
     /**
@@ -1408,7 +1758,8 @@ public class MainActivity extends Activity {
         // 只看 1) 会让"切一次汇聚端就再也发不出声音"——那正是用户报的现象。
         if (!alreadyRunning && !hasProjectionAuth() && !CaptureService.sHasProjection) {
             // 两条都没有：只能让用户点「送入」重新授权（一次性授权真的用掉了）
-            graphHint("本机已设为音源，开始采集后生效");
+            // v0.44：同上 —— 缺的是授权，用户必须点「送入」才会弹系统授权框。
+            graphHint("需要重新授权：点下面的「送入」");
             return;
         }
         try {
@@ -1791,8 +2142,20 @@ public class MainActivity extends Activity {
     }
 
     private void invitePeer(final Discovery.Device d) {
-        if (!isLocalHub() || !ReceiverService.sRunning) {
-            Toast.makeText(this, "只有汇聚端能邀请别人，请先把汇聚端设为本机",
+        // v0.38：本机不是汇聚端时，"邀请"这个动作在本机语义里其实是"加入对方"。
+        //
+        // 以前这里直接 return + 一句 Toast「只有汇聚端能邀请别人」，用户点完
+        // 只看到一句提示、网络上什么也没发生 —— 表现就是「手机直接邀请电脑也不行」。
+        // 但设备行上并排就有「连入」按钮，两者对音源端来说是同一件事：
+        // 音源端能做的只有"把声音送给一个汇聚端"，也就是 pickRemoteHub 那条路
+        // （它内部会走 respondToInvite 发 CONN-REQ + 弹采集授权）。
+        // 所以这里不再堵死，直接转交过去，让用户点哪个都成立。
+        if (!isLocalHub()) {
+            pickRemoteHub(d);
+            return;
+        }
+        if (!ReceiverService.sRunning) {
+            Toast.makeText(this, "本机是汇聚端但接收服务没起来，请重开 App 再试",
                     Toast.LENGTH_LONG).show();
             return;
         }

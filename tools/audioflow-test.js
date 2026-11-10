@@ -16,6 +16,7 @@
  *   T4 切换过程中音源进程不重启（pid 不变、seq 不回退）
  *   T5 目标暂不可达（对端还没起来）时进程不退出，恢复可达后自动出声
  *   T6 断开 → 重连：重连后还能出声
+ *   T7 收摊（会话清空）后，只发音频的源必须能把图谱拉回来（v0.26 回归）
  *
  * 退出码 0 = 全过，1 = 有失败（可直接进 CI）。
  *
@@ -158,20 +159,46 @@ function retarget (hub, streamId) {
 // ---------------------------------------------------------------- 观测量
 
 /**
- * 总线电平就是"汇聚端耳机里有没有声音"。
+ * 判断"汇聚端耳机里有没有声音"。
  *
- * 判据只看它，不看 kbps —— `kbps > 0` 只说明包到了网卡，
- * 抖动缓冲还没填满时总线依然是 -120 dBFS（"包在涨、耳机全静音"就是那个状态）。
+ * 以前只用 busLevel。它确实是汇聚端混音后的电平，但它是 Meter::Take() —— **取走即清零**。
+ * 界面自己每 200ms 轮询一次，测试再读一次就会读到空桶，于是"明明在响"被读成 -120。
+ * 这正是排查"双端不通"时结论反复横跳的原因（实测：同一时刻 audible=1439898、peak=-9.1，
+ * 而 busLevel 报 -120）。
+ *
+ * 现在以 v0.27 的渲染探针为主：renderAudibleFrames 从启动起只增不减，
+ * 夹在"真正送进声卡的那一帧"上，任何读者都偷不走。busLevel 只作为兼容兜底。
  */
 async function observe (hub) {
   const st = await httpJson(hub.http, '/api/state')
   const sources = Array.isArray(st.sources) ? st.sources : []
   return {
     busLevel: typeof st.busLevel === 'number' ? st.busLevel : -120,
+    // 单调递增的出声证据：至少一个声道非零的帧数（不会被任何轮询抢走）
+    audible: typeof st.renderAudibleFrames === 'number' ? st.renderAudibleFrames : 0,
+    renderFrames: typeof st.renderFrames === 'number' ? st.renderFrames : 0,
+    peakDbfs: typeof st.renderPeakDbfs === 'number' ? st.renderPeakDbfs : -240,
     kbps: st.kbps || 0,
     sources: sources.length,
     packets: sources.reduce((a, s) => a + (s && s.packets ? s.packets : 0), 0)
   }
+}
+
+async function postJson (port, pathname, payload) {
+  const res = await fetch('http://127.0.0.1:' + port + pathname, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {})
+  })
+  if (!res.ok) throw new Error('HTTP ' + res.status)
+  return res.json()
+}
+
+/** 图谱里有几个节点（含自己）。v0.26 回归用。 */
+async function graphNodes (hub) {
+  const st = await httpJson(hub.http, '/api/state')
+  const g = st.graph || {}
+  return { nodes: Array.isArray(g.nodes) ? g.nodes.length : 0, isHub: !!g.isHub }
 }
 
 /** 等目标 hub 真的在出声（连续两次采样都有电平）。返回 { ms, state }。 */
@@ -179,10 +206,13 @@ async function waitForSound (hub, timeoutMs) {
   const start = Date.now()
   let last = null
   let goodRun = 0
+  let audibleBase = -1   // 第一次采样定基准，之后只看增量
   while (Date.now() - start < timeoutMs) {
     try {
       last = await observe(hub)
-      if (last.busLevel > -60) {
+      if (audibleBase < 0) audibleBase = last.audible
+      // busLevel 只是兜底：有声帧数涨了才算真的出声（一次采样一个增量基准）
+      if (last.audible > audibleBase || last.busLevel > -60) {
         goodRun++
         if (goodRun >= 2) return { ms: Date.now() - start, state: last }
       } else {
@@ -197,10 +227,13 @@ async function waitForSound (hub, timeoutMs) {
 async function waitForSilence (hub, timeoutMs) {
   const start = Date.now()
   let last = null
+  let audibleBase = -1
   while (Date.now() - start < timeoutMs) {
     try {
       last = await observe(hub)
-      if (last.busLevel <= -60) return { ms: Date.now() - start, state: last }
+      if (audibleBase < 0) audibleBase = last.audible
+      // 静音判据同样以探针为主：有声帧 3 秒没涨才算静音
+      if (last.audible <= audibleBase && last.busLevel <= -60) return { ms: Date.now() - start, state: last }
     } catch (e) { /* ignore */ }
     await sleep(100)
   }
@@ -236,7 +269,7 @@ async function main () {
     process.exit(2)
   }
 
-  startHub(HUB_A)
+  const hubAProc = startHub(HUB_A)
   startHub(HUB_B)
   if (!await waitHubUp(HUB_A, 8000) || !await waitHubUp(HUB_B, 8000)) {
     console.error('hub 起不来')
@@ -296,6 +329,46 @@ async function main () {
   r = await waitForSound(HUB_B, 6000)
   check(r.ms >= 0, 'T6 重连后恢复出声',
     r.ms >= 0 ? (fmtLevel(r.state.busLevel) + '，' + r.ms + 'ms') : '超时')
+
+  // ---- T7: 收摊后只发音频的源必须能自己回来 ----
+  console.log('')
+  console.log('==> T7 收摊（会话清空）后，只发音频的源要把图谱拉回来')
+  // v0.26 回归用例。ClearSession() 会 GraphResetLocked() 把 graph_detached 置真，
+  // 之后 HandleGraphFrame / GraphBroadcastLocked 全部早退。手机 CaptureService
+  // 重连时【只发音频包、不发 CONN-REQ】，如果这条路径不 reattach，两端会各自
+  // 守着自己那份图谱、都认为汇聚端是自己 —— 现象就是"两端彻底都收不到对方的声音"。
+  // 这里用一直在推流的音源走同一条路径：清空会话 → 只发音频 → 图谱必须自愈。
+  await retarget(HUB_A, 1)
+  const beforeClear = await waitForSound(HUB_A, 4000)
+  check(beforeClear.ms >= 0, 'T7 清空会话前 HUB-A 在出声',
+    beforeClear.ms >= 0 ? fmtLevel(beforeClear.state.busLevel) : '超时')
+  const pre = await graphNodes(HUB_A)
+  check(pre.nodes >= 2, 'T7 清空会话前图谱里有对端', 'nodes=' + pre.nodes)
+
+  // 注意：音源此刻一直在推流，ClearSession 之后它会立刻以"纯音频包"重新建流，
+  // 所以"图谱只剩自己"这个中间态是**观测不到**的（修复后 2ms 就自愈了）。
+  // 不设这条中间断言：它本质上是有竞态的，会让测试变成随机红。
+  // 真正的回归判据是下面这条"能不能自愈"——去掉 src/hub_core.cpp 里 v0.26 的
+  // reattach 之后，图谱会永远停在 1 个节点，这里必红。
+  const hubPidBefore = hubAProc.pid
+  await postJson(HUB_A.http, '/api/session/clear', {})
+
+  let healed = -1
+  const healStart = Date.now()
+  while (Date.now() - healStart < 6000) {
+    const g = await graphNodes(HUB_A)
+    if (g.nodes >= 2) { healed = Date.now() - healStart; break }
+    await sleep(100)
+  }
+  check(healed >= 0, 'T7 清空会话后，只发音频的源能把图谱拉回来（不会两端各自为 hub）',
+    healed >= 0 ? (healed + 'ms') : '6s 内没回来')
+  check(hubAProc.pid === hubPidBefore && hubAProc.exitCode === null,
+    'T7 自愈过程没有重启汇聚端进程', 'pid ' + hubPidBefore + ' → ' + hubAProc.pid)
+
+  const after = await waitForSound(HUB_A, 4000)
+  check(after.ms >= 0, 'T7 自愈后 HUB-A 仍然在出声',
+    after.ms >= 0 ? fmtLevel(after.state.busLevel) : '超时，最后 '
+      + fmtLevel(after.state && after.state.busLevel))
 
   // ---- 汇总 ----
   killAll()

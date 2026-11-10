@@ -569,6 +569,195 @@ function setSync (text, tone) {
   renderSyncLine()
 }
 
+// 「出声 0/N」这三个数必须自己解释自己（v0.28）。
+//
+// 之前只有一个裸数字，用户看到 0 完全无法判断是坏了还是本该如此 —— 事实上最常见
+// 的情形根本不是故障：本机不是汇聚端时，协议 §6.1 规定混音输出恒为静音，
+// 渲染的每一帧本来就该是零。把它当成缺陷去修，只会越修越乱。
+//
+// 归因三选一（判据来自后端归因探针，不靠猜）：
+//   renderingAsHub === false        → 本机不是汇聚端，0 是正确的
+//   mixedSources === 0              → 是汇聚端，但这一拍一路都没混进去
+//   mixedSources > 0 且 audible==0  → 确实混进去了、混出来就是静音（采集端没在放声音）
+function audibleSuffix (state) {
+  const frames = Number.isFinite(state.renderFrames) ? state.renderFrames : 0
+  const audible = Number.isFinite(state.renderAudibleFrames) ? state.renderAudibleFrames : 0
+  if (frames < 1000 || audible > 0) return ''
+  if (state.renderingAsHub === false) return '（本机不是汇聚端，按协议本就静音）'
+  const mixed = Number.isFinite(state.mixedSources) ? state.mixedSources : 0
+  if (mixed === 0) return '（' + whyNoSource(state) + '）'
+  // v0.34：到这一步已经是「数据真的流进来了、混音器也真的在混、混出来全是零」。
+  // 这是整条链路上唯一一个「网络、防火墙、混音、渲染全部无罪」的位置，
+  // 唯一的嫌疑在采集端：AudioPlaybackCapture 只抓得到 USAGE_MEDIA/GAME/UNKNOWN
+  // 的应用声音，手机没在放媒体声音（或放的是通话/铃声/被标记成别的声音）时，
+  // 采到的就是一片零。所以这里必须直接说出「去手机上做什么」，
+  // 而不是留一句「混出来是静音」让用户自己猜。
+  return '（音频数据到了 CPU、混音器也在混，但内容全是零 —— 问题在采集端：' +
+    '手机没在播放媒体声音，或放的声音不属于媒体类型）'
+}
+
+// 「一路都没混进来」只是现象，真正的原因最少有五种，用户看这句才知道下一步该做什么：
+//   1. 压根没收到包        → 网络 / 发送端没点「送入」
+//   2. 收到了流但未确认    → 界面上的「自动同意」被关了，或本机在等确认
+//   3. 收到的流全被静音    → 自己点了静音
+//   4. 流刚建立还没跑满    → 再等一秒
+//   5. 一条流都没有        → 先让对端连上来
+// 这些判据全部来自已有的 /api/state.sources，不需要新增任何后端字段。
+function whyNoSource (state) {
+  const list = Array.isArray(state.sources) ? state.sources : []
+  if (list.length === 0) {
+    const pend = Array.isArray(state.pending) ? state.pending.length : 0
+    if (pend > 0) return '对端已请求连接，等你点「同意」'
+    const peers = Array.isArray(state.peers) ? state.peers.length : 0
+    if (peers > 0) return '已经发现对端，但它还没开始送音'
+    // 图谱比发现列表更权威：图谱里除了自己没有别的节点 = 对端确实没连上，
+    // 这时候去查音量、输出设备、混音参数全是白费力气。
+    const nodes = state.graph && Array.isArray(state.graph.nodes) ? state.graph.nodes : []
+    const others = nodes.filter((n) => n && !n.isSelf)
+    if (nodes.length > 0 && others.length === 0) {
+      // v0.31：同样一句「对端还没连上」，背后可能是完全不同的两件事。
+      // rxPackets 是接收循环里只增不减的计数：它 ==0 表示这个进程一个字节都没收到，
+      // 那么问题必然在网络层（防火墙 / 地址不对 / 发送端没点「送入」），不可能是混音；
+      // 它 >0 说明包到了、只是没建成流，排查方向完全不同。
+      const rx = Number.isFinite(state.rxPackets) ? state.rxPackets : 0
+      if (rx === 0) return '星空里只有你自己，对端还没连上（本机一个包都没收到）'
+      return '星空里只有你自己（收到 ' + fmtNumber(rx, 0) + ' 个包，但没建成流）'
+    }
+    // v0.32：图谱里看得见对方、对方却连不上，这在现场有两种完全不同的成因，
+    // 而用户看到的都是「对方就在星空里，但它还没开始送音」。分界线是握手口
+    // （audioPort+2，承载 CONN-REQ / CONN-ACK / GRAPH / POS）有没有收到过包：
+    //   hsPackets === 0 且 discoveryPeers > 0
+    //     → 发现广播（47300，UDP 广播）通了、所以看得见，
+    //       但握手口一个包都进不来 → 两端互报「没回应」，且音频口也必然是 0 包。
+    //       这是「个别端口被挡」，不是「网络全断」，查防火墙要针对这个端口。
+    //   hsPackets > 0 但没建成流
+    //     → 包到了、命令没匹配上（看 hsLastCmd/hsLastLine），查协议版本。
+    const hs = Number.isFinite(state.hsPackets) ? state.hsPackets : 0
+    const disco = Number.isFinite(state.discoveryPeers) ? state.discoveryPeers : 0
+    const hsPort = Number.isFinite(state.hsPort) ? state.hsPort : 0
+    // v0.36：最强的一条证据，必须排在最前面。
+    // egressHijacked 来自后端 ProbeEgress（connect+getsockname，不发包）：
+    // 本机若发往这个节点，源地址会被系统选成代理 TUN 的地址（如 198.18.0.1），
+    // 这种包永远到不了对面的手机/电脑 —— 而且它会同时打断两个方向（对端回包
+    // 也按同一条错误路由走），现场表现就是"两端互报没回应、音频口 0 包"。
+    // 这类故障跟防火墙、AP 隔离、协议版本全都无关，先去关代理的 TUN 模式。
+    const hijacked = others.filter((n) => n && n.egressHijacked)
+    if (hijacked.length > 0) {
+      return '本机发往 ' + hijacked[0].id + ' 的包被代理 TUN 接走了' +
+        '（源地址会变成 ' + (hijacked[0].egressSrc || '代理地址') + '，对方的包也回不来）' +
+        ' —— 请先关掉 Clash / 代理软件的 TUN（增强）模式'
+    }
+    if (others.length > 0 && others.every((n) => !n.online)) {
+      if (hs === 0 && disco > 0) {
+        return '对端在图谱里，但握手口 ' + (hsPort || 'audioPort+2') +
+          ' 一个包都没收到（广播能看见它、这个端口被挡了，所以两端互报「没回应」）'
+      }
+      if (hs === 0) return '对端在图谱里但已离线（握手口也没收到过包）'
+      return '对端在图谱里，握手口收到过 ' + fmtNumber(hs, 0) + ' 个包，但没能建成流' +
+        (state.hsLastCmd ? '（最近命令：' + state.hsLastCmd + '）' : '')
+    }
+    if (others.length > 0) {
+      if (hs === 0 && disco > 0) {
+        return '对端就在星空里，但它没开始送音（握手口 ' + (hsPort || 'audioPort+2') + ' 一个包都没收到）'
+      }
+      return '对端就在星空里，但它还没开始送音'
+    }
+    return '还没有任何对端连上来'
+  }
+  const muted = list.filter((x) => x.muted)
+  if (muted.length === list.length) return '收到的 ' + list.length + ' 路音源全被你静音了'
+  const unconfirmed = list.filter((x) => !x.confirmed)
+  if (unconfirmed.length === list.length) return '流已收到，但都还没被确认（看界面上的「自动同意」）'
+  const silent = list.filter((x) => !x.packets || x.packets < 10)
+  if (silent.length === list.length) return '流刚建立，还没收到足够的包'
+  return '收到了 ' + list.length + ' 路流，但没有一路通过混音条件'
+}
+
+function audibleTitle (state) {
+  const frames = Number.isFinite(state.renderFrames) ? state.renderFrames : 0
+  const audible = Number.isFinite(state.renderAudibleFrames) ? state.renderAudibleFrames : 0
+  if (frames < 1000) return '已写进声卡、且至少一个声道非零的帧 / 总帧数（刚启动，还没攒够数据）'
+  if (audible > 0) return '已写进声卡、且至少一个声道非零的帧 / 总帧数'
+  if (state.renderingAsHub === false) {
+    return '本机不是汇聚端：协议规定混音输出恒为静音，所以这里恒为 0 —— 这是正确行为，不是故障'
+  }
+  const mixed = Number.isFinite(state.mixedSources) ? state.mixedSources : 0
+  if (mixed === 0) {
+    return '本机是汇聚端，但没有任何一路音源真正混进来：' + whyNoSource(state)
+  }
+  const mf = Number.isFinite(state.mixedFrames) ? state.mixedFrames : 0
+  return '混入了 ' + mixed + ' 路、共 ' + fmtNumber(mf, 0) + ' 帧被混音，但混出来全是零：' +
+    '音频数据进来了却没有声音，说明采集端抓到的就是静音（它没在播放媒体声音）'
+}
+
+// 接收侧那一格（v0.31）。为什么单独抽出来：
+//   「没有音源」这句提示能指方向，但指不准 —— 包没到和包到了没建成流，
+//   下一步完全不同（前者查网络，后者查协议）。rxPackets 是接收循环里
+//   只增不减的计数，是这两者之间唯一可信的分界线。
+function rxSpan (state) {
+  const rx = Number.isFinite(state.rxPackets) ? state.rxPackets : 0
+  const bad = Number.isFinite(state.rxBadPackets) ? state.rxBadPackets : 0
+  const senders = Number.isFinite(state.rxDistinctSenders) ? state.rxDistinctSenders : 0
+  const port = Number.isFinite(state.listenPort) ? state.listenPort : 0
+  const title = rx === 0
+    ? '本进程还没收到过任何 UDP 包（监听端口 ' + (port || '未知') + '）。' +
+      '这意味着问题在网络层：对端没发、地址不对、或防火墙把入站挡掉了 —— 与混音无关。'
+    : '已收到 ' + rx + ' 个包（来自 ' + senders + ' 个来源' +
+      (bad > 0 ? '，其中 ' + bad + ' 个解析失败' : '') + '），监听端口 ' + (port || '未知') + '。' +
+      (state.rxLastReject ? '最近一次拒收：' + state.rxLastReject : '')
+  const text = rx === 0 ? '未收到包' : fmtNumber(rx, 0) + ' 包'
+  return '<span title="' + title + '">接收 <b>' + text + '</b></span>'
+}
+
+// 握手口那一格（v0.32）。为什么必须单独一格：
+//   「接收 未收到包」说的是音频口（47000）。但握手、图谱、摆位全走
+//   audioPort+2（47002），是完全独立的端口。用户现场「两端在图谱里互相
+//   看得见、却都说对方没回应」正是「发现口(47300)通、握手口(47002)不通」
+//   的指纹 —— 只看音频口的 0 包会把它误判成「网络全断」。
+//   这里只增不减，任何轮询都偷不走。
+function hsSpan (state) {
+  const hs = Number.isFinite(state.hsPackets) ? state.hsPackets : 0
+  const recent = Number.isFinite(state.hsRecent) ? state.hsRecent : 0
+  const disco = Number.isFinite(state.discoveryPeers) ? state.discoveryPeers : 0
+  const port = Number.isFinite(state.hsPort) ? state.hsPort : 0
+  const cmd = state.hsLastCmd || ''
+  const line = state.hsLastLine || ''
+  let title
+  if (hs === 0) {
+    title = '握手口 ' + (port || '未知') + ' 还没收到过任何包。' +
+      (disco > 0
+        ? '但发现广播（47300）已经看到 ' + disco + ' 台设备 —— 说明"广播能到、这个端口被挡"。' +
+          '两端会互报"没回应"，音频口也会一直是 0 包。请针对这个端口查防火墙/子网隔离。'
+        : '发现广播也没有看到任何设备，先确认两端在同一网络。')
+  } else {
+    title = '握手口 ' + (port || '未知') + ' 已收到 ' + hs + ' 个包（最近 10 秒 ' + recent + ' 个）' +
+      (cmd ? '，最近命令 ' + cmd : '') + (line ? '：' + line : '') +
+      '。包到了却连不上，方向是协议/版本，不是网络。'
+  }
+  const text = hs === 0 ? '未收到' : fmtNumber(hs, 0)
+  return '<span title="' + title + '">握手 <b>' + text + '</b>' +
+    (hs > 0 && cmd ? '<span class="hsCmd">' + cmd + '</span>' : '') + '</span>'
+}
+
+// v0.36：本机真实网卡清单。存在的意义是把"我的包到底从哪张卡出去"变成
+// 界面上的一行字 —— 出站网卡由系统路由表决定，装了代理 TUN 之后它可能不是
+// 你以为的那张，而这种错在应用层完全看不出来（收包绑的是 0.0.0.0，照样能收）。
+function egressSpan (state) {
+  const nics = Array.isArray(state.localNics) ? state.localNics : []
+  if (nics.length === 0) return ''
+  const nodes = state.graph && Array.isArray(state.graph.nodes) ? state.graph.nodes : []
+  const bad = nodes.filter((n) => n && !n.isSelf && n.egressHijacked)
+  const title = bad.length > 0
+    ? '本机网卡：' + nics.join('；') +
+      '。但发往 ' + bad.map((n) => n.id).join('、') + ' 会被代理 TUN 接走' +
+      '（源地址 ' + (bad[0].egressSrc || '?') + '），这些包到不了对端。' +
+      '关掉代理的 TUN / 增强模式，或让两端处在同一网段。'
+    : '本机网卡：' + nics.join('；') +
+      '。发往每个对端的源地址都会是其中一张，没有被代理接管。'
+  const text = bad.length > 0 ? '⚠ 被代理接管' : nics.length + ' 张'
+  return '<span title="' + title + '">网卡 <b>' + text + '</b></span>'
+}
+
 function renderSyncLine () {
   const el = $('graphStatus')
   if (!el) return
@@ -793,6 +982,8 @@ function renderControlDevices (state) {
 let knownSourceIds = new Set()
 let noticeText = ''
 let noticeUntil = 0
+// v0.24：连续「已接流但总线静音」的起始时间（判据见 render() 里的静音提示）。
+let silentSince = 0
 
 function showNotice (text) {
   noticeText = text
@@ -862,8 +1053,27 @@ function checkInvites (state) {
   if (invitesWaiting.size === 0) return
   const now = Date.now()
   const sources = Array.isArray(state.sources) ? state.sources : []
+  // v0.20：判定「邀请成功」不能再靠 peerIp === 邀请时填的 IP。
+  //
+  // 邀请填的是一个"我以为对端在哪"的地址，而流的 peerIp 是 CONN-REQ 包的
+  // 真实源地址。两者经常不一样：双网卡（WiFi + 网线各一个地址）、DHCP 续租
+  // 换了地址、对端在 NAPT 后面、或者用户填的是主机名解析出的地址。
+  // 一旦不等，这里就永远判不成立 —— 对端明明已经连上并开始推流，界面却
+  // 在 20 秒后报「无响应」。用户报的「电脑连接手机后一直显示无反应」
+  // 就是这条：手机那边已经在等确认，电脑这边却只会超时。
+  //
+  // 现在改成认「**任意一条新确认的流**」：邀请期间只要冒出一路刚 confirmed
+  // 的流，就说明对端响应了。为了不放过多台同时连入的极端情况，优先用 IP
+  // 精确匹配；匹配不到时退化为"邀请之后才出现的 confirmed 流"。
   for (const [ip, w] of invitesWaiting) {
-    if (sources.some((s) => s && s.confirmed && s.peerIp === ip)) {
+    const exact = sources.some((s) => s && s.confirmed && s.peerIp === ip)
+    const fresh = sources.some((s) => {
+      if (!s || !s.confirmed) return false
+      // 邀请发起前就在推流的流不算（那是老连接，不能拿来给这次邀请背书）
+      const seen = knownSourceIds.has(s.peerIp) || knownSourceIds.has(s.id)
+      return !seen
+    })
+    if (exact || fresh) {
       invitesWaiting.delete(ip)   // 对方已经开始推流，接入提示由 checkNewSources 负责
       continue
     }
@@ -935,6 +1145,47 @@ function render (state) {
   const localFlow = confirmedCount > 0 || !!state.pcSource
   const anyConnection = networkUp || localFlow
 
+  // v0.24：音源已接入、但采集到的是静音 —— 明确告诉用户「不是没收到 / 没渲染」。
+  // 根因：发送端用 AudioPlaybackCapture 抓的是「系统正在播放的声音」（音乐 / 视频 / 游戏），
+  // 不是麦克风；发送端没放音时包照发、本端照收照渲染，但总线电平恒 -120（dbText 显示「静音」）。
+  // 判据用总线电平（就是汇聚端耳机里实际听到的），持续 3 秒才提示，
+  // 避免刚接入 / 抖动缓冲还没填满时闪一下假警。
+  const lvl = (x) => (typeof x === 'number' && Number.isFinite(x) ? x : -120)
+  // 界面自己是"合法采样者"：每 200ms 读一次 busLevel，正好对上 Meter::Take() 的
+  // 设计节奏（被读空的是外面用 curl 的旁观者，不是界面）。所以这里继续用 busLevel
+  // 判断"此刻静不静"，但用只增不减的渲染探针把原因说清楚：
+  //   有音源 + 渲染在跑 + 一帧都没出过声  → 混音后就是静音（上游问题，别去查音量）
+  //   有音源 + 出过声但此刻静音          → 发送端现在没在放声音
+  const audibleNow = Number.isFinite(state.renderAudibleFrames) ? state.renderAudibleFrames : 0
+  const framesNow = Number.isFinite(state.renderFrames) ? state.renderFrames : 0
+  const neverAudible = framesNow > 1000 && audibleNow === 0
+  // 归因探针（v0.28）：audible 恒 0 有三种完全不同的原因，不能一律说成"没混进来"。
+  const mixedSources = Number.isFinite(state.mixedSources) ? state.mixedSources : 0
+  const asHub = state.renderingAsHub !== false
+  const silentNow = confirmedCount > 0 && (lvl(state.busLevel) <= -119)
+  if (!silentNow) silentSince = 0
+  else if (!silentSince) silentSince = Date.now()
+  const silentWarn = silentNow && (Date.now() - silentSince >= 3000)
+  const silentEl = $('silentWarn')
+  if (silentEl) {
+    if (silentWarn) {
+      silentEl.textContent = !neverAudible
+        ? ('已收到音源，但当前是静音：本功能送的是发送端「正在播放的声音」（音乐 / 视频 / 游戏），不是麦克风。' +
+           '请确认发送端正在播放媒体声音。')
+        : (!asHub
+          ? ('本机不是汇聚端，混音输出按协议恒为静音 —— 此刻' + framesNow + ' 帧全是零是正确的（声音应该在汇聚端那台设备上）。' +
+             '如果两台都听不到，问题不在本机输出：请看图谱里谁是汇聚端、那台设备的状态。')
+          : (mixedSources === 0
+            ? ('本机是汇聚端，但一路音源都没混进来：送进声卡的 ' + framesNow + ' 帧全是零。' +
+               '这是"没混进去"，不是音量或输出设备的问题 —— 查：音源是否已确认、是否真的在没在发包。')
+            : ('本机是汇聚端，混入了 ' + mixedSources + ' 路、却混出全零：' + framesNow + ' 帧没有一帧有声音。' +
+               '数据进来了但内容是静音 —— 说明采集端抓到的就是无声，请确认发送端正在播放媒体声音。')))
+      silentEl.classList.remove('hidden')
+    } else {
+      silentEl.classList.add('hidden')
+    }
+  }
+
   // 断开锁：只有出现「新会话」的证据才解锁。这里刻意不把"图谱变空"当成解锁条件 ——
   // 本机作为客户端时，远端 hub 的图谱可能先空一下又回灌旧节点（最长 10s 才转离线），
   // 一解锁就会被残留图谱弹回控制台，这正是用户反馈的那个 bug。
@@ -996,6 +1247,26 @@ function render (state) {
       '<span>码率 <b>' + fmtNumber(state.kbps, 0) + '</b> kbps</span>' +
       '<span>坏包 <b>' + (Number.isFinite(state.malformed) ? state.malformed : 0) + '</b></span>' +
       '<span>渲染欠载 <b>' + (Number.isFinite(state.renderUnderruns) ? state.renderUnderruns : 0) + '</b></span>' +
+      // 出声判定（v0.27）：这是"汇聚端到底有没有真的出声"的唯一硬证据。
+      // 总线电平（busLevel）是取走即清零的采样器，界面每 200ms 轮询就把它抢光了，
+      // 谁再看一眼都只剩 -120 —— 以前就是被它误导的。下面两个数从启动起只增不减。
+      '<span title="' + audibleTitle(state) + '">出声 <b>' +
+        fmtNumber(state.renderAudibleFrames, 0) + '</b>/' + fmtNumber(state.renderFrames, 0) + ' 帧' +
+        audibleSuffix(state) + '</span>' +
+      '<span title="实际送进声卡的最高电平">峰值 <b>' +
+        (Number.isFinite(state.renderPeakDbfs) && state.renderPeakDbfs > -200 ? dbText(state.renderPeakDbfs) : '—') +
+        '</b></span>' +
+      // 接收侧证据（v0.31）：上面那组数只说「出声没有」，这一组说「包到底来没来」。
+      // 两个都是接收/渲染循环里只增不减的计数，与任何轮询都不冲突。
+      // 星空里只有自己时看这个数：0 = 网络层就没通（别查混音）；
+      // >0 = 包到了、只是没建成流（查协议/版本）。
+      rxSpan(state) +
+      // 握手口证据（v0.32）：音频口 0 包时，这一格决定「网络层完全不通」
+      // 还是「只有 47002 被挡住」—— 后者正是"互相看得见却说没回应"的指纹。
+      hsSpan(state) +
+      // v0.36：出站网卡证据。收发都绑 0.0.0.0，所以"收得到"不代表
+      // "发得出去" —— 装了代理 TUN 之后，发往跨网段对端的包会被接走。
+      egressSpan(state) +
       (srcList.length > 0
         ? '<span>流欠载 <b>' + underrun + '</b> 帧</span>' +
           '<span>迟到/溢出 <b>' + lateLost + '</b></span>'

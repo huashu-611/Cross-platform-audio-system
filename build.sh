@@ -28,7 +28,7 @@ $CXX $FLAGS \
   src/graph.cpp src/spatial.cpp \
   tests/test_main.cpp tests/test_packet.cpp tests/test_ring.cpp tests/test_jitter.cpp \
   tests/test_clock.cpp tests/test_asrc.cpp tests/test_mixer.cpp tests/test_pipeline.cpp \
-  tests/test_graph.cpp tests/test_spatial.cpp \
+  tests/test_graph.cpp tests/test_spatial.cpp tests/test_meter.cpp \
   -lws2_32 -liphlpapi -o "$OUT/audiohub_tests.exe"
 
 if [ "${WIN32:-1}" = "1" ]; then

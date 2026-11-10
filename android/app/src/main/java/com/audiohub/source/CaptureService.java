@@ -70,6 +70,15 @@ public class CaptureService extends Service {
     public static volatile int sLevelDbfs = -120;
     public static volatile double sKbps = 0;
 
+    // v0.33：三个只增不减的计数，用来分开「没在发」「发了但抛异常」「压根没读到数据」。
+    // 用户报「采集到的是静音」时，屏幕上必须还能看见 sPackets 和 sendTarget —— 
+    // 那两个数才是判断包到底有没有出去、发错地址没有的唯一依据。以前静音提示
+    // 把整行替换掉了，于是最关键的两个数被提示顶掉，只能靠猜。
+    public static volatile long sSendErrors = 0;
+    public static volatile String sLastSendError = "";
+    public static volatile long sReadZero = 0;
+    public static volatile long sReadTotal = 0;
+
     /**
      * 最近一次启动/运行失败的原因，MainActivity 每 400ms 轮询取走并清空。
      * 主要用途：把「采集授权已失效，请重新授权」这种必须让用户看到的信息
@@ -90,9 +99,16 @@ public class CaptureService extends Service {
     public static volatile int sPort = 0;
     public static volatile int sStreamId = 0;
 
-    // ---- 连接后静音（用户 2026-10-27 定稿）：手机作音源时静音媒体音量，只让汇聚端出声。
-    // 停止/异常/线程退出都恢复。另带自愈：若这台机器上"静音"真的把采集掐了，自动取消静音。
-    // 阈值与时长：电平 >-60 dBFS 视为有信号，<-100 dBFS 视为静音，持续 3 s 触发自愈。----
+    // ---- 媒体音量策略（v0.25 起不再主动静音）----
+    // 旧版连接后把 STREAM_MUSIC 设成 0，想让声音只从汇聚端出。真机实测：部分 ROM 在
+    // 媒体音量为 0 时会把 AudioPlaybackCapture 一起掐成静音（播放器音轨被一并静音），
+    // 现象就是「手机在放、桌面端电平条不动、完全没声音」；模拟器 ROM 不受影响所以没暴露。
+    // 静音自愈（maybeHealMute）本该 3 秒兜底，但它带 isMusicActive() 闸门，某些 ROM 上
+    // 恒 false，自愈永远不触发，整条流变成永久静音。用户 2026-11-06 定稿：从头到尾不碰
+    // 媒体音量 —— 手机照常出声、汇聚端也收得到，两害相权先保证有声音。
+    // 下面的常量与 mute/restore/heal 方法保留作兼容兜底（mutedByUs 恒 false 时全是 no-op），
+    // 这样所有收尾路径都不用跟着大改，也不会有谁再误把音量设成 0。
+    // 阈值与时长：电平 >-60 dBFS 视为有信号，<-100 dBFS 视为静音，持续 3 s 触发自愈。
     private static final int MUTE_SIGNAL_DBFS = -60;
     private static final int MUTE_SILENT_DBFS = -100;
     private static final long MUTE_HEAL_SILENCE_MS = 3000L;
@@ -341,6 +357,10 @@ public class CaptureService extends Service {
             sPort = port;
             sStreamId = streamId;
             sPackets = 0;
+            sSendErrors = 0;
+            sLastSendError = "";
+            sReadZero = 0;
+            sReadTotal = 0;
             sStatus = "已恢复 " + host + ":" + port + " · 通道 " + streamId;
             Log.i(TAG, "复用保留的采集会话恢复发送 → " + host + ":" + port);
             muteMediaVolume();
@@ -388,7 +408,7 @@ public class CaptureService extends Service {
             return START_NOT_STICKY;
         }
 
-        // 开始采集后立刻静音媒体音量：声音只从汇聚端耳机出（用户定稿）。
+        // v0.25：不静音媒体音量（真机上会连带掐掉 AudioPlaybackCapture，见字段区说明）。
         muteMediaVolume();
 
         acquireLocks();
@@ -397,6 +417,10 @@ public class CaptureService extends Service {
         sPort = port;
         sStreamId = streamId;
         sPackets = 0;
+        sSendErrors = 0;
+        sLastSendError = "";
+        sReadZero = 0;
+        sReadTotal = 0;
         sStatus = "已连接 " + host + ":" + port + " · 通道 " + streamId;
         return START_NOT_STICKY;
     }
@@ -432,14 +456,47 @@ public class CaptureService extends Service {
         // 4 包以上的缓冲：太小会在系统调度抖动时丢采样，太大则平白增加延迟。
         int bufferBytes = Math.max(minBytes * 2, PacketProtocol.PAYLOAD_BYTES * 4);
 
+        // 只允许 MEDIA / GAME / UNKNOWN —— 这不是"偷懒"，是平台的硬限制。
+        //
+        // v0.38 一度把 ALARM / NOTIFICATION* / ASSISTANCE* / VOICE_COMMUNICATION*
+        // 一起 addMatchingUsage()，Builder 全部接受（不抛异常），但随后
+        // AudioRecord.Builder().build() 直接失败：
+        //     E AudioHubCapture: 创建 AudioRecord 失败: Error: could not register audio policy
+        // 采集线程根本没起来，一个包都发不出去 —— 比"抓到静音"更糟。
+        // 所以这里必须**只加平台允许的三类**（它们的值恰好也是
+        // AudioPlaybackCaptureConfiguration 文档里写明的可采集 usage）。
+        //
+        // 由此带来的固有限制要如实告诉用户：手机若把声音挂在别的声音类型上
+        //（通话、通知提示音、无障碍朗读等），播放采集永远抓不到。抓不到时
+        // Android 返回的是静音帧而不是 0 —— 这就是 UI 上"有特效但电脑没声"
+        // 的那一类情况；v0.24 的 silentHint 会在这时给出提示。
+        //
+        // 仍然逐个 add + try/catch：万一某个 OEM ROM 对某一类另有规定，
+        // 少一类总比整个 AudioRecord 建不起来强。
         AudioPlaybackCaptureConfiguration config;
         try {
-            config = new AudioPlaybackCaptureConfiguration.Builder(projection)
-                    // 只抓这三类。注意不能和 excludeUsage 混用。
-                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-                    .build();
+            final AudioPlaybackCaptureConfiguration.Builder builder =
+                    new AudioPlaybackCaptureConfiguration.Builder(projection);
+            final int[] usages = new int[]{
+                    AudioAttributes.USAGE_MEDIA,
+                    AudioAttributes.USAGE_GAME,
+                    AudioAttributes.USAGE_UNKNOWN,
+            };
+            int added = 0;
+            for (int usage : usages) {
+                try {
+                    builder.addMatchingUsage(usage);
+                    ++added;
+                } catch (Throwable ignored) {
+                    // 这个 usage 不被采集框架允许，跳过即可
+                }
+            }
+            if (added == 0) {
+                fail("构建采集配置失败：没有任何可用的音频类型");
+                return false;
+            }
+            config = builder.build();
+            Log.i(TAG, "采集匹配音频类型 " + added + "/" + usages.length + " 种");
         } catch (Exception e) {
             fail("构建采集配置失败: " + e.getMessage());
             return false;
@@ -530,8 +587,14 @@ public class CaptureService extends Service {
                     sStatus = "采集中断（错误码 " + read + "）";
                     break;
                 }
+                // v0.33：非致命错误码走 continue 时什么都没记，于是「read() 一直
+                // 返回 0」和「好好地读着只是没凑满」在界面上长得一模一样。
+                // AudioPlaybackCapture 抓不到声音时就是前者：包不发、电平停在
+                // -120，而 sStatus 还是「已连接」。计数只增不减，让界面说得出区别。
+                sReadZero++;
                 continue;
             }
+            sReadTotal += read;
             fill += read;
             if (fill < block.length) continue;  // 还没凑满一包
 
@@ -570,7 +633,13 @@ public class CaptureService extends Service {
                 }
             } catch (Exception e) {
                 // 切换目标那一瞬间旧 socket 会被关掉，正常的 "Socket closed" 不要报给界面
-                if (target == socket) sStatus = "发送失败: " + e.getMessage();
+                if (target == socket) {
+                    sStatus = "发送失败: " + e.getMessage();
+                    // v0.33：以前只写一行会被下一帧覆盖的文案。计数留着，
+                    // 这样「sPackets 不涨」能区分是没数据还是 send() 一直在抛。
+                    sSendErrors++;
+                    sLastSendError = e.getClass().getSimpleName() + ": " + e.getMessage();
+                }
             }
 
             samplePos += PacketProtocol.FRAMES_PER_PACKET;
@@ -591,7 +660,7 @@ public class CaptureService extends Service {
                 sLevelDbfs = mean > 0 ? (int) Math.round(10 * Math.log10(mean)) : -120;
                 sKbps = sPackets * PacketProtocol.PACKET_BYTES * 8.0 / 1000.0
                         / ((now - t0) / 1000.0);
-                // 静音自愈：静音后若采集电平持续静音，说明静音掐掉了采集，自动取消静音。
+                // v0.25 起 mutedByUs 恒 false，这里安全空转；保留调用以防将来重新启用静音策略。
                 maybeHealMute(sLevelDbfs);
                 levelSum = 0;
                 levelPackets = 0;
@@ -621,37 +690,19 @@ public class CaptureService extends Service {
     // ------------------------------------------------------------ 静音与自愈
 
     /**
-     * 开始采集后静音媒体音量（用户定稿：连接后直接静音，只有汇聚端的耳机出声）。
+     * 媒体音量策略入口（v0.25 起为 no-op，保留签名与全部调用点）。
      *
-     * 只接管"当前不是静音"的情况：本来就是 0，说明用户自己静音了，不接管，停止时也不弹回来。
-     * 部分机型/勿扰模式会拒绝改音量（SecurityException），失败只记日志，绝不影响采集。
+     * 旧版在这里把 STREAM_MUSIC 设 0；真机实测部分 ROM 会连 AudioPlaybackCapture 一起掐成
+     * 静音，而自愈的 isMusicActive() 闸门在这些 ROM 上恒 false，整条流会变成永久静音。
+     * 现在全程不碰媒体音量；mutedByUs 恒 false，restore/heal 的所有收尾调用都安全空转。
      */
     private synchronized void muteMediaVolume() {
-        if (mutedByUs) return;
-        healWarned = false;
-        hadSignalLevel = false;
-        silentSinceElapsed = -1;
-        try {
-            if (audioManager == null) {
-                audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-            }
-            if (audioManager == null) return;
-            final int current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
-            if (current <= 0) {
-                Log.i(TAG, "媒体音量本来就是 0，不接管（停止采集时不恢复）");
-                return;
-            }
-            savedMusicVolume = current;
-            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0);
-            mutedByUs = true;
-            Log.i(TAG, "已静音媒体音量（原音量 " + current + "/"
-                    + audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-                    + "，声音只从汇聚端播放）");
-        } catch (Exception e) {
-            mutedByUs = false;
-            savedMusicVolume = -1;
-            Log.w(TAG, "静音媒体音量失败（不影响采集）: " + e.getMessage());
-        }
+        // v0.25：保留方法签名与全部调用点，但**不再修改媒体音量**。
+        // 真机实测 setStreamVolume(STREAM_MUSIC, 0) 会连带掐掉 AudioPlaybackCapture 的声音，
+        // 静音自愈又因 isMusicActive() 闸门在某些 ROM 上永不触发，整条流会变成永久静音。
+        // 现在任何路径都不会把 mutedByUs 置 true，restoreMediaVolume()/maybeHealMute()
+        // 也就永远安全空转；用户手机音量保持原样，手机照常出声、汇聚端也收得到。
+        Log.i(TAG, "v0.25：保持媒体音量不变（不静音，避免掐断音频采集）");
     }
 
     /**
@@ -683,14 +734,11 @@ public class CaptureService extends Service {
     /**
      * 静音自愈（采集线程每个 1 秒电平窗口调用一次）。
      *
-     * Windows 上验证过"端点静音不影响 WASAPI 回环采集"；Android 的 AudioPlaybackCapture
-     * 理论上也不受媒体音量影响，但没实测。所以留一个安全阀：静音后若采集电平持续静音，
-     * 自动取消静音并 log 一次警告，避免把整个流变成静音。
-     *
-     * 触发条件：静音电平持续 ≥3 秒 **且** 系统确实在放声音（isMusicActive，说明有内容要被采集
-     * 却抓不到信号）。额外用 isMusicActive 做闸门是必要的：只看"由有信号变为静音"的话，
-     * 用户暂停播放 3 秒就会把音量弹回来，之后恢复播放手机又出声，违背"连接后保持静音"；
-     * 这个闸门也顺带兜住了"静音从一开始就掐断采集"（启动路径上永远见不到"有信号"）。
+     * v0.25：mutedByUs 恒 false（已不再主动静音），本方法首行即返回，保留作兼容兜底。
+     * 历史背景：旧版连接后把 STREAM_MUSIC 设 0，Windows 的 WASAPI 回环不受端点静音影响，
+     * 曾据此推测 Android 也一样 —— 真机证明不成立：部分 ROM 会连 AudioPlaybackCapture 一起
+     * 掐成静音，而且 isMusicActive() 闸门在这些 ROM 上恒 false，自愈永远不触发。所以 v0.25
+     * 直接放弃静音，而不是继续修这条自愈链路。
      */
     private void maybeHealMute(int levelDbfs) {
         if (!mutedByUs) return;

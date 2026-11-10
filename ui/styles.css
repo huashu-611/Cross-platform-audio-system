@@ -327,6 +327,16 @@ h1 span { color: var(--cyan-soft); font-weight: 300; }
 }
 .stats b { color: var(--dim); font-weight: 600; }
 
+/* v0.24：静音提示条（音源已接入但总线没声音） */
+.silent-warn {
+  margin: 10px 0 0; padding: 9px 13px;
+  font-size: 12px; line-height: 1.5; color: var(--warn);
+  background: rgba(255, 209, 102, .09);
+  border-left: 3px solid var(--warn);
+  border-radius: 10px;
+}
+.silent-warn.hidden { display: none; }
+
 /* ---------- 控制界面：星图 ---------- */
 /* 图谱绘制层是 Canvas（ui/scene3d.js + ui/starfield.js）：逻辑视口恒 920x460，
    画布在 .graphwrap 里 100% 撑开、等比缩放并居中（多余方向留边，不拉伸也不裁掉节点）。
@@ -519,4 +529,15 @@ h1 span { color: var(--cyan-soft); font-weight: 300; }
   .graphwrap { min-height: 90px; }
   .sect, .sectrow { margin: 9px 0 6px; }
   .deco { display: none; }
+}
+
+/* v0.32：握手口那一格里追加的最近命令名（CONN-REQ / GRAPH / POS …）。
+   它只在收到过包时出现，用弱化的等宽小字，避免和主数字抢视线。 */
+.hsCmd {
+  margin-left: 4px;
+  padding: 0 4px;
+  border-radius: 4px;
+  font-size: 0.86em;
+  opacity: 0.72;
+  background: rgba(120, 170, 255, 0.14);
 }

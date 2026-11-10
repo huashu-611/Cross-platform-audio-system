@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace audiohub {
 
@@ -65,5 +66,47 @@ class UdpSocket {
 
 // 返回本机所有 IPv4 地址，便于启动时打印"把手机指向这个 IP"。
 std::string LocalIPv4List();
+
+// 本机**全部** IPv4 地址（v0.41）。
+//
+// 和 LocalIPv4List() 的区别很重要，别混用：
+//   * LocalIPv4List() 回答的是"我该对外通告哪个地址" —— 所以它剔除 VMware /
+//     WSL / Clash 这些虚拟网卡，还按"像不像真实局域网"打分排序。
+//   * LocalIPv4Addresses() 回答的是"这些地址里哪些是我" —— 判断身份时必须把
+//     虚拟网卡也算进来：手机看到的电脑地址完全可能是 192.168.x（VMnet）或多
+//     出口 NAT 后的地址，那不是"对外通告的选择"，而是"对端眼里的我"。
+// 用途：GRAPH 里 hubId 的归属判定（见 HubCore::IsSelfIdLocked）。
+std::vector<std::string> LocalIPv4Addresses();
+
+// 出网路径判定（v0.36）。只读，不发包，不改变任何 socket 行为。
+//
+// 为什么需要它：装了 Clash / V2Ray 的 TUN 模式后，0.0.0.0/0 默认路由会被
+// 虚拟网卡抢走（本机实测：Meta 网卡 198.18.0.1 抢到默认路由），于是发往
+// "不在本网段"的对端时源地址会变成 198.18.0.1 —— 那些包永远到不了手机，
+// 而 mDNS 广播因为在同一网段内还能通，界面照样显示"星空里有对方"。
+// 结果就是用户看到的"两端都显示对方没响应"，且从协议层怎么查都查不出问题。
+//
+// 判据不能用"连公网看来路"：那条路由恰好就是被劫持的那条。
+// 这里用 connect()+getsockname() 对具体对端问一次内核 —— UDP connect 只做
+// 路由查询，不产生任何流量。
+struct EgressInfo {
+  bool ok = false;        // false = 判定失败（地址非法 / socket 建不出来）
+  std::string src_ip;     // 内核选定的源地址
+  bool hijacked = false;  // true = 源地址不在任何"真实"网卡上（落进了 TUN 等虚拟网卡）
+};
+
+// 对 dst_ipv4 做一次不发包的路由查询。
+EgressInfo ProbeEgress(const std::string& dst_ipv4);
+
+// 本机"真实"网卡（已排除 VMware / TUN / 回环 / 链路本地）的清单，
+// 每行 "ip/prefix gateway=yes|no name=<友好名>"。用于启动自检输出。
+std::vector<std::string> RealNicSummary();
+
+// 枚举当前已绑定 port 的 UDP 端点地址（"*" = 通配绑定）；空 = 端口干净。
+//
+// Windows 上"绑具体 IP"与"绑通配 IP"可以并存：一个残留进程占着
+// 127.0.0.1:47002 时，新进程绑 0.0.0.0:47002 仍然成功，但发往 127.0.0.1
+// 的包会全部进残留进程。bind() 看不出这件事，只能在绑之前问系统。
+std::vector<std::string> ProbeUdpPortOwners(uint16_t port);
 
 }  // namespace audiohub
