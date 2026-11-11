@@ -31,10 +31,24 @@ package com.audiohub.source;
  *   sin 在整圆上给出正确的左右符号与两侧对称：az=±90 最偏、az=±135 回收到 ±0.707、
  *   az=180（正后方）回到中置 —— 后半球不会被饱和成硬左/硬右，正后方只靠后向线索区分。
  *
- * 前后（诚实定位）：立体声两声道没有 HRTF 卷积时无法可靠区分前/后。
- *   这里只做两条弱线索：rear = max(0, -cos az)，后向增益 kRearGain=0.7，
- *   一阶低通截止从 20 kHz 随 rear 降到 4 kHz。它能让"身后"的节点听起来明显更闷、
- *   更轻，但这不是真正的前后定位；真要前后定位需要 HRTF，本轮不做。
+ * 前后（v0.46，四线索）：立体声两声道没有 HRTF 卷积时无法可靠区分前/后。
+ *   本轮把两条弱线索扩成四条，全部走同一个后向因子 rear = max(0, -cos az)：
+ *   ① 电平：后向增益 kRearGain=0.7（约 -3.1 dB）；
+ *   ② 闷化：一阶低通从 20 kHz 随 rear 降到 6 kHz（v0.46 由 4 kHz 放宽，
+ *      4 kHz 会把"身后"糊成同一团低频，后 vs 后右 反而更难分）；
+ *   ③ 耳廓陷波：二阶带通并联出的宽带凹陷，中心随 rear 从 6 kHz 抬到 8 kHz，
+ *      正后方挖 15 dB（Q=1.6，-3 dB 带宽约 5 kHz）；
+ *   ④ 早期反射：两路延迟副本（7.5~11 ms / 12.4~18.2 ms），随 rear 变长变响，
+ *      合计约 +3.5 dB 湿声，模拟墙面/肩部反射。
+ *   另外 rear 本身做了对比度拉伸（kRearContrastExponent=0.55），否则 135° 只有
+ *   0.707 的力度、与 45° 几乎无法区分。
+ *
+ *   rear=0（正前/正侧）时后向链**逐位透明**：beta=0、dull=0、湿声增益=0，
+ *   输出与"没有后向链"完全一致 —— 前方音色一点不动。
+ *
+ *   仍做不到：锥形混淆（前上 vs 后下）、俯仰定位、个体耳廓差异、单声道兼容
+ *   （后向线索在 mono 折叠时会部分抵消）。真要前后定位需要双耳 HRTF 卷积或
+ *   多声道输出，本轮不做。
  */
 public final class Spatial {
 
@@ -51,8 +65,13 @@ public final class Spatial {
     public static final float kDegToRad = kPi / 180.0f;
     public static final float kRadToDeg = 180.0f / kPi;
 
-    /** 节点默认圆环半径，也是距离衰减的参考距离 r0。 */
+    /** 节点默认圆环半径（只给 defaultScenePlacement 用）。 */
     public static final float kSceneRadius = 1.0f;
+    /**
+     * 距离衰减的参考距离 r0（v0.45 从 kSceneRadius 拆出，v0.46 由 0.1 m 改为 0.3 m）。
+     * 以前与 kSceneRadius 共用一个 1.0，改衰减会顺带把默认摆位圆环也改掉。
+     */
+    public static final float kDistanceRefM = 0.3f;
     /** UI 默认相机距离（只给 UI 用，DSP 不读它）。 */
     public static final float kDefaultCameraRadius = 2.6f;
     /** 人最大双耳时间差 ≈0.63 ms @48k ≈30.2 帧。 */
@@ -65,22 +84,67 @@ public final class Spatial {
     public static final float kRearGain = 0.7f;
     /** 正前方一阶低通截止。 */
     public static final float kRearLpFrontHz = 20000.0f;
-    /** 正后方一阶低通截止。 */
-    public static final float kRearLpBackHz = 4000.0f;
+    /**
+     * 正后方一阶低通截止。v0.46：4 kHz 放宽到 6 kHz。
+     * 4 kHz 的一阶低通把后向压得太闷，所有"身后"声音都变成同一团低频糊，
+     * "后 vs 后右"反而更难分；放宽后判决权交给陷波（③）与反射（④）。
+     */
+    public static final float kRearLpBackHz = 6000.0f;
+    /**
+     * v0.46 ③ 耳廓陷波：二阶带通并联出的宽带凹陷（{@code y = x + beta*bp(x)}），
+     * 中心随 rear 从 6 kHz 抬到 8 kHz，正后方挖 15 dB。这是耳廓梳状响应随入射角
+     * 移动的主瓣位置 —— "越低越偏后"是选这条映射的听感依据。
+     */
+    public static final float kRearNotchFrontHz = 6000.0f;
+    public static final float kRearNotchBackHz = 8000.0f;
+    /** v0.46b：12 -> 15 dB（斜后方也要听得出来）。 */
+    public static final float kRearNotchDepthDb = 15.0f;
+    /**
+     * v0.46b：Q 2.5 -> 1.6。Q=2.5 的坑只有 ±1.2 kHz 宽，宽带音乐里很容易被相邻
+     * 频段填满；放宽后是一条"presence 区整体发闷"的宽带凹陷，更像耳廓效应、也更抗掩蔽。
+     */
+    public static final float kRearNotchQ = 1.6f;
+    /**
+     * v0.46b ④ 后向对比度拉伸。裸 rear = max(0, -cos az) 在「斜后方」只有 0.707（135°），
+     * 于是陷波/反射/闷化全都只按七成力度生效 —— 实测 135° 与 45° 只差约 2 dB，人耳分不出来。
+     * 指数 0.55 把 135° 抬到 0.83、120° 抬到 0.68，两端（0°/180°）保持不变。
+     */
+    public static final float kRearContrastExponent = 0.55f;
+    /**
+     * v0.46 ④ 早期反射：两路延迟副本，rear 越大越长、越响。
+     * 第一路是"同侧墙面/肩部"近反射，第二路是"对侧墙"远反射；两路不成简单整数比，
+     * 避免并入同一个梳状峰。
+     */
+    public static final float kRearEr1DelayFrontMs = 7.5f;
+    public static final float kRearEr1DelayBackMs = 11.0f;
+    public static final float kRearEr2DelayFrontMs = 12.4f;
+    public static final float kRearEr2DelayBackMs = 18.2f;
+    /** v0.46b：0.26 -> 0.34（反射更强）。 */
+    public static final float kRearEr1Gain = 0.34f;
+    /** v0.46b：0.12 -> 0.16（两路合计 0.50，约 +3.5 dB 湿声）。 */
+    public static final float kRearEr2Gain = 0.16f;
+    /** 反射路径的一阶低通（墙面/肩部吸高频）。 */
+    public static final float kRearErLpHz = 2500.0f;
     /** 增益/声像平滑时间常数（50 ms）。 */
     public static final float kSmoothTauSec = 0.05f;
     /** ITD 每块（5 ms）最多变 2 帧，防爆音。 */
     public static final float kMaxDelaySlewFrames = 2.0f;
-    /** 每源历史 ≥ 最大延时 30 帧 + 插值余量。 */
-    public static final int kSpatialHistoryFrames = 64;
+    /**
+     * 每源历史。v0.46：64 -> 1024。最长反射 18.2 ms @48k ≈ 874 帧，还要 2 帧插值余量；
+     * 取 1024（2 的幂，取模是掩码级开销）。状态从 512 B 涨到 8 KB/源，可忽略。
+     */
+    public static final int kSpatialHistoryFrames = 1024;
     /** P0 只用 [0]（单声道化后）；[1] 保留 side 通路。 */
     public static final int kSpatialHistoryChannels = 2;
-    /** 距离下限，防除零。 */
-    public static final float kMinDistanceM = 0.25f;
-    /** +6 dB，近场封顶（远场不再截断：距离就是音量，用户 2026-10-27 定稿）。 */
-    public static final float kMaxDistanceGain = 2.0f;
-    /** 距离衰减指数（v0.4）：C++ 的 kDistanceExponent，跨端必须一致。 */
-    public static final float kDistanceExponent = 1.6f;
+    /** 距离下限，防除零（= r0，靠得再近也不再变响）。 */
+    public static final float kMinDistanceM = 0.3f;
+    /** 100% 封顶（v0.45 取消原来的 +6 dB 近场升压，r0 处正好满）。 */
+    public static final float kMaxDistanceGain = 1.0f;
+    /**
+     * 距离衰减指数（v0.46）：C++ 的 kDistanceExponent，跨端必须一致。
+     * 口径：0.3 m = 100%，2.0 m = 1% → p = ln(0.01)/ln(0.3/2.0) = 2.4274533。
+     */
+    public static final float kDistanceExponent = 2.4274533f;
     /** 世界坐标绝对值上限 ±320 m（= POS 帧 ±32000 cm；与内核/协议双重校验一致）。 */
     public static final float kSpatialCoordLimit = 320.0f;
     /** 内部采样率（与 C++ kSampleRate、PacketProtocol.SAMPLE_RATE 一致）。 */
@@ -261,16 +325,16 @@ public final class Spatial {
     }
 
     /**
-     * 距离衰减：线性反比振幅，参考距离 r0 = kSceneRadius（1 unit = 1 m）。
-     *   g = min((r0 / max(d, kMinDistanceM))^p, kMaxDistanceGain)，p = kDistanceExponent = 1.6
-     *   d=1 -> 0 dB；d=2 -> -9.6 dB；d=3 -> -14.4 dB；d=4 -> -19.3 dB；d=10 -> -32 dB
-     *   （远场不再截断："距离就是音量"，用户 2026-10-27 定稿）；d<0.25 -> 上限 +6 dB，近场封顶。
+     * 距离衰减（v0.46 口径，与 C++ DistanceGain 逐位一致）。
+     *   g = min((r0 / max(d, kMinDistanceM))^p, kMaxDistanceGain)
+     *   r0 = kDistanceRefM = 0.3 m，p = 2.4274533，封顶 1.0
+     *   d≤0.3 -> 100%(0 dB)；d=0.5 -> 28.9%(-10.8 dB)；d=0.75 -> 10.8%(-19.3 dB)；
+     *   d=1.0 -> 5.4%(-25.4 dB)；d=2.0 -> 1.0%(-40.0 dB)；d=3.0 -> 0.37%(-48.6 dB)。
      */
     public static float distanceGain(float distance) {
         final float d = Math.max(distance, kMinDistanceM);
         // 距离即音量：只有近场封顶，没有远场下限（见 C++ spatial.hpp）。
-        // v0.4：指数 1.6（原来 1.0 太缓，用户反馈拖远后音量变化不明显）。
-        return Math.min((float) Math.pow(kSceneRadius / d, kDistanceExponent), kMaxDistanceGain);
+        return Math.min((float) Math.pow(kDistanceRefM / d, kDistanceExponent), kMaxDistanceGain);
     }
 
     /**
@@ -281,16 +345,52 @@ public final class Spatial {
         return (float) Math.sin(clampDeg(azimuthDeg) * kDegToRad) * kMaxItdSeconds;
     }
 
-    /** 后向因子：0 = 正前，1 = 正后。 */
+    /** 后向因子：0 = 正前，1 = 正后（v0.46b 带对比度拉伸）。 */
     public static float rearFactor(float azimuthDeg) {
-        return clamp(-((float) Math.cos(clampDeg(azimuthDeg) * kDegToRad)), 0.0f, 1.0f);
+        final float c = clamp(-((float) Math.cos(clampDeg(azimuthDeg) * kDegToRad)), 0.0f, 1.0f);
+        // v0.46b：对比度拉伸，让"斜后方"也拿到足够的线索强度（见 kRearContrastExponent）。
+        //   两端不动：az=0 -> 0，az=180 -> 1；az=135 从 0.707 抬到 0.826。
+        return (float) Math.pow(c, kRearContrastExponent);
     }
 
-    /** 后向低通截止：rear=0 -> 20 kHz，rear=1 -> 4 kHz（在 log 频率上插值）。 */
+    /** 后向低通截止：rear=0 -> 20 kHz，rear=1 -> 6 kHz（在 log 频率上插值）。 */
     public static float rearCutoffHz(float rear) {
         final float r = clamp(rear, 0.0f, 1.0f);
-        // 在 log 频率上插值，听感更均匀：20k * (4k/20k)^r，r=0.5 时 = sqrt(20k*4k) ≈ 8944 Hz。
+        // 在 log 频率上插值，听感更均匀。
         return kRearLpFrontHz * (float) Math.pow(kRearLpBackHz / kRearLpFrontHz, r);
+    }
+
+    /** 耳廓陷波中心：rear=0 -> 6 kHz，rear=1 -> 8 kHz（log 插值，约 1/3 倍频程）。 */
+    public static float rearNotchHz(float rear) {
+        final float r = clamp(rear, 0.0f, 1.0f);
+        return kRearNotchFrontHz * (float) Math.pow(kRearNotchBackHz / kRearNotchFrontHz, r);
+    }
+
+    /** 早期反射延迟（秒）：stage=0 走 Er1 那组，否则 Er2；随 rear 线性变长。 */
+    public static float rearReflectionDelaySeconds(float rear, int stage) {
+        final float r = clamp(rear, 0.0f, 1.0f);
+        final float frontMs = stage == 0 ? kRearEr1DelayFrontMs : kRearEr2DelayFrontMs;
+        final float backMs = stage == 0 ? kRearEr1DelayBackMs : kRearEr2DelayBackMs;
+        return (frontMs + (backMs - frontMs) * r) * 0.001f;
+    }
+
+    /**
+     * RBJ cookbook 二阶带通（constant 0 dB peak）系数。b1 恒 0、b2 = -b0，
+     * 所以陷波用「并联」形式 y = x + beta*bp(x)：极点在 a1/a2 里，beta 怎么扫都不破坏稳定，
+     * 且 beta=0 时 y 逐位等于 x（rear=0 时后向链完全透明）。
+     */
+    public static void bandPassCoeffs(float sampleRate, float freqHz, float q,
+            float[] out) {
+        final float f = clamp(freqHz, 20.0f, 0.45f * sampleRate);
+        final float w0 = 2.0f * kPi * f / sampleRate;
+        final float cw = (float) Math.cos(w0);
+        final float alpha = (float) Math.sin(w0) / (2.0f * q);
+        final float inv = 1.0f / (1.0f + alpha);   // 1/a0
+        out[0] = alpha * inv;                      // b0
+        out[1] = 0.0f;                             // b1
+        out[2] = -alpha * inv;                     // b2
+        out[3] = (-2.0f * cw) * inv;               // a1
+        out[4] = (1.0f - alpha) * inv;             // a2
     }
 
     /**
@@ -362,6 +462,24 @@ public final class Spatial {
         private float smDelay = 0.0f;   // 带符号 ITD（帧），+ = 右耳领先
         private float lp = 0.0f;        // 后向一阶低通状态
 
+        // ---- v0.46 ③ 耳廓陷波：并联带通 y = x + beta*bp(x)。
+        //   bp 的极点只由 notchA1/notchA2 决定，beta 怎么扫都不破坏稳定；
+        //   beta=0 时 y 逐位等于 x（rear=0 完全透明）。串联 peaking 的 b0 会带 1 ulp 误差，
+        //   破坏"正前方逐位不变"的跨端断言，所以选并联形式。
+        private float notchB0 = 0.0f;   // bp 的 b0（b1 恒 0，b2 = -b0）
+        private float notchA1 = 0.0f;
+        private float notchA2 = 0.0f;
+        private float notchBeta = 0.0f; // -(1 - 10^(-depth*rear/20))，rear=0 时为 0
+        private float notchZ1 = 0.0f;   // TDF-II 状态
+        private float notchZ2 = 0.0f;
+        // ---- v0.46 ④ 早期反射：两路一阶低通状态
+        private final float[] erLp = new float[2];
+        /** bandPassCoeffs 的暂存（构造时分配；process 里不 new）。 */
+        private final float[] bpCoeffs = new float[5];
+        /** 两路反射的延迟/强度暂存（同上，避免每块分配）。 */
+        private final float[] erDelay = new float[2];
+        private final float[] erGain = new float[2];
+
         // ITD 历史：单声道化后的信号。hist[0] 是 P0 用的；hist[1] 留给 P1 的 side 通路。
         private final float[][] hist = new float[kSpatialHistoryChannels][kSpatialHistoryFrames];
         private int histPos = 0;
@@ -386,6 +504,15 @@ public final class Spatial {
             smRear = 0.0f;
             smDelay = 0.0f;
             lp = 0.0f;
+            // v0.46：陷波与反射状态一并清零（与 C++ Reset 逐行对应）
+            notchB0 = 0.0f;
+            notchA1 = 0.0f;
+            notchA2 = 0.0f;
+            notchBeta = 0.0f;
+            notchZ1 = 0.0f;
+            notchZ2 = 0.0f;
+            erLp[0] = 0.0f;
+            erLp[1] = 0.0f;
             for (int ch = 0; ch < kSpatialHistoryChannels; ++ch) {
                 for (int i = 0; i < kSpatialHistoryFrames; ++i) hist[ch][i] = 0.0f;
             }
@@ -508,7 +635,32 @@ public final class Spatial {
             final float dl = smDelay > 0.0f ? smDelay : 0.0f;
             final float dr = smDelay < 0.0f ? -smDelay : 0.0f;
 
-            // ---- 逐样本：写历史 -> 双耳分数延时读取 -> 后向闷化(干湿混合) -> 等功率/距离增益
+            // ---- v0.46 ③ 耳廓陷波：并联带通，参数按本块的 smRear 重算。
+            //   beta = -(1 - 10^(-depth*rear/20))：rear=0 -> 0（y 与 x 逐位相同，纯旁路），
+            //   rear=1 -> -(1 - 10^(-15/20)) = -0.822，即中心频率处压到 17.8%（-15 dB）。
+            bandPassCoeffs(sampleRate, rearNotchHz(smRear), kRearNotchQ, bpCoeffs);
+            final float notchBetaTarget = -(1.0f - (float) Math.pow(10.0f,
+                    -kRearNotchDepthDb * smRear * 0.05f));
+            // 平滑到新系数/增益：beta 与极点都朝目标走，块间不会出现参数跳变。
+            notchB0 += (bpCoeffs[0] - notchB0) * k;
+            notchA1 += (bpCoeffs[3] - notchA1) * k;
+            notchA2 += (bpCoeffs[4] - notchA2) * k;
+            notchBeta += (notchBetaTarget - notchBeta) * k;
+
+            // ---- v0.46 ④ 两路早期反射：延迟与强度都随 smRear 走。
+            //   rear=0 时强度为 0，读历史的结果乘 0 —— 但**不要**跳过循环里的读取，
+            //   否则两条路径的 histPos 推进节奏会不同（这里保持结构一致，代价可忽略）。
+            final float[] erDelay = this.erDelay;
+            final float[] erGain = this.erGain;
+            for (int s = 0; s < 2; ++s) {
+                erDelay[s] = rearReflectionDelaySeconds(smRear, s) * sampleRate;
+                erGain[s] = (s == 0 ? kRearEr1Gain : kRearEr2Gain) * smRear;
+            }
+            final float erAlpha = 1.0f
+                    - (float) Math.exp(-2.0f * kPi * kRearErLpHz / sampleRate);
+
+            // ---- 逐样本：写历史 -> 双耳分数延时读取 -> 后向闷化(干湿混合)
+            //      -> 陷波(并联) + 早期反射 -> 等功率/距离增益
             final float alpha = 1.0f
                     - (float) Math.exp(-2.0f * kPi * cutoffHz / sampleRate);
             final boolean ramp = frames > 1;
@@ -526,14 +678,37 @@ public final class Spatial {
                 final float t = ramp ? (float) i / (float) (frames - 1) : 1.0f;
                 final float l = readHistory(dlStart + dlSpan * t);
                 final float r = readHistory(drStart + drSpan * t);
+                // 后向链是"单声道染色"：以 mid 为输入，只产出**相对 mid 的增量** rearExtra，
+                // 再原样加到两耳上。这样 ITD（l 与 r 各自的延时差）完全不被破坏 ——
+                // 如果直接把染色后的单声道信号写给两耳，ITD 就被抹掉了。
                 final float mid = 0.5f * (l + r);
                 lp += alpha * (mid - lp);
-                // 干湿混合：前方全频；正后方只剩 4 kHz 以下（一阶），两条线索叠加才够"听到身后"。
+                // 干湿混合：前方全频；后向按 smRear 混入一阶低通版本（v0.46 截止放宽到 6 kHz）。
                 final float dull = smRear * (lp - mid);
+                float colored = mid + dull;
+
+                // ③ 并联陷波：bp 是二阶带通（b1=0、b2=-b0），colored + beta*bp 在 bp 中心处压 beta。
+                //   TDF-II（转置直接II型）：y = b0*x + z1；z1 = -a1*y + z2；z2 = -b0*x - a2*y。
+                final float bp = notchB0 * colored + notchZ1;
+                notchZ1 = -notchA1 * bp + notchZ2;
+                notchZ2 = -notchB0 * colored - notchA2 * bp;
+                colored += notchBeta * bp;
+
+                // ④ 两路早期反射（带一阶低通，模拟墙面/肩部吸高频），与干声并联相加。
+                float wet = 0.0f;
+                for (int s = 0; s < 2; ++s) {
+                    final float ref = readHistory(erDelay[s]);
+                    erLp[s] += erAlpha * (ref - erLp[s]);
+                    wet += erGain[s] * erLp[s];
+                }
+                // 相对 mid 的增量：rear=0 时 dull=0、beta=0、wet=0 -> rearExtra 恒等于 0，
+                // 输出 (l + 0) 与旧实现逐位相同（见 SpatialCheck 的逐位断言）。
+                final float rearExtra = (colored + wet) - mid;
+
                 final float gl = gainL + (targetL - gainL) * t;
                 final float gr = gainR + (targetR - gainR) * t;
-                interleaved[2 * i] = (l + dull) * gl;
-                interleaved[2 * i + 1] = (r + dull) * gr;
+                interleaved[2 * i] = (l + rearExtra) * gl;
+                interleaved[2 * i + 1] = (r + rearExtra) * gr;
             }
 
             gainL = targetL;

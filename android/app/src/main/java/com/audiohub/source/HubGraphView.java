@@ -146,6 +146,8 @@ public class HubGraphView extends View {
 
     /** 双击时间窗（ms）。 */
     private static final long DOUBLE_TAP_MS = 320L;
+    /** 拟合时球半径的像素上限：只用来挡病态输入，正常 ppu 下永远不生效。 */
+    private static final float VIEW_BALL_MAX_PX = 100000f;
 
     private final List<Node> nodes = new ArrayList<>();
     private OnNodeTap onNodeTap;
@@ -298,9 +300,12 @@ public class HubGraphView extends View {
         final GraphFit.Item[] items = new GraphFit.Item[nodes.size()];
         for (int i = 0; i < items.length; ++i) {
             final Node n = nodes.get(i);
+            // v0.45：像素上下限只留一个 1.5 px 的极小下限（与绘制时的 R_PX_FLOOR 同值）。
+            // 以前的 dp(18)/dp(8) 下限 + dp(56)/dp(22) 上限会让拟合迭代把球夹死，
+            // 位置越挤球越大 —— 重叠的真正来源。
             items[i] = new GraphFit.Item((float) n.wx, (float) n.wz,
                     (float) (n.hub ? Scene3D.CFG.HUB_BALL_R : Scene3D.CFG.NODE_BALL_R),
-                    n.hub ? dp(18f) : dp(8f), n.hub ? dp(56f) : dp(22f));
+                    (float) Scene3D.CFG.R_PX_FLOOR, VIEW_BALL_MAX_PX);
         }
         final GraphFit.Result fit = GraphFit.fit(w, h, topReserve, items,
                 dp(LABEL_HALF_W_DP), dp(LABEL_V_DP));
@@ -485,10 +490,10 @@ public class HubGraphView extends View {
             it.dist = (float) Math.hypot(n.wx, n.wz);
             n.azDeg = Scene3D.wrap360(Math.atan2(n.wx, -n.wz) / Scene3D.DEG);
             if (n.hub) {
-                it.rPx = hubRadiusPx(w, h);
+                it.rPx = hubRadiusPx();
                 it.palette = PALETTES[0];
             } else {
-                it.rPx = planetRadiusPx(it.dist);
+                it.rPx = planetRadiusPx();
                 it.palette = n.online ? PALETTES[planetIndex % PALETTES.length] : PALETTE_OFF;
                 planetIndex++;
             }
@@ -500,21 +505,21 @@ public class HubGraphView extends View {
     }
 
     /**
-     * 恒星半径：屏幕短边的 10.5%（约屏宽 1/5 直径），夹在 26~46 dp。
-     * 但不要顶到 1 m 环上（节点离得近时 ppu 大、环也大）：最多占 1 m 环半径的 85%，
-     * 这样环还能从日冕里露出来；节点离得远（环缩成 0 像素）时才退回基径。
+     * 恒星半径（px）= 世界半径 × ppu —— v0.45 起与 PC 侧 projectAll() 同一口径。
+     * <p>以前这里是「屏幕短边 10.5%、夹在 26~46 dp、且不超过 1 m 环的 85%」，
+     * 行星则是「23 dp × 距离系数、夹在 15~28 dp」。那套 dp 夹紧让球的**像素**尺寸
+     * 与 {@link #ppu} 脱钩：节点一多，ppu 被压小、位置互相靠近，球却仍是 15~28 dp，
+     * 于是必然重叠 —— 这就是用户反馈的「手机界面的星球总是重叠」。
+     * <p>现在只有一条规则：屏幕半径 = 世界半径 × ppu，全图按同一比例缩放。
+     * 唯一的例外是 {@link Scene3D.CFG#R_PX_FLOOR}，防止缩到亚像素后彻底看不见。
      */
-    private float hubRadiusPx(int w, int h) {
-        final float base = Math.min(w, h) * 0.105f;
-        final float ringPx = (float) Scene3D.CFG.RING_R * ppu;
-        final float cap = Math.max(ringPx * 0.85f, dp(30));
-        return clamp(Math.min(base, cap), dp(26), dp(46));
+    private float hubRadiusPx() {
+        return Math.max((float) (Scene3D.CFG.HUB_BALL_R * ppu), (float) Scene3D.CFG.R_PX_FLOOR);
     }
 
-    /** 行星半径：基径 23 dp × 距离系数（越远越小，0.70~1.32 倍），夹在 15~28 dp。 */
-    private float planetRadiusPx(float dist) {
-        final double sizeScale = clampDouble(Math.pow(1.0 / Math.max(dist, 0.2), 0.5), 0.70, 1.32);
-        return clamp((float) (dp(23) * sizeScale), dp(15), dp(28));
+    /** 行星半径（px）= 世界半径 × ppu（v0.45：不再叠距离缩放、不再夹 dp）。 */
+    private float planetRadiusPx() {
+        return Math.max((float) (Scene3D.CFG.NODE_BALL_R * ppu), (float) Scene3D.CFG.R_PX_FLOOR);
     }
 
     /** 地面：R=1 m 实线、R=2.4 m 虚线 + 方位 + 45° 距离标注 + 原点 + 左下比例尺。 */
@@ -1149,7 +1154,7 @@ public class HubGraphView extends View {
     private void drawGhostHub(Canvas canvas) {
         final int w = getWidth();
         final int h = getHeight();
-        final float r = hubRadiusPx(w, h);
+        final float r = hubRadiusPx();
         glow(canvas, cx, cy, r * 2.3f, 210, 176, 120, 0.09f, 0.025f);
 
         // 还没点亮的恒星核心：只是一团很淡的金色

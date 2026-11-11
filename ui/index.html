@@ -15,12 +15,10 @@
   <header>
     <div class="brand">
       <h1>AudioHub <span>连接设备</span></h1>
-      <div class="sub">多台设备的声音，汇到这一副耳机里</div>
     </div>
     <div class="hdr-right">
       <div class="addr">
         <div>
-          <div class="k">手机上填</div>
           <div class="v" id="addr">—</div>
         </div>
         <button id="copyBtn">复制</button>
@@ -48,7 +46,6 @@
     <div class="sectrow">
       <div class="sect" style="margin:0">按 IP 直接邀请</div>
     </div>
-    <div class="hint">广播被拦的网络（办公 / 校园 WiFi 常见）用这个。<b>只填 IP 就行</b>，端口默认 47000</div>
     <div class="grid">
       <div class="card" style="max-width:560px">
         <div class="row">
@@ -58,23 +55,8 @@
       </div>
     </div>
 
-    <!-- 连接页底部的星座装饰（v1.8）：只解释"连接后星图长什么样"，不是功能入口 -->
-  <div class="decspacer" aria-hidden="true"></div>
-  <div class="deco" aria-hidden="true">
-    <svg class="deco-const" viewBox="0 0 320 96" fill="none">
-      <path d="M28 62 L86 30 L146 54 L206 24 L268 46 L300 34" stroke="rgba(160,190,255,.28)" stroke-width="1"/>
-      <path d="M86 30 L108 66 L146 54" stroke="rgba(160,190,255,.16)" stroke-width="1"/>
-      <circle cx="28" cy="62" r="2.2" fill="#a9ecff" opacity=".85"/>
-      <circle cx="86" cy="30" r="1.8" fill="#eaf1ff" opacity=".8"/>
-      <circle cx="146" cy="54" r="2.6" fill="#ffd27a"/>
-      <circle cx="206" cy="24" r="1.8" fill="#b7a4ff" opacity=".85"/>
-      <circle cx="268" cy="46" r="2" fill="#a9ecff" opacity=".75"/>
-      <circle cx="300" cy="34" r="1.6" fill="#eaf1ff" opacity=".6"/>
-    </svg>
-    <div class="deco-hint">连接后：汇聚端会亮成恒星，设备成为它周围静止的行星</div>
   </div>
 
-  </div>
 
   <!-- ============ 控制界面：全网图谱 ============ -->
   <div id="screenControl" style="display:none">
@@ -83,18 +65,6 @@
          hub 投影仍是 (460,208)；role/aria 保留，读屏体验不倒退。 -->
     <div class="graphwrap">
       <canvas id="graph" width="920" height="460" role="img" aria-label="全网设备图谱（星图：恒星为汇聚端，行星为设备）"></canvas>
-    </div>
-
-    <!-- 图例 + 操作提示（v1.8）：放在星图下方，而不是压在图里 —— 节点标签/角标可能落在
-         画面任意角落，和图内浮层抢位置会互相遮挡。只做可读性说明，没有交互。 -->
-    <div class="graph-meta" aria-hidden="true">
-      <div class="legend">
-        <span class="lg"><i class="star-dot">✦</i>恒星 · 汇聚端</span>
-        <span class="lg"><i class="planet-dot">●</i>行星 · 设备</span>
-        <span class="lg"><i class="beam-dot">—</i>音频流</span>
-        <span class="lg"><i class="off-dot">┄</i>离线</span>
-      </div>
-      <div class="graph-hint">左键拖动摆位（距离即音量） · 空白拖动旋转视角 · 滚轮缩放 · 右键星球菜单</div>
     </div>
 
     <!-- 切换后的同步状态：已切换，正在同步… / 已同步（vN） -->
@@ -116,7 +86,6 @@
       <button class="scanbtn" id="ctrlAddBtn">添加设备</button>
     </div>
     <div id="ctrlAddPanel" style="display:none">
-      <div class="hint">扫描附近，或直接填对端地址。会话不会中断。</div>
       <div class="grid" id="ctrlPeers"></div>
       <div class="grid">
         <div class="card" style="max-width:560px">
@@ -131,7 +100,6 @@
     <div class="hubbar">
       <span class="hublabel">汇聚端</span>
       <span class="hubnow" id="hubNow">—</span>
-      <span class="hubnote" id="hubNote">承担收流 / 混音 / 播放</span>
       <label class="autochk">
         <input type="checkbox" id="autoAccept">
         <span>自动同意连接请求</span>

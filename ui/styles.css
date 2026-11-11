@@ -102,7 +102,6 @@ h1 {
   text-shadow: 0 0 26px rgba(120, 180, 255, .22);
 }
 h1 span { color: var(--cyan-soft); font-weight: 300; }
-.sub { color: var(--dim); font-size: 12px; margin-top: 4px; letter-spacing: .05em; }
 
 .addr {
   display: flex; align-items: center; gap: 10px;
@@ -111,14 +110,9 @@ h1 span { color: var(--cyan-soft); font-weight: 300; }
   border-radius: var(--radius-s); padding: 7px 10px 7px 12px;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, .06), 0 0 22px rgba(80, 190, 255, .07);
 }
-.addr .k {
-  font-size: 9.5px; color: var(--cyan-soft);
-  letter-spacing: .16em; text-transform: uppercase;
-}
 .addr .v {
   font-size: 15px; font-weight: 600;
   font-variant-numeric: tabular-nums; letter-spacing: .03em;
-  margin-top: 1px;
 }
 .addr button {
   background: transparent; color: var(--cyan-soft);
@@ -360,34 +354,6 @@ h1 span { color: var(--cyan-soft); font-weight: 300; }
 }
 #graph:active { cursor: grabbing; }
 
-/* 图例 + 操作提示：放在星图下方单独一行（压在图上会和节点标签/角标互相遮挡） */
-.graph-meta {
-  display: flex; align-items: center; justify-content: space-between;
-  gap: 10px; flex-wrap: wrap;
-  flex: 0 0 auto;
-  margin: 2px 2px 0;
-}
-.legend {
-  display: flex; align-items: center; gap: 13px; flex-wrap: wrap;
-  padding: 4px 11px;
-  background: rgba(8, 13, 28, .45);
-  border: 1px solid var(--line-faint);
-  border-radius: 999px;
-  backdrop-filter: blur(8px);
-  font-size: 10.5px; letter-spacing: .03em; color: var(--dim);
-}
-.legend .lg { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
-.legend i { font-style: normal; font-size: 12px; line-height: 1; }
-.legend .star-dot { color: var(--gold); text-shadow: 0 0 9px rgba(255, 200, 110, .8); }
-.legend .planet-dot { color: var(--cyan); text-shadow: 0 0 9px rgba(110, 220, 255, .8); }
-.legend .beam-dot { color: var(--violet); text-shadow: 0 0 9px rgba(170, 150, 255, .8); }
-.legend .off-dot { color: #7d879c; }
-.graph-hint {
-  font-size: 10.5px; letter-spacing: .02em;
-  color: rgba(163, 179, 209, .72);
-  text-align: right;
-}
-
 /* 切换后的同步状态 */
 .graphstatus {
   font-size: 12px; color: var(--dim); letter-spacing: .02em;
@@ -443,7 +409,6 @@ h1 span { color: var(--cyan-soft); font-weight: 300; }
   font-variant-numeric: tabular-nums; letter-spacing: .02em;
 }
 .hubnow.off { color: var(--warn); font-weight: 400; }
-.hubnote { font-size: 11.5px; color: var(--faint); }
 
 /* ---------- 扫描按钮 ---------- */
 .sectrow {
@@ -494,22 +459,6 @@ h1 span { color: var(--cyan-soft); font-weight: 300; }
 }
 .autochk:hover { color: var(--text); }
 
-/* ---------- 连接页底部：星座装饰（只解释星图语义，不是功能入口） ---------- */
-.decspacer { flex: 1 1 auto; min-height: 14px; }
-.deco {
-  flex: 0 0 auto;
-  display: flex; flex-direction: column; align-items: center; gap: 6px;
-  padding: 2px 0 12px;
-  opacity: .92;
-  pointer-events: none;
-}
-.deco-const { width: 320px; max-width: 62%; height: auto; }
-.deco-hint {
-  font-size: 12px; letter-spacing: .05em;
-  color: rgba(163, 179, 209, .8);
-  text-shadow: 0 1px 10px rgba(3, 5, 12, .9);
-}
-
 /* ---------- 窄屏 / 小窗口：图谱与菜单不挤爆 ---------- */
 @media (max-width: 760px) {
   body { padding: 10px 12px 8px; }
@@ -519,25 +468,10 @@ h1 span { color: var(--cyan-soft); font-weight: 300; }
   .autochk { margin-left: 0; }
   .stats { gap: 14px; }
   .graphwrap { min-height: 120px; }
-  .graph-hint { display: none; }
 }
 @media (max-height: 640px) {
   body { padding: 8px 12px 6px; }
   header { padding-bottom: 7px; }
-  .sub { display: none; }
-  .addr .k { display: none; }
   .graphwrap { min-height: 90px; }
   .sect, .sectrow { margin: 9px 0 6px; }
-  .deco { display: none; }
-}
-
-/* v0.32：握手口那一格里追加的最近命令名（CONN-REQ / GRAPH / POS …）。
-   它只在收到过包时出现，用弱化的等宽小字，避免和主数字抢视线。 */
-.hsCmd {
-  margin-left: 4px;
-  padding: 0 4px;
-  border-radius: 4px;
-  font-size: 0.86em;
-  opacity: 0.72;
-  background: rgba(120, 170, 255, 0.14);
 }

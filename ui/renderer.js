@@ -523,17 +523,17 @@ function openNodeMenu (nodeId, clientX, clientY) {
 
   // ① 切换汇聚端
   if (node.isHub) {
-    el.appendChild(menuItem('切换汇聚端到此设备', '它已经是汇聚端', true, null))
+    el.appendChild(menuItem('切换汇聚端到此设备', '', true, null))
   } else {
     let hint = ''
-    if (node.isSelf) hint = '本机将负责收流 / 混音 / 播放'
-    else if (!node.online) hint = '该设备当前离线'
+    if (node.isSelf) hint = '本机'
+    else if (!node.online) hint = '离线'
     el.appendChild(menuItem('切换汇聚端到此设备', hint, false, () => doSwitchTo(node, graph)))
   }
 
   // ② 位置复位（只对显式摆位过的节点出现）
   if (node.posSet) {
-    el.appendChild(menuItem('位置复位', '回到自动排位（全网同步）', false, () => {
+    el.appendChild(menuItem('位置复位', '', false, () => {
       clearPlacement(node.id)
       pumpSpatial()
     }))
@@ -543,7 +543,7 @@ function openNodeMenu (nodeId, clientX, clientY) {
   if (node.isHub) {
     const placed = graph.nodes.filter((n) => n.posSet).map((n) => n.id)
     el.appendChild(menuItem('所有设备位置复位',
-      placed.length ? ('清掉 ' + placed.length + ' 台设备的摆位') : '当前都是自动排位',
+      placed.length ? (placed.length + ' 台') : '',
       placed.length === 0,
       () => {
         for (const nodeId of placed) clearPlacement(nodeId)
@@ -583,7 +583,7 @@ function audibleSuffix (state) {
   const frames = Number.isFinite(state.renderFrames) ? state.renderFrames : 0
   const audible = Number.isFinite(state.renderAudibleFrames) ? state.renderAudibleFrames : 0
   if (frames < 1000 || audible > 0) return ''
-  if (state.renderingAsHub === false) return '（本机不是汇聚端，按协议本就静音）'
+  if (state.renderingAsHub === false) return '（本机非汇聚端）'
   const mixed = Number.isFinite(state.mixedSources) ? state.mixedSources : 0
   if (mixed === 0) return '（' + whyNoSource(state) + '）'
   // v0.34：到这一步已经是「数据真的流进来了、混音器也真的在混、混出来全是零」。
@@ -592,8 +592,7 @@ function audibleSuffix (state) {
   // 的应用声音，手机没在放媒体声音（或放的是通话/铃声/被标记成别的声音）时，
   // 采到的就是一片零。所以这里必须直接说出「去手机上做什么」，
   // 而不是留一句「混出来是静音」让用户自己猜。
-  return '（音频数据到了 CPU、混音器也在混，但内容全是零 —— 问题在采集端：' +
-    '手机没在播放媒体声音，或放的声音不属于媒体类型）'
+  return '（采集端无声）'
 }
 
 // 「一路都没混进来」只是现象，真正的原因最少有五种，用户看这句才知道下一步该做什么：
@@ -607,9 +606,9 @@ function whyNoSource (state) {
   const list = Array.isArray(state.sources) ? state.sources : []
   if (list.length === 0) {
     const pend = Array.isArray(state.pending) ? state.pending.length : 0
-    if (pend > 0) return '对端已请求连接，等你点「同意」'
+    if (pend > 0) return '对端已请求，等你同意'
     const peers = Array.isArray(state.peers) ? state.peers.length : 0
-    if (peers > 0) return '已经发现对端，但它还没开始送音'
+    if (peers > 0) return '对端还没开始送音'
     // 图谱比发现列表更权威：图谱里除了自己没有别的节点 = 对端确实没连上，
     // 这时候去查音量、输出设备、混音参数全是白费力气。
     const nodes = state.graph && Array.isArray(state.graph.nodes) ? state.graph.nodes : []
@@ -620,8 +619,8 @@ function whyNoSource (state) {
       // 那么问题必然在网络层（防火墙 / 地址不对 / 发送端没点「送入」），不可能是混音；
       // 它 >0 说明包到了、只是没建成流，排查方向完全不同。
       const rx = Number.isFinite(state.rxPackets) ? state.rxPackets : 0
-      if (rx === 0) return '星空里只有你自己，对端还没连上（本机一个包都没收到）'
-      return '星空里只有你自己（收到 ' + fmtNumber(rx, 0) + ' 个包，但没建成流）'
+      if (rx === 0) return '只有你自己（0 包）'
+      return '只有你自己（' + fmtNumber(rx, 0) + ' 包未成流）'
     }
     // v0.32：图谱里看得见对方、对方却连不上，这在现场有两种完全不同的成因，
     // 而用户看到的都是「对方就在星空里，但它还没开始送音」。分界线是握手口
@@ -643,51 +642,47 @@ function whyNoSource (state) {
     // 这类故障跟防火墙、AP 隔离、协议版本全都无关，先去关代理的 TUN 模式。
     const hijacked = others.filter((n) => n && n.egressHijacked)
     if (hijacked.length > 0) {
-      return '本机发往 ' + hijacked[0].id + ' 的包被代理 TUN 接走了' +
-        '（源地址会变成 ' + (hijacked[0].egressSrc || '代理地址') + '，对方的包也回不来）' +
-        ' —— 请先关掉 Clash / 代理软件的 TUN（增强）模式'
+      return '发往 ' + hijacked[0].id + ' 被代理接走（关掉 TUN）'
     }
     if (others.length > 0 && others.every((n) => !n.online)) {
       if (hs === 0 && disco > 0) {
-        return '对端在图谱里，但握手口 ' + (hsPort || 'audioPort+2') +
-          ' 一个包都没收到（广播能看见它、这个端口被挡了，所以两端互报「没回应」）'
+        return '握手口 ' + (hsPort || 'audioPort+2') + ' 被挡（广播可见）'
       }
-      if (hs === 0) return '对端在图谱里但已离线（握手口也没收到过包）'
-      return '对端在图谱里，握手口收到过 ' + fmtNumber(hs, 0) + ' 个包，但没能建成流' +
-        (state.hsLastCmd ? '（最近命令：' + state.hsLastCmd + '）' : '')
+      if (hs === 0) return '对端离线'
+      return '握手 ' + fmtNumber(hs, 0) + ' 包未成流' +
+        (state.hsLastCmd ? '（' + state.hsLastCmd + '）' : '')
     }
     if (others.length > 0) {
       if (hs === 0 && disco > 0) {
-        return '对端就在星空里，但它没开始送音（握手口 ' + (hsPort || 'audioPort+2') + ' 一个包都没收到）'
+        return '对端没开始送音（握手口 ' + (hsPort || 'audioPort+2') + ' 被挡）'
       }
-      return '对端就在星空里，但它还没开始送音'
+      return '对端还没开始送音'
     }
-    return '还没有任何对端连上来'
+    return '还没有对端'
   }
   const muted = list.filter((x) => x.muted)
-  if (muted.length === list.length) return '收到的 ' + list.length + ' 路音源全被你静音了'
+  if (muted.length === list.length) return list.length + ' 路音源全被静音'
   const unconfirmed = list.filter((x) => !x.confirmed)
-  if (unconfirmed.length === list.length) return '流已收到，但都还没被确认（看界面上的「自动同意」）'
+  if (unconfirmed.length === list.length) return list.length + ' 路流未确认（看自动同意）'
   const silent = list.filter((x) => !x.packets || x.packets < 10)
-  if (silent.length === list.length) return '流刚建立，还没收到足够的包'
-  return '收到了 ' + list.length + ' 路流，但没有一路通过混音条件'
+  if (silent.length === list.length) return '流刚建立，包不够'
+  return list.length + ' 路流都没进混音'
 }
 
 function audibleTitle (state) {
   const frames = Number.isFinite(state.renderFrames) ? state.renderFrames : 0
   const audible = Number.isFinite(state.renderAudibleFrames) ? state.renderAudibleFrames : 0
-  if (frames < 1000) return '已写进声卡、且至少一个声道非零的帧 / 总帧数（刚启动，还没攒够数据）'
-  if (audible > 0) return '已写进声卡、且至少一个声道非零的帧 / 总帧数'
+  if (frames < 1000) return '出声帧 / 总帧数（刚启动）'
+  if (audible > 0) return '出声帧 / 总帧数'
   if (state.renderingAsHub === false) {
-    return '本机不是汇聚端：协议规定混音输出恒为静音，所以这里恒为 0 —— 这是正确行为，不是故障'
+    return '本机非汇聚端，恒为 0 是正常的'
   }
   const mixed = Number.isFinite(state.mixedSources) ? state.mixedSources : 0
   if (mixed === 0) {
-    return '本机是汇聚端，但没有任何一路音源真正混进来：' + whyNoSource(state)
+    return whyNoSource(state)
   }
   const mf = Number.isFinite(state.mixedFrames) ? state.mixedFrames : 0
-  return '混入了 ' + mixed + ' 路、共 ' + fmtNumber(mf, 0) + ' 帧被混音，但混出来全是零：' +
-    '音频数据进来了却没有声音，说明采集端抓到的就是静音（它没在播放媒体声音）'
+  return '混入 ' + mixed + ' 路共 ' + fmtNumber(mf, 0) + ' 帧，全是零：采集端没有声音'
 }
 
 // 接收侧那一格（v0.31）。为什么单独抽出来：
@@ -705,6 +700,9 @@ function rxSpan (state) {
     : '已收到 ' + rx + ' 个包（来自 ' + senders + ' 个来源' +
       (bad > 0 ? '，其中 ' + bad + ' 个解析失败' : '') + '），监听端口 ' + (port || '未知') + '。' +
       (state.rxLastReject ? '最近一次拒收：' + state.rxLastReject : '')
+  // v0.45：正常收流时不占位（码率/出声已经说明在收）。只有「一个包都没收到」
+  // 或「收到了但有解析失败」这两种需要用户动手的情况下才出现。
+  if (rx > 0 && bad === 0) return ''
   const text = rx === 0 ? '未收到包' : fmtNumber(rx, 0) + ' 包'
   return '<span title="' + title + '">接收 <b>' + text + '</b></span>'
 }
@@ -726,17 +724,16 @@ function hsSpan (state) {
   if (hs === 0) {
     title = '握手口 ' + (port || '未知') + ' 还没收到过任何包。' +
       (disco > 0
-        ? '但发现广播（47300）已经看到 ' + disco + ' 台设备 —— 说明"广播能到、这个端口被挡"。' +
-          '两端会互报"没回应"，音频口也会一直是 0 包。请针对这个端口查防火墙/子网隔离。'
-        : '发现广播也没有看到任何设备，先确认两端在同一网络。')
+        ? '广播可见 ' + disco + ' 台，此端口被拦（查防火墙/子网隔离）。'
+        : '发现广播也没看到设备，先确认在同一网络。')
   } else {
     title = '握手口 ' + (port || '未知') + ' 已收到 ' + hs + ' 个包（最近 10 秒 ' + recent + ' 个）' +
       (cmd ? '，最近命令 ' + cmd : '') + (line ? '：' + line : '') +
       '。包到了却连不上，方向是协议/版本，不是网络。'
   }
-  const text = hs === 0 ? '未收到' : fmtNumber(hs, 0)
-  return '<span title="' + title + '">握手 <b>' + text + '</b>' +
-    (hs > 0 && cmd ? '<span class="hsCmd">' + cmd + '</span>' : '') + '</span>'
+  // v0.45：握手正常时不占位。只有 0 包（两端互相看不见）才必须让用户看到。
+  if (hs > 0) return ''
+  return '<span title="' + title + '">握手 <b>未收到</b></span>'
 }
 
 // v0.36：本机真实网卡清单。存在的意义是把"我的包到底从哪张卡出去"变成
@@ -754,8 +751,10 @@ function egressSpan (state) {
       '关掉代理的 TUN / 增强模式，或让两端处在同一网段。'
     : '本机网卡：' + nics.join('；') +
       '。发往每个对端的源地址都会是其中一张，没有被代理接管。'
-  const text = bad.length > 0 ? '⚠ 被代理接管' : nics.length + ' 张'
-  return '<span title="' + title + '">网卡 <b>' + text + '</b></span>'
+  // v0.45：平时不占位。只有真的被代理接管时才冒出来 —— 正常时它只是一句
+  // 「网卡 2 张」，对用户没有任何信息量，却一直占着底栏。
+  if (bad.length === 0) return ''
+  return '<span title="' + title + '">网卡 <b>⚠ 被代理接管</b></span>'
 }
 
 function renderSyncLine () {
@@ -783,12 +782,12 @@ async function doSwitchTo (node, graph) {
   const nodeId = node.id
   const fromVersion = graph ? graph.version : (lastState ? collectGraph(lastState).version : 0)
   pendingSwitch = { nodeId: nodeId, fromVersion: fromVersion, timer: null }
-  setSync('已切换，正在同步…', '')
+  setSync('正在同步…', '')
   // 兜底：6 秒还没等到新图谱就说明同步没成
   pendingSwitch.timer = setTimeout(() => {
     if (pendingSwitch && pendingSwitch.nodeId === nodeId) {
       pendingSwitch = null
-      setSync('仍未收到新图谱，请检查网络或音频核心状态', 'warn')
+      setSync('切换未确认', 'warn')
     }
   }, 6000)
 
@@ -827,7 +826,6 @@ document.addEventListener('mousedown', (ev) => {
 
 function renderHubBar (state, graph) {
   const nowEl = $('hubNow')
-  const noteEl = $('hubNote')
   if (nowEl) {
     const hub = graph.hubNode
     if (hub && !hub.ghost) {
@@ -837,16 +835,6 @@ function renderHubBar (state, graph) {
     } else {
       nowEl.textContent = graph.hubId ? '汇聚端未知（' + graph.hubId + '）' : '汇聚端未知'
       nowEl.classList.add('off')
-    }
-  }
-  if (noteEl) {
-    if (graph.isHubSelf) {
-      noteEl.textContent = '本机承担收流 / 混音 / 播放'
-    } else if (state.pcSource) {
-      const hubName = graph.hubNode && !graph.hubNode.ghost ? graph.hubNode.name : '远端'
-      noteEl.textContent = '本机声音正送往 ' + hubName
-    } else {
-      noteEl.textContent = '本机空闲（未作为音源发送）'
     }
   }
 }
@@ -879,7 +867,7 @@ function renderRequestBar (container, state) {
     el.innerHTML =
       '<span class="who"></span>' +
       '<span class="ip"></span>' +
-      '<span class="ask">邀请你把本机声音送过去</span>' +
+      '<span class="ask">邀请你送音</span>' +
       '<button class="btn ok">同意</button>' +
       '<button class="btn no">拒绝</button>'
     el.querySelector('.who').textContent = inv.name || inv.ip
@@ -896,7 +884,7 @@ function renderRequestBar (container, state) {
     el.innerHTML =
       '<span class="who"></span>' +
       '<span class="ip"></span>' +
-      '<span class="ask">请求把声音送到这里</span>' +
+      '<span class="ask">请求送音</span>' +
       '<button class="btn ok">同意</button>' +
       '<button class="btn no">拒绝</button>'
     el.querySelector('.who').textContent = p.name || ('设备 ' + p.streamId)
@@ -923,7 +911,7 @@ function renderPeers (container, state) {
       '<div class="db"></div></div>' +
       '<div class="row"><span class="ask"></span></div>' +
       '<div class="row" style="margin-top:10px">' +
-        '<button class="btn go">邀请它把声音送过来</button>' +
+        '<button class="btn go">邀请</button>' +
       '</div>'
     el.querySelector('.name').appendChild(document.createTextNode(p.name || ''))
     el.querySelector('.db').textContent = role
@@ -932,9 +920,9 @@ function renderPeers (container, state) {
       const res = await window.hub.invitePeer({ ip: p.ip, audioPort: p.audioPort })
       if (res && res.ok) {
         watchInvite(p.ip, p.name)
-        showNotice('已邀请 ' + (p.name || p.ip) + '，等待对方确认…')
+        showNotice('已邀请 ' + (p.name || p.ip))
       } else {
-        showNotice('邀请发送失败：音频核心没有响应')
+        showNotice('邀请失败')
       }
     })
     container.appendChild(el)
@@ -1079,7 +1067,7 @@ function checkInvites (state) {
     }
     if (now >= w.until) {
       invitesWaiting.delete(ip)
-      showNotice('邀请 ' + w.name + ' 无响应：确认对方 App 在前台、且与电脑在同一网络')
+      showNotice('邀请 ' + w.name + ' 无响应')
     }
   }
 }
@@ -1169,17 +1157,22 @@ function render (state) {
   const silentEl = $('silentWarn')
   if (silentEl) {
     if (silentWarn) {
+      // v0.45：界面上只留一句话，完整归因挪进 title（悬停才看见，不占观感）。
       silentEl.textContent = !neverAudible
-        ? ('已收到音源，但当前是静音：本功能送的是发送端「正在播放的声音」（音乐 / 视频 / 游戏），不是麦克风。' +
-           '请确认发送端正在播放媒体声音。')
+        ? ('收到音源但静音 —— 发送端在放声音吗？')
         : (!asHub
-          ? ('本机不是汇聚端，混音输出按协议恒为静音 —— 此刻' + framesNow + ' 帧全是零是正确的（声音应该在汇聚端那台设备上）。' +
-             '如果两台都听不到，问题不在本机输出：请看图谱里谁是汇聚端、那台设备的状态。')
+          ? ('本机不是汇聚端，输出静音是正确的')
           : (mixedSources === 0
-            ? ('本机是汇聚端，但一路音源都没混进来：送进声卡的 ' + framesNow + ' 帧全是零。' +
-               '这是"没混进去"，不是音量或输出设备的问题 —— 查：音源是否已确认、是否真的在没在发包。')
-            : ('本机是汇聚端，混入了 ' + mixedSources + ' 路、却混出全零：' + framesNow + ' 帧没有一帧有声音。' +
-               '数据进来了但内容是静音 —— 说明采集端抓到的就是无声，请确认发送端正在播放媒体声音。')))
+            ? ('一路音源都没混进来（' + framesNow + ' 帧全零）')
+            : ('混入 ' + mixedSources + ' 路却全是零')))
+      silentEl.title = !neverAudible
+        ? ('送的是发送端「正在播放的声音」（音乐 / 视频 / 游戏），不是麦克风。')
+        : (!asHub
+          ? ('此刻 ' + framesNow + ' 帧全是零是正确的，声音应该在汇聚端那台设备上。' +
+             '如果两台都听不到，请先看图谱里谁是汇聚端。')
+          : (mixedSources === 0
+            ? ('这是「没混进去」，不是音量或输出设备的问题 —— 查：音源是否已确认、是否真的在发包。')
+            : ('数据进来了但内容全是静音，说明采集端抓到的就是无声。')))
       silentEl.classList.remove('hidden')
     } else {
       silentEl.classList.add('hidden')
@@ -1245,8 +1238,12 @@ function render (state) {
       (graph.hasGraph ? '<span>图谱 <b>v' + graph.version + '</b></span>' : '') +
       '<span>总线 <b>' + dbText(state.busLevel) + '</b></span>' +
       '<span>码率 <b>' + fmtNumber(state.kbps, 0) + '</b> kbps</span>' +
-      '<span>坏包 <b>' + (Number.isFinite(state.malformed) ? state.malformed : 0) + '</b></span>' +
-      '<span>渲染欠载 <b>' + (Number.isFinite(state.renderUnderruns) ? state.renderUnderruns : 0) + '</b></span>' +
+      // v0.45：坏包 / 渲染欠载平时恒为 0，属于「出问题才需要看」的数，
+      // 非零时才插进来 —— 底栏原本两行都放不下，一半是这些恒零项。
+      ((Number.isFinite(state.malformed) && state.malformed > 0)
+        ? '<span>坏包 <b>' + state.malformed + '</b></span>' : '') +
+      ((Number.isFinite(state.renderUnderruns) && state.renderUnderruns > 0)
+        ? '<span>渲染欠载 <b>' + state.renderUnderruns + '</b></span>' : '') +
       // 出声判定（v0.27）：这是"汇聚端到底有没有真的出声"的唯一硬证据。
       // 总线电平（busLevel）是取走即清零的采样器，界面每 200ms 轮询就把它抢光了，
       // 谁再看一眼都只剩 -120 —— 以前就是被它误导的。下面两个数从启动起只增不减。
@@ -1267,9 +1264,9 @@ function render (state) {
       // v0.36：出站网卡证据。收发都绑 0.0.0.0，所以"收得到"不代表
       // "发得出去" —— 装了代理 TUN 之后，发往跨网段对端的包会被接走。
       egressSpan(state) +
-      (srcList.length > 0
-        ? '<span>流欠载 <b>' + underrun + '</b> 帧</span>' +
-          '<span>迟到/溢出 <b>' + lateLost + '</b></span>'
+      (srcList.length > 0 && (underrun > 0 || lateLost > 0)
+        ? (underrun > 0 ? '<span>流欠载 <b>' + underrun + '</b> 帧</span>' : '') +
+          (lateLost > 0 ? '<span>迟到/溢出 <b>' + lateLost + '</b></span>' : '')
         : '')
   }
 }
@@ -1293,7 +1290,7 @@ $('scanBtn').addEventListener('click', async () => {
   btn.classList.add('busy')
   btn.textContent = '扫描中…'
   hint.className = 'hint'
-  hint.textContent = '正在向局域网广播探测…'
+  hint.textContent = '扫描中…'
 
   const res = await window.hub.scan()
 
@@ -1303,16 +1300,16 @@ $('scanBtn').addEventListener('click', async () => {
 
   if (!res || !res.ok) {
     hint.className = 'hint warn'
-    hint.textContent = '扫描失败：音频核心没有响应'
+    hint.textContent = '扫描失败'
     return
   }
   const n = (res.peers || []).length
   if (n === 0) {
     hint.className = 'hint warn'
-    hint.textContent = '没有发现设备。请确认：① 手机已打开 App；② 手机和电脑在同一 WiFi / 网段'
+    hint.textContent = '没发现设备（同一 WiFi？）'
   } else {
     hint.className = 'hint ok'
-    hint.textContent = '扫描完成，发现 ' + n + ' 台设备'
+    hint.textContent = '发现 ' + n + ' 台'
   }
   // 立即用扫描结果刷新一次列表，不等下一次 200ms 轮询
   render(lastState)
@@ -1324,21 +1321,21 @@ $('manualInviteBtn').addEventListener('click', async () => {
   const hint = $('scanHint')
   if (!raw) {
     hint.className = 'hint warn'
-    hint.textContent = '请先填对方的地址'
+    hint.textContent = '先填地址'
     return
   }
   const { ip, port } = parsePeerAddress(raw)
   const res = await window.hub.invitePeer({ ip, audioPort: port })
   if (res && res.ok) {
     hint.className = 'hint ok'
-    hint.textContent = '已向 ' + ip + ':' + port + ' 发出邀请，等对方确认'
+    hint.textContent = '已邀请 ' + ip + ':' + port
     watchInvite(ip, ip)
   } else {
     hint.className = 'hint warn'
     // 把内核给的原因说出来：以前一律"地址格式不对或音频核心没响应"，
     // 用户分不清是自己填错、还是没填端口、还是核心没起来。
     const why = (res && res.error) ? res.error : '音频核心没有响应'
-    hint.textContent = '邀请发送失败：' + why
+    hint.textContent = '邀请失败：' + why
   }
 })
 
@@ -1359,10 +1356,10 @@ $('ctrlInviteBtn').addEventListener('click', async () => {
   const res = await window.hub.invitePeer({ ip, audioPort: port })
   if (res && res.ok) {
     watchInvite(ip, ip)
-    showNotice('已邀请 ' + ip + ':' + port + '，等待对方确认…')
+    showNotice('已邀请 ' + ip + ':' + port)
   } else {
     const why = (res && res.error) ? res.error : '音频核心没有响应'
-    showNotice('邀请发送失败：' + why)
+    showNotice('邀请失败：' + why)
   }
 })
 

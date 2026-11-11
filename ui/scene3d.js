@@ -63,19 +63,25 @@
     ringR: 1.0,               // 内圈参考半径（地面 R=1 环）
     camDist: 3.4,             // 默认相机距离：要同时看下 1 m / 2 m 环与后方节点（原 2.6 只够 1 m 环）
     // —— 默认摆放：32 个互不重叠的预计算槽位（SLOTS）——
-    slotRMin: 0.85,
-    slotRMax: 2.2,
-    slotFrontMin: 1.35,       // 前方（-Z）节点投影会贴近 hub，太近会叠球
-    slotRearMax: 1.5,         // 后方（+Z，靠近相机）再远投影会掉出屏幕下沿
-    slotGap: 0.42,            // 槽位间最小平面距离（米），保证球不叠
+    // v0.45：整张房间压到「0.35–2.0 m」这个用户实际会用的尺度上。
+    //   以前 0.85–2.2 是按"1 m 处 = 0 dB"定的；现在音量口径变成
+    //   「0.3 m = 100%、2 m = 1%」，默认槽位必须跟着靠近，否则一进来全是 -30 dB 以下。
+    slotRMin: 0.35,
+    slotRMax: 2.0,
+    slotFrontMin: 0.55,       // 前方（-Z）节点投影会贴近 hub，太近会叠球
+    slotRearMax: 1.45,        // 后方（+Z，靠近相机）再远投影会掉出屏幕下沿
+    slotGap: 0.30,            // 槽位间最小平面距离（米），保证球不叠
     // —— 拖动 / 相机 ——
-    dragRMin: 0.45,           // 拖节点离听者太近会"穿过头"
+    dragRMin: 0.1,            // 最近可拖到 0.1 m（0.3 m 以内音量都是 100%，允许拖更近）
     // 拖拽没有半径上限（v1.6 定稿：距离即音量，拖多远就轻多少）；
     // 落点只受画布可视区域与 ROOM_COORD_MAX（POS 帧绝对坐标上限）约束。
     // —— 球体尺寸：屏幕半径 = 透视投影 × 距离缩放（近大远小，与音量衰减同向）——
-    hubBallR: 0.23,           // 旧 HUB_R=46px 反解：46*2.6/522.71≈0.229
-    nodeBallR: 0.145,         // 旧 NODE_R=29px 反解：29*2.6/522.71≈0.144
-    sizeRef: 1.0,             // 距离 1 m 时缩放 = 1
+    // v0.45：世界半径按新尺度下调（槽位间距 0.30 m）。
+    //   默认相机 3.4 m 时 ppu≈154：hub 0.20 m→31 px、行星 0.105 m→16 px，
+    //   相邻槽位间距 0.30 m→46 px，球之间留得下空隙。
+    hubBallR: 0.20,
+    nodeBallR: 0.105,
+    sizeRef: 0.3,             // 仅留档：与音频侧 kDistanceRefM 同值，实际不再参与半径计算
     sizePow: 0.55,            // scale = (sizeRef/dist)^sizePow
     sizeMin: 0.55,
     sizeMax: 1.5,
@@ -84,13 +90,22 @@
     pitchDefault: 40,         // 默认俯角（D1 修订：16.07° → 40°，避免前排节点被 hub 球遮挡）
     pitchMin: 6,              // 俯仰下限，避免视线与地面平行（unproject 退化）
     pitchMax: 74,
-    distMin: 0.85,            // 滚轮缩放下限（凑近看单颗行星）
-    distMax: 12.0,            // 上限：拉到 12m 也能看清整张房间图
+    // v0.45 缩放范围收紧（用户："缩放应该有限制，不能无限缩放"）：
+    //   原来 0.85~12.0 相差 14 倍，滚两下就飞出去了。
+    //   现在 1.45~6.2 相差 4.3 倍：最近能贴脸看单颗行星，最远刚好装下 2.2 m 的整张房间。
+    //   视口在 d=6.2 时竖直覆盖 460/(522.71/6.2) ≈ 5.45 m，2.2 m 半径的槽位全在画面内。
+    distMin: 1.45,            // 滚轮缩放下限（凑近看单颗行星）
+    distMax: 6.2,             // 缩放下限：一张房间图正好装满视口
     VW: VW, VH: VH, CX: CX, CY: CY,
     near: 0.05,
     focalPx: FOCAL,
-    hubRMin: 26, hubRMax: 64, // 球半径像素夹紧：远处可读、近处不压邻居
-    nodeRMin: 12, nodeRMax: 40,
+    // v0.45：**取消**球半径的像素夹紧。
+    //   以前 hubRMin/hubRMax、nodeRMin/nodeRMax 把屏幕半径夹在固定像素区间里，
+    //   于是"缩放"只改变行星之间的距离、不改变球的大小 —— 用户看到的正是
+    //   「球大小不变而周围星球变远」。现在半径纯 = 世界半径 × ppu，
+    //   整个画面按同一比例缩放，相对大小恒定。
+    //   只留一个极小的下限，防止拉到最远时球退化成亚像素点（1.5 px 已看不见）。
+    rPxFloor: 1.5,
     dprMax: 2,
     labelLOD: 8,              // 非 hub 节点 >8 时只给选中/悬停画名称（报告 §2.1.3/R3）
     animMs: 250               // 切 hub / 节点增删的位置插值时长
@@ -243,11 +258,12 @@
   function buildSlots () {
     const out = []
     const GA = 137.507764               // 黄金角：方向铺得快，相邻槽位不扎堆（度）
+    // v0.45：半径表同步压到 0.35–2.0 m（原来 0.85–2.2）。
     const radii = [
-      2.00, 1.55, 1.20, 1.85, 0.95, 2.10, 1.30, 2.20,
-      1.05, 1.70, 1.45, 0.85, 1.90, 1.15, 2.05, 1.60,
-      1.00, 1.75, 0.90, 2.15, 1.35, 1.50, 1.80, 1.10,
-      1.65, 1.25, 1.95, 0.85, 1.40, 1.85, 1.05, 1.55
+      2.00, 1.55, 1.20, 1.85, 0.95, 1.98, 1.30, 2.00,
+      1.05, 1.70, 1.45, 0.85, 1.90, 1.15, 1.95, 1.60,
+      1.00, 1.75, 0.90, 1.98, 1.35, 1.50, 1.80, 1.10,
+      1.65, 1.25, 1.92, 0.75, 1.40, 1.85, 1.05, 1.55
     ]
     for (let i = 0; i < SLOT_COUNT; i++) {
       let theta = (-90 + i * GA) * DEG
@@ -776,14 +792,19 @@
         const pr = project(view, pos)
         const a = azOf(listener, pos)
         let rPx
-        let sizeScale = 1
+        const sizeScale = 1   // v0.45：恒为 1，见下面注释（尺寸只由世界半径 × ppu 决定）
         if (rec.isHub) {
-          rPx = clamp(CFG.hubBallR * pr.ppu, CFG.hubRMin, CFG.hubRMax)
+          // 纯透视：世界半径 × ppu，没有任何像素夹紧（见 CFG.rPxFloor 注释）。
+          rPx = CFG.hubBallR * pr.ppu
         } else {
-          // 近大远小：距离 1 m 时缩放 = 1，越远越小 —— 与音量衰减同向（用户"用大小模拟远近"）。
-          sizeScale = clamp(Math.pow(CFG.sizeRef / Math.max(a.dist, 0.2), CFG.sizePow), CFG.sizeMin, CFG.sizeMax)
-          rPx = clamp(CFG.nodeBallR * pr.ppu * sizeScale, CFG.nodeRMin, CFG.nodeRMax)
+          // v0.45：**不再**额外叠一层 (sizeRef/dist)^sizePow。
+          //   透视投影的 ppu = focal/depth 本身就已经是"近大远小"；
+          //   再叠一层指数缩放，等于同一个效果乘两遍，拖动时尺寸跳得厉害，
+          //   而且让"相对大小"随距离漂移（用户要求相对大小固定）。
+          //   现在只有一条规则：屏幕半径 = 世界半径 × ppu —— 与缩放严格等比。
+          rPx = CFG.nodeBallR * pr.ppu
         }
+        if (rPx < CFG.rPxFloor) rPx = CFG.rPxFloor
         items.push({
           rec: rec,
           pos: pos,
@@ -892,8 +913,10 @@
     }
 
     function drawGround (scale) {
-      // 地面距离参考环：R=1 m / R=2 m（透视下是椭圆）。远近与音量衰减都靠它判读。
-      const rings = [{ r: 1.0, dash: null }, { r: 2.0, dash: [4, 6] }]
+      // 地面距离参考环：R=0.5 / 1.0 / 2.0 m（透视下是椭圆）。远近与音量衰减都靠它判读。
+      // v0.46：加了 0.5 m 环 —— 音量口径改成 0.3 m=100%/2 m=1% 之后，
+      // 用户实际摆位集中在 0.2–1 m，只有 1/2 m 两道环不够判读。
+      const rings = [{ r: 0.5, dash: [2, 4] }, { r: 1.0, dash: null }, { r: 2.0, dash: [4, 6] }]
       for (let ri = 0; ri < rings.length; ri++) {
         const rr = rings[ri].r
         ctx.beginPath()
@@ -904,7 +927,7 @@
           if (!p.visible) { started = false; continue }
           if (!started) { ctx.moveTo(p.sx, p.sy); started = true } else ctx.lineTo(p.sx, p.sy)
         }
-        ctx.strokeStyle = ri === 0 ? COLOR.ground : COLOR.groundDim
+        ctx.strokeStyle = rings[ri].r === 1.0 ? COLOR.ground : COLOR.groundDim
         ctx.lineWidth = 1
         if (rings[ri].dash) ctx.setLineDash(rings[ri].dash)
         ctx.stroke()

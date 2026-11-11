@@ -9,15 +9,20 @@ package com.audiohub.source;
  * 约束（必须与 {@link HubGraphView} 的绘制一致）：
  *   · 正交映射：屏幕中心是听者/hub 原点，sx = cx + wx*ppu，sy = cy + wz*ppu；
  *   · 画布四边各留约 12% 边距，最远节点「连球半径与标签」也要落在里面；
- *   · 视野半径正常 ∈ [2.6 m, 640 m]：近处不比原来的 2.6 m 更大（避免 1 m 房间巨大化），
+ *   · 视野半径正常 ∈ [0.55 m, 640 m]：近处不比 0.55 m 更大（v0.45 后房间尺度压到
+ *     0.1–2 m，最近可拖到 0.1 m；原先的 2.6 m 会把 0.1 m 的近景挤成一团），
  *     远处最多缩到 ±320 m 坐标上限的对角（≈452 m）也装得下；标签是固定像素，
  *     窄画布 + 远处节点时允许再缩一点（硬上限见 {@link #HARD_MAX_VIEW_RADIUS_M}）；
  *   · 球半径有像素上下限，所以缩放解是 ppu 的不动点，迭代几轮收敛。
  */
 public final class GraphFit {
 
-    /** 最小视野半径（米）：全都在近处时也不放大到比这更近。 */
-    public static final float MIN_VIEW_RADIUS_M = 2.6f;
+    /**
+     * 最小视野半径（米）：全是近处节点时也不放大到比这更近。
+     * v0.46：2.6 → 0.55 —— 新的空间尺度是「0.3 m = 音量 100%、2 m = 1%」，
+     * 2.6 m 的强制近景上限会让 0.1–0.6 m 的节点全挤在屏幕中心。
+     */
+    public static final float MIN_VIEW_RADIUS_M = 0.55f;
     /** 最大视野半径（米）：±320 m 坐标上限的对角 ≈452 m，正常缩放下限给到 640 m。 */
     public static final float MAX_VIEW_RADIUS_M = 640.0f;
     /**
@@ -39,9 +44,9 @@ public final class GraphFit {
         public final float wz;
         /** 球体在世界里的半径（米）。 */
         public final float ballRadiusM;
-        /** 球半径像素下限（远景别缩没了）。 */
+        /** 球半径像素下限（远景别缩没了）。v0.45：应传 1.5f。 */
         public final float ballMinPx;
-        /** 球半径像素上限（近景别撑爆）。 */
+        /** 球半径像素上限。v0.45：应传一个大值，让半径真的等于 ballRadiusM*ppu。 */
         public final float ballMaxPx;
 
         public Item(float wx, float wz, float ballRadiusM, float ballMinPx, float ballMaxPx) {
@@ -78,7 +83,7 @@ public final class GraphFit {
      * @param widthPx       画布宽（像素）
      * @param heightPx      画布高（像素）
      * @param topReservePx  顶部状态文字预留带（像素）
-     * @param items         节点列表（null/空 = 没有节点，按近景 2.6 m 视野画）
+     * @param items         节点列表（null/空 = 没有节点，按近景 MIN_VIEW_RADIUS_M 视野画）
      * @param labelHalfWpx  标签水平半宽（像素，名称/角标）
      * @param labelVpx      标签垂直占用（像素，名称 + 第二行信息/角标）
      */
@@ -106,6 +111,20 @@ public final class GraphFit {
                     final float rpx = it.radiusPx(ppu);
                     final float ax = Math.abs(it.wx);
                     final float az = Math.abs(it.wz);
+                    if (ax <= 1e-4f && az <= 1e-4f) {
+                        // 原点节（典型是汇聚端恒星）：偏移量为 0，下面的 |w|*ppu 约束
+                        // 一条都不会命中，球会连同标签一起顶出画布。这里补两条纯半径约束。
+                        if (it.ballRadiusM > 1e-6f) {
+                            final float allowX = halfW - labelHalfWpx;
+                            final float allowY = halfH - labelVpx;
+                            if (allowX <= 0f || allowY <= 0f) {
+                                next = 0f;
+                                break;
+                            }
+                            next = Math.min(next, Math.min(allowX, allowY) / it.ballRadiusM);
+                        }
+                        continue;
+                    }
                     if (ax > 1e-4f) {
                         final float allow = halfW - labelHalfWpx - rpx;
                         if (allow <= 0f) {

@@ -174,7 +174,7 @@ public class MainActivity extends Activity {
     private static final long SILENT_WARN_DELAY_MS = 3000L;
 
     /** 构建标记：与 APK versionName 保持一致，用于在手机上确认装的是哪一版。 */
-    private static final String BUILD_TAG = "0.44";
+    private static final String BUILD_TAG = "0.46";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {

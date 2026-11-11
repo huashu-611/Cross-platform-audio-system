@@ -144,29 +144,28 @@ public final class SceneCheck {
         // ---- CFG（逐项对齐 PC golden scene.cfg）----
         eq("cfg/camDist", Scene3D.CFG.CAM_DIST, 3.4);
         eq("cfg/pitchDefault", Scene3D.CFG.PITCH_DEFAULT, 40);
-        eq("cfg/slotRMin", Scene3D.CFG.SLOT_R_MIN, 0.85);
-        eq("cfg/slotRMax", Scene3D.CFG.SLOT_R_MAX, 2.2);
-        eq("cfg/slotFrontMin", Scene3D.CFG.SLOT_FRONT_MIN, 1.35);
-        eq("cfg/slotRearMax", Scene3D.CFG.SLOT_REAR_MAX, 1.5);
-        eq("cfg/slotGap", Scene3D.CFG.SLOT_GAP, 0.42);
-        eq("cfg/dragRMin", Scene3D.CFG.DRAG_R_MIN, 0.45);
+        // v0.46：房间尺度压到 0.1–2 m（音量口径 0.3 m=100%、2 m=1%），
+        // 球半径取消像素夹紧（只留 R_PX_FLOOR），缩放范围收紧到 1.45–6.2。
+        eq("cfg/slotRMin", Scene3D.CFG.SLOT_R_MIN, 0.35);
+        eq("cfg/slotRMax", Scene3D.CFG.SLOT_R_MAX, 2.0);
+        eq("cfg/slotFrontMin", Scene3D.CFG.SLOT_FRONT_MIN, 0.55);
+        eq("cfg/slotRearMax", Scene3D.CFG.SLOT_REAR_MAX, 1.45);
+        eq("cfg/slotGap", Scene3D.CFG.SLOT_GAP, 0.30);
+        eq("cfg/dragRMin", Scene3D.CFG.DRAG_R_MIN, 0.1);
         eq("cfg/dragRMax", Scene3D.CFG.DRAG_R_MAX, 2.3);
-        eq("cfg/hubBallR", Scene3D.CFG.HUB_BALL_R, 0.23);
-        eq("cfg/nodeBallR", Scene3D.CFG.NODE_BALL_R, 0.145);
-        eq("cfg/sizeRef", Scene3D.CFG.SIZE_REF, 1);
+        eq("cfg/hubBallR", Scene3D.CFG.HUB_BALL_R, 0.20);
+        eq("cfg/nodeBallR", Scene3D.CFG.NODE_BALL_R, 0.105);
+        eq("cfg/sizeRef", Scene3D.CFG.SIZE_REF, 0.3);
         eq("cfg/sizePow", Scene3D.CFG.SIZE_POW, 0.55);
         eq("cfg/sizeMin", Scene3D.CFG.SIZE_MIN, 0.55);
         eq("cfg/sizeMax", Scene3D.CFG.SIZE_MAX, 1.5);
-        eq("cfg/hubRMin", Scene3D.CFG.HUB_R_MIN, 26);
-        eq("cfg/hubRMax", Scene3D.CFG.HUB_R_MAX, 64);
-        eq("cfg/nodeRMin", Scene3D.CFG.NODE_R_MIN, 12);
-        eq("cfg/nodeRMax", Scene3D.CFG.NODE_R_MAX, 40);
+        eq("cfg/rPxFloor", Scene3D.CFG.R_PX_FLOOR, 1.5);
         eq("cfg/ROOM_R", Scene3D.CFG.ROOM_R, 2.4);
         eq("cfg/RING_R", Scene3D.CFG.RING_R, 1.0);
         eq("cfg/PITCH_MIN", Scene3D.CFG.PITCH_MIN, 6);
         eq("cfg/PITCH_MAX", Scene3D.CFG.PITCH_MAX, 74);
-        eq("cfg/DIST_MIN", Scene3D.CFG.DIST_MIN, 1.2);
-        eq("cfg/DIST_MAX", Scene3D.CFG.DIST_MAX, 6.0);
+        eq("cfg/DIST_MIN", Scene3D.CFG.DIST_MIN, 1.45);
+        eq("cfg/DIST_MAX", Scene3D.CFG.DIST_MAX, 6.2);
         eq("cfg/NEAR", Scene3D.CFG.NEAR, 0.05);
         eq("cfg/LABEL_LOD", Scene3D.CFG.LABEL_LOD, 8);
         eq("cfg/ANIM_MS", Scene3D.CFG.ANIM_MS, 250);
@@ -179,8 +178,8 @@ public final class SceneCheck {
         final double[][] cases = new double[][] {
             new double[] {0, 3.4, 40, 0, 2.1854778729342335, 2.604551106604525, 0, -0.6427876096865394, -0.7660444431189781, 1, 0, 0, 0, 0.7660444431189781, -0.6427876096865394, 0, 3.4, 40}, // default-40deg
             new double[] {90, 2.6, 25, 2.3564002462952898, 1.0988074805258186, 1.4428790095677807e-16, -0.90630778703665, -0.4226182617406995, -5.549534652183772e-17, 6.123233995736766e-17, 0, -1, -0.4226182617406995, 0.90630778703665, -2.5877905075098297e-17, 90, 2.6, 25}, // yaw90-pitch25
-            new double[] {-30, 1.2, 6, -0.5967131372209639, 0.12543415592118415, 1.033537471210529, 0.4972609476841366, -0.10452846326765346, -0.8612812260087742, 0.8660254037844387, 0, 0.49999999999999994, 0.05226423163382672, 0.9945218953682734, -0.09052430460833645, -30, 1.2, 6}, // yaw-30-pitch6
-            new double[] {370, 0.5, 90, 0.05743670944146366, 1.1535140351259827, 0.32573976603403854, -0.04786392453455305, -0.961261695938319, -0.27144980502836547, 0.9848077530122082, 0, -0.17364817766692991, -0.16692134176071158, 0.27563735581699916, -0.9466579708337205, 10, 1.2, 74}, // wrap370-clamp-dist0.5-pitch90
+            new double[] {-30, 1.2, 6, -0.721028374141998, 0.15156627173809753, 1.2488577777127225, 0.4972609476841366, -0.10452846326765347, -0.8612812260087742, 0.8660254037844387, 0, 0.49999999999999994, 0.05226423163382673, 0.9945218953682734, -0.09052430460833646, -30, 1.45, 6}, // yaw-30-clamp-dist1.2-pitch6
+            new double[] {370, 0.5, 90, 0.06940269057510191, 1.3938294591105624, 0.3936022172911299, -0.04786392453455304, -0.961261695938319, -0.27144980502836547, 0.9848077530122082, 0, -0.1736481776669299, -0.16692134176071155, 0.27563735581699916, -0.9466579708337205, 10, 1.45, 74}, // wrap370-clamp-dist0.5-pitch90
             new double[] {0, Double.NaN, 40, 0, 2.1854778729342335, 2.604551106604525, 0, -0.6427876096865394, -0.7660444431189781, 1, 0, 0, 0, 0.7660444431189781, -0.6427876096865394, 0, 3.4, 40}, // NaN-dist-default
             new double[] {0, 3.4, Double.NaN, 0, 0.72, 3.322890308150421, 0, -0.21176470588235297, -0.977320678867771, 1, 0, 0, 0, 0.977320678867771, -0.21176470588235297, 0, 3.4, 12.225788593157482}, // NaN-pitch-implicit-camH
         };
@@ -304,37 +303,37 @@ public final class SceneCheck {
         eq("slots/count", slots.size(), 32);
         final double[][] want = new double[][] {
             new double[] {1.2246467991473532e-16, 0, -2, 0},
-            new double[] {1.0132354423582295, 0, 1.1060533162325958, 137.507764},
-            new double[] {-1.3448309053736653, 0, -0.11802472601894712, 275.015528},
+            new double[] {0.9794609276129552, 0, 1.0691848723581758, 137.507764},
+            new double[] {-1.1954052492210359, 0, -0.10491086757239743, 275.015528},
             new double[] {1.4681613869405632, 0, -1.125611896657441, 52.523292000000026},
             new double[] {-0.16547284959244157, 0, 0.9354778116277035, 190.031056},
-            new double[] {-1.127128918252442, 0, -1.7718861141842837, 327.53882},
+            new double[] {-1.0627215514951596, 0, -1.6706354790880389, 327.53882},
             new double[] {1.255429598456919, 0, 0.3374855897935483, 105.04658400000005},
-            new double[] {-1.3311726396414048, 0, 0.6913605452078785, 242.55434800000006},
-            new double[] {0.4631021428204465, 0, -1.2680837532730678, 20.062112000000127},
-            new double[] {0.5723346236103309, 0, 1.3865183297082013, 157.56987600000002},
+            new double[] {-1.2868002183200244, 0, 0.6683151937009492, 242.55434800000006},
+            new double[] {0.36019055552701396, 0, -0.9862873636568306, 20.062112000000127},
+            new double[] {0.5532568028233199, 0, 1.3403010520512613, 157.56987600000002},
             new double[] {-1.3133147005728918, 0, -0.6145766813499642, 295.07764000000003},
-            new double[] {1.2881215585342871, 0, -0.40403322937501035, 72.58540400000021},
-            new double[] {-0.7521113582476545, 0, 1.2978168225118938, 210.09316800000016},
-            new double[] {-0.2898712441750636, 0, -1.3185122911070648, 347.6009320000001},
-            new double[] {0.023333343035560797, 0, 1.4998185073877388, 179.10869599999955},
-            new double[] {-1.2501193272109778, 0, -1.3227250915188586, 316.6164599999995},
-            new double[] {0.8700034124689605, 0, -1.0322761560223912, 40.12422399999997},
-            new double[] {-0.6891364503804933, 0, -1.8562033705273178, 339.6319879999984},
-            new double[] {-0.9522629356348471, 0, -0.9569196943401799, 315.1397519999999},
-            new double[] {0.5951582723741167, 0, -2.055574525728673, 16.147515999997154},
-            new double[] {1.170874431200338, 0, -1.862539413371241, 32.15527999999824},
-            new double[] {1.8366510055953245, 0, -0.4865316882235783, 75.1630439999995},
-            new double[] {1.4999908614866857, 0, -0.00523597712283564, 89.80000000000001},
-            new double[] {2.1905181824960542, 0, -0.20403453667010327, 84.67857199999855},
-            new double[] {2.02360729410782, 0, -0.863141656527832, 66.90000000000003},
-            new double[] {1.2831263987389263, 0, 0.7769083889747066, 121.19409999999732},
-            new double[] {-1.470931549096937, 0, 0.29387136279550186, 258.7018640000001},
-            new double[] {0.7841022443645501, 0, 0.32815190138482386, 112.7096279999999},
-            new double[] {1.1234730083680147, 0, -1.367738425090311, 39.400000000000034},
-            new double[] {1.5085770165309715, 0, -1.5458963048000665, 44.30000000000001},
+            new double[] {0.8110394998178844, 0, -0.2543912925694509, 72.58540400000021},
+            new double[] {-0.7270409796393993, 0, 1.2545562617614974, 210.09316800000016},
+            new double[] {-0.24692735614912822, 0, -1.123177136868981, 347.6009320000001},
+            new double[] {1.1861905340151337, 0, 0.8339376577496017, 125.10869600000012},
+            new double[] {-1.4379767769201703, 0, 0.18634051904585353, 262.61646},
+            new double[] {0.64444697219923, 0, -0.7646490044610305, 40.12422399999997},
+            new double[] {0.059910869495278386, 0, 1.4487617774210912, 177.63198799999998},
+            new double[] {-0.6348419570898981, 0, -0.6379464628934532, 315.1397519999999},
+            new double[] {1.4484522790797807, 0, 0.06697757257909984, 92.64751599999983},
+            new double[] {-1.036507963693107, 0, 0.8649573638051586, 230.1552799999998},
+            new double[] {0.20002045437640004, 0, -1.486604122768082, 7.663044000000127},
+            new double[] {-1.5059571275505352, 0, -0.27017240788011754, 280.17080799999883},
+            new double[] {-0.9697443757705078, 0, -0.8044848324620351, 309.6785719999998},
+            new double[] {1.431617400599573, 0, -0.820348473699148, 60.18633599999998},
+            new double[] {-0.3799186994308028, 0, 1.1908659797906762, 197.69409999999996},
+            new double[] {-0.3918284837273459, 0, -1.9612420654625806, 348.7018639999998},
+            new double[] {0.6918549214981325, 0, 0.2895457953395505, 112.7096279999999},
+            new double[] {-1.3974777598601813, 0, -0.9503451534554013, 304.2173920000018},
+            new double[] {0.8606768642463023, 0, -1.6376004809938083, 27.725156000000595},
             new double[] {0.26763472621787215, 0, 1.0153184984635535, 165.2329200000006},
-            new double[] {-1.0833772740512453, 0, 1.037445748976443, 226.24068400000638},
+            new double[] {-1.1273577138878497, 0, -1.1772699711355767, 316.2406840000008},
         };
         if (slots.size() == want.length) {
             for (int i = 0; i < want.length; i++) {
@@ -343,7 +342,7 @@ public final class SceneCheck {
                 eqVec(n + "/pos", s.pos, want[i], 0);
                 eq(n + "/az", s.azDeg, want[i][3]);
                 final double r = Math.hypot(s.pos.x, s.pos.z);
-                ok(n + "/radius-0.85..2.2", r >= 0.85 - 1e-9 && r <= 2.2 + 1e-9, "r=" + r);
+                ok(n + "/radius-0.35..2.0", r >= 0.35 - 1e-9 && r <= 2.0 + 1e-9, "r=" + r);
                 ok(n + "/on-ground", s.pos.y == 0, "y=" + s.pos.y);
             }
         }
@@ -361,10 +360,10 @@ public final class SceneCheck {
             }
         }
         ok("slots/distinct", minGap > 0.01, "minGap=" + minGap);
-        eq("slots/minGap-matches-pc", minGap, 0.42045424247286084);
-        ok("slots/pairwise-gap>=0.42", minGap >= 0.42 - 1e-9, "minGap=" + minGap);
-        info("slots: PC v1.3 buildSlots 保底满足两两间距 >= 0.42 m（min=0.420454），Android 忠实移植"
-                + "；PC buildSlots 在 24 次重试后接受冲突（docs §7.2），Android 忠实移植以对齐 golden，故不断言 0.42");
+        eq("slots/minGap-matches-pc", minGap, 0.3074430359170691);
+        ok("slots/pairwise-gap>=0.30", minGap >= 0.30 - 1e-9, "minGap=" + minGap);
+        info("slots: PC v0.45 buildSlots（房间压到 0.35–2.0 m、gap 0.30）保底满足两两间距 >= 0.30 m"
+                + "（min=0.307443），Android 忠实移植以对齐 golden");
     }
 
     private static void checkRoomLayout() {
@@ -379,7 +378,7 @@ public final class SceneCheck {
         final double[][] want = new double[][] {
             new double[] {1.2246467991473532e-16, 0, -2, 0, 0, 0}, // a
             new double[] {0.5, 0, 0.25, -1, 1, 116.56505117707798}, // b
-            new double[] {-1.127128918252442, 0, -1.7718861141842837, 5, 0, 327.53882}, // c
+            new double[] {-1.0627215514951596, 0, -1.6706354790880389, 5, 0, 327.53882}, // c
         };
         final String[] names = new String[] {"a", "b", "c"};
         for (int i = 0; i < want.length; i++) {
@@ -446,37 +445,35 @@ public final class SceneCheck {
     }
 
     private static void checkBallRadius() {
-        // hub 球半径 = clamp(0.23*ppu, 26, 64)
+        // v0.45：hub 球半径 = max(HUB_BALL_R(0.20) * ppu, R_PX_FLOOR(1.5))，无像素上限。
         final double[][] hubs = new double[][] {
-            new double[] {153.73963592739304, 35.3601162633004},
-            new double[] {135.431430914089, 31.14922911024047},
-            new double[] {100, 26},
-            new double[] {1000, 64},
-            new double[] {50, 26},
+            new double[] {153.73963592739304, 30.74792718547861},
+            new double[] {135.431430914089, 27.0862861828178},
+            new double[] {100, 20},
+            new double[] {1000, 200},
+            new double[] {50, 10},
         };
         for (int i = 0; i < hubs.length; i++) {
             eq("hubRadius/" + i, Scene3D.hubRadiusPx(hubs[i][0]), hubs[i][1]);
         }
-        // node 球 = clamp(0.145*ppu*sizeScale, 12, 40)；距离越远不增（近大远小）
+        // node 球 = max(NODE_BALL_R(0.105) * ppu, 1.5)，不再叠距离缩放
         final double[] dists = new double[] {0.6, 1, 1.5, 2, 2.5, 0.9, 1.2};
         final double[] ppus = new double[] {135.431430914089, 125.47027985179088, 114.90593580696238, 105.98242939450488, 98.34503015116586, 127.8206214801088, 121.01970456598025};
-        final double[] rPx = new double[] {26.00783981278619, 18.193190578509675, 13.330924653437721, 12, 12, 19.639731532560056, 15.873562463416928};
+        final double[] rPx = new double[] {14.220300245979344, 13.174379384438042, 12.065123259731049, 11.128155086423012, 10.326228165872415, 13.421165255411424, 12.707068979427925};
         for (int i = 0; i < dists.length; i++) {
             eq("nodeRadius/" + dists[i], Scene3D.nodeRadiusPx(ppus[i], dists[i]), rPx[i]);
         }
-        double prev = Double.MAX_VALUE;
-        for (int i = 0; i < 5; i++) { // 0.6/1.0/1.5/2.0/2.5 依次变远
-            final double r = Scene3D.nodeRadiusPx(ppus[i], dists[i]);
-            ok("nodeRadius/monotonic@" + dists[i], r <= prev + 1e-12, "r=" + r + " prev=" + prev);
-            prev = r;
-        }
-        ok("nodeSizeScale/1m", Math.abs(Scene3D.nodeSizeScale(1) - 1) < 1e-12,
-                "=" + Scene3D.nodeSizeScale(1));
-        eq("nodeSizeScale/2m", Scene3D.nodeSizeScale(2), 0.6830201283771977);
-        eq("nodeSizeScale/3.4m", Scene3D.nodeSizeScale(3.4), 0.55);
-        eq("nodeSizeScale/clamp-far", Scene3D.nodeSizeScale(50), 0.55);
-        eq("hubRadius/clamp-max", Scene3D.hubRadiusPx(1000), 64);
-        eq("hubRadius/clamp-min", Scene3D.hubRadiusPx(10), 26);
+        // 球半径只随 ppu 变；同一个 ppu 下距离完全不参与（v0.45 的核心口径）
+        ok("nodeRadius/ignores-dist", Scene3D.nodeRadiusPx(120, 0.1) == Scene3D.nodeRadiusPx(120, 50),
+                "near=" + Scene3D.nodeRadiusPx(120, 0.1) + " far=" + Scene3D.nodeRadiusPx(120, 50));
+        // hub 与行星的像素比恒为世界半径比 0.20/0.105（相对大小固定）
+        final double ratio = Scene3D.hubRadiusPx(400) / Scene3D.nodeRadiusPx(400, 1);
+        ok("radius/hub:node-ratio-constant", Math.abs(ratio - 0.20 / 0.105) < 1e-9, "ratio=" + ratio);
+        eq("nodeSizeScale/always-1", Scene3D.nodeSizeScale(0.1), 1.0);
+        eq("nodeSizeScale/far-1", Scene3D.nodeSizeScale(50), 1.0);
+        eq("hubRadius/pixel-floor", Scene3D.hubRadiusPx(1), 1.5);
+        eq("nodeRadius/pixel-floor", Scene3D.nodeRadiusPx(1, 5), 1.5);
+        eq("hubRadius/cmd-value", Scene3D.hubRadiusPx(154), 30.8);
     }
 
     private static void checkAllocateSlots() {

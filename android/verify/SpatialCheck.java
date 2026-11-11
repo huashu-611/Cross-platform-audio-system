@@ -30,6 +30,7 @@ public final class SpatialCheck {
         distanceGainClamps();
         itdFullCircle();
         rearCue();
+        rearChainBitExactAtFront();
         listenerYawRotatesScene();
         monoDownmixAndMakeup();
         userGainFoldsIntoOutput();
@@ -44,6 +45,10 @@ public final class SpatialCheck {
         framesEdgeCases();
         resetClearsState();
         defaultLayoutStable();
+        rearNotchIsARealDip();
+        rearEarlyReflectionsArriveLate();
+        frontBackSpectralDistance();
+        rearChainLeavesItdIntact();
 
         System.out.println("---------------------------------------------");
         if (failures == 0) {
@@ -153,13 +158,33 @@ public final class SpatialCheck {
         exact("kMonoMakeup", Spatial.kMonoMakeup, 1.41421356f);
         exact("kRearGain", Spatial.kRearGain, 0.7f);
         exact("kRearLpFrontHz", Spatial.kRearLpFrontHz, 20000.0f);
-        exact("kRearLpBackHz", Spatial.kRearLpBackHz, 4000.0f);
+        // v0.46：后向低通从 4 kHz 放宽到 6 kHz。
+        exact("kRearLpBackHz", Spatial.kRearLpBackHz, 6000.0f);
+        // v0.46 ③ 耳廓陷波（v0.46b：depth 12 -> 15 dB，Q 2.5 -> 1.6）
+        exact("kRearNotchFrontHz", Spatial.kRearNotchFrontHz, 6000.0f);
+        exact("kRearNotchBackHz", Spatial.kRearNotchBackHz, 8000.0f);
+        exact("kRearNotchDepthDb", Spatial.kRearNotchDepthDb, 15.0f);
+        exact("kRearNotchQ", Spatial.kRearNotchQ, 1.6f);
+        // v0.46b ④ 后向对比度拉伸
+        exact("kRearContrastExponent", Spatial.kRearContrastExponent, 0.55f);
+        // v0.46 ④ 早期反射（v0.46b：0.26/0.12 -> 0.34/0.16）
+        exact("kRearEr1DelayFrontMs", Spatial.kRearEr1DelayFrontMs, 7.5f);
+        exact("kRearEr1DelayBackMs", Spatial.kRearEr1DelayBackMs, 11.0f);
+        exact("kRearEr2DelayFrontMs", Spatial.kRearEr2DelayFrontMs, 12.4f);
+        exact("kRearEr2DelayBackMs", Spatial.kRearEr2DelayBackMs, 18.2f);
+        exact("kRearEr1Gain", Spatial.kRearEr1Gain, 0.34f);
+        exact("kRearEr2Gain", Spatial.kRearEr2Gain, 0.16f);
+        exact("kRearErLpHz", Spatial.kRearErLpHz, 2500.0f);
         exact("kSmoothTauSec", Spatial.kSmoothTauSec, 0.05f);
         exact("kMaxDelaySlewFrames", Spatial.kMaxDelaySlewFrames, 2.0f);
-        eq("kSpatialHistoryFrames", Spatial.kSpatialHistoryFrames, 64);
+        // v0.46：64 -> 1024（容纳 18.2 ms 早期反射 ≈ 874 帧 + 插值余量）
+        eq("kSpatialHistoryFrames", Spatial.kSpatialHistoryFrames, 1024);
         eq("kSpatialHistoryChannels", Spatial.kSpatialHistoryChannels, 2);
-        exact("kMinDistanceM", Spatial.kMinDistanceM, 0.25f);
-        exact("kMaxDistanceGain", Spatial.kMaxDistanceGain, 2.0f);
+        // v0.46：距离参考距离 r0 = 0.3 m，下限 = r0，封顶取消 +6 dB。
+        exact("kDistanceRefM", Spatial.kDistanceRefM, 0.3f);
+        exact("kMinDistanceM", Spatial.kMinDistanceM, 0.3f);
+        exact("kMaxDistanceGain", Spatial.kMaxDistanceGain, 1.0f);
+        exact("kDistanceExponent", Spatial.kDistanceExponent, 2.4274533f);
         exact("kSpatialCoordLimit", Spatial.kSpatialCoordLimit, 320.0f);
         eq("kSampleRate", Spatial.kSampleRate, 48000);
         end("SpatialConstantsMatchCpp", f);
@@ -209,17 +234,34 @@ public final class SpatialCheck {
 
     private static void distanceGainClamps() {
         final int f = begin("SpatialDistanceGainClamps");
-        near("d=1", Spatial.distanceGain(1.0f), 1.0f, kTol);      // 0 dB
-        near("d=2", Spatial.distanceGain(2.0f), 0.329877f, kTol); // -9.63 dB（指数 1.6）
-        near("d=0.5", Spatial.distanceGain(0.5f), 2.0f, kTol);    // 近场封顶
-        near("d=0.25", Spatial.distanceGain(0.25f), 2.0f, kTol);  // 近场封顶
-        // 用户 2026-10-27 定稿「距离就是音量」；v0.4 指数 1.6 让远距离变化更明显。
-        near("d=4", Spatial.distanceGain(4.0f), 0.108819f, kTol); // -19.3 dB
-        near("d=10", Spatial.distanceGain(10.0f), 0.025120f, kTol); // -32 dB
-        near("d=40", Spatial.distanceGain(40.0f), 0.002728f, kTol); // -51.3 dB
-        near("d=0", Spatial.distanceGain(0.0f), 2.0f, kTol);      // 除零保护
+        // v0.46 口径（用户定稿）：0.3 m = 100%，2 m = 1%。
+        //   r0 = kDistanceRefM = 0.3 m，p = 2.4274533，封顶 1.0（取消原来的 +6 dB 近场升压）。
+        //   断言值与 tests/test_spatial.cpp 的 SpatialDistanceGainClamps 同源。
+        near("d=0.3", Spatial.distanceGain(0.3f), 1.0f, kTol);       // 参考距离 = 100%
+        near("d=0.5", Spatial.distanceGain(0.5f), 0.289383f, kTol);  // -10.77 dB
+        near("d=0.75", Spatial.distanceGain(0.75f), 0.108148f, kTol); // -19.32 dB
+        near("d=1", Spatial.distanceGain(1.0f), 0.053794f, kTol);    // -25.39 dB
+        near("d=2", Spatial.distanceGain(2.0f), 0.010000f, kTol);    // -40.00 dB ← 1%
+        near("d=3", Spatial.distanceGain(3.0f), 0.003737f, kTol);    // -48.55 dB
+        near("d=10", Spatial.distanceGain(10.0f), 0.000201f, kTol);  // -73.93 dB
+        // 近场不再升压：贴到 0 也只是 100%（0.3 m 以内全部封顶）。
+        near("d=0.2", Spatial.distanceGain(0.2f), 1.0f, kTol);
+        near("d=0.05", Spatial.distanceGain(0.05f), 1.0f, kTol);
+        near("d=0", Spatial.distanceGain(0.0f), 1.0f, kTol);         // 除零保护
         near("20log10(g(2))", (float) (20.0 * Math.log10(Spatial.distanceGain(2.0f))),
-                -9.6340f, 0.02f);
+                -40.0f, 0.02f);
+        // 单调不增，且永远不会是 0（拉得再远也不至于全哑）。
+        boolean positive = true;
+        boolean monotonic = true;
+        float prev = Spatial.distanceGain(0.4f);
+        for (float d = 0.4f; d < 300.0f; d *= 1.7f) {
+            final float g = Spatial.distanceGain(d);
+            if (!(g > 0.0f)) positive = false;
+            if (g > Spatial.distanceGain(d / 1.7f) + 1e-6f) monotonic = false;
+            prev = g;
+        }
+        check("距离增益恒正", positive);
+        check("距离增益单调不增", monotonic);
         end("SpatialDistanceGainClamps", f);
     }
 
@@ -246,9 +288,109 @@ public final class SpatialCheck {
         near("rear(90)", Spatial.rearFactor(90.0f), 0.0f, kTol);
         near("rear(180)", Spatial.rearFactor(180.0f), 1.0f, kTol);
         near("cutoff(0)", Spatial.rearCutoffHz(0.0f), 20000.0f, 1.0f);
-        near("cutoff(1)", Spatial.rearCutoffHz(1.0f), 4000.0f, 1.0f);
-        near("cutoff(0.5)", Spatial.rearCutoffHz(0.5f), 8944.27f, 1.0f); // sqrt(20k*4k)
+        // v0.46：后向低通放宽到 6 kHz（4 kHz 会把"身后"糊成同一团），
+        // 判决权交给陷波与早期反射；这里只断言"越后越闷"的单调底色。
+        near("cutoff(1)", Spatial.rearCutoffHz(1.0f), 6000.0f, 1.0f);
+        near("cutoff(0.5)", Spatial.rearCutoffHz(0.5f), 10954.451f, 1.0f);  // sqrt(20k*6k)
+        // v0.46 ③：陷波中心随 rear 从 6 kHz 抬到 8 kHz（log 插值）。
+        near("notch(0)", Spatial.rearNotchHz(0.0f), 6000.0f, 1.0f);
+        near("notch(1)", Spatial.rearNotchHz(1.0f), 8000.0f, 1.0f);
+        near("notch(0.5)", Spatial.rearNotchHz(0.5f), 6928.203f, 1.0f);  // sqrt(6k*8k)
+        // v0.46 ④：两路反射延迟随 rear 线性变长。
+        near("er1(0)", Spatial.rearReflectionDelaySeconds(0.0f, 0), 0.0075f, 1e-6f);
+        near("er1(1)", Spatial.rearReflectionDelaySeconds(1.0f, 0), 0.0110f, 1e-6f);
+        near("er2(0)", Spatial.rearReflectionDelaySeconds(0.0f, 1), 0.0124f, 1e-6f);
+        near("er2(1)", Spatial.rearReflectionDelaySeconds(1.0f, 1), 0.0182f, 1e-6f);
+        // 线性插值的中点：er1(0.5) = (7.5+11.0)/2 = 9.25 ms；er2(0.5) = (12.4+18.2)/2 = 15.3 ms。
+        near("er1(0.5)", Spatial.rearReflectionDelaySeconds(0.5f, 0), 0.00925f, 1e-7f);
+        near("er2(0.5)", Spatial.rearReflectionDelaySeconds(0.5f, 1), 0.0153f, 1e-7f);
+        // v0.46b：对比度拉伸 —— 两端不动，135° 从 0.707 抬到 0.826。
+        //   0.8265 = 0.70710678^0.55（pow 走 double 再落 float，见 rearFactor）。
+        near("rear(135)", Spatial.rearFactor(135.0f), 0.8265f, 1e-4f);
         end("SpatialRearCue", f);
+    }
+
+    // ------------------------------------------------ 5b. rear=0 时后向链逐位透明（C++ SpatialRearChainIsBypassedAtFront）
+
+    /**
+     * rear=0（正前方/正侧面）时后向链必须是**逐位**透明的：
+     *   dull = sm_rear*(lp-mid) = 0、beta = 0 -> colored 与 mid 逐位相同、wet = 0
+     *   -> rear_extra = (colored + wet) - mid 恰好等于 0 -> (l + 0) 与旧实现逐位相同。
+     *
+     * 这是跨端一致性的硬约束，也是"前方音色一点不动"的保证：只要 beta 在 rear=0 时
+     * 不是精确 0、或反射读历史引入了任何偏移，这里立刻变红。
+     *
+     * 判据分两层：
+     *   ① 恒定直流块（与 C++ 同参数）收敛后的输出电平 = 等功率(0.7071) * makeup(√2) = 1.0；
+     *   ② 更强的版本：跑一段宽带素材，逐样本断言 out == mid * gain_l **按位相等**。
+     *      gain 在 rear=0 时恒为初值，所以"按位相等"是能成立的（不是近似）。
+     */
+    private static void rearChainBitExactAtFront() {
+        final int f = begin("SpatialRearChainBitExactAtFront");
+        final Spatial.SpatialParams params = new Spatial.SpatialParams();
+        final Spatial.ListenerPose listener = Spatial.defaultListener();
+        final float[] buf = new float[480];
+
+        // ① 与 C++ test_spatial.cpp:515 同参数：居中直流 + 正前 + 参考距离，40 块。
+        final Spatial.SpatialState st = newState();
+        st.setTargetPosition(new Spatial.Vec3(0.0f, 0.0f, -Spatial.kDistanceRefM));
+        for (int k = 0; k < 40; ++k) {
+            fill(buf, 240, 1.0f, 1.0f);
+            st.process(buf, 240, listener, params, 1.0f);
+        }
+        // C++ 用 1e-5 容差；这里先按同容差断言，再单独断言"确实不是靠容差擦过去的"。
+        near("rear=0 直流 out L", buf[478], 1.0f, 1e-5f);
+        near("rear=0 直流 out R", buf[479], 1.0f, 1e-5f);
+        // 等功率(0.70710677) * makeup(1.4142135) 在 float 下正好是 0.99999994（=1-1ulp），
+        // 这才是"只有等功率 + makeup"的逐位结果；断言 bit 相等，把 1 ulp 的偏移也钉住。
+        final float expectGain = Spatial.panGains(0.0f, 1.0f)[0] * Spatial.kMonoMakeup;
+        check("rear=0 输出 = mid*（pan*makeup）按位相等（直流）",
+                Float.floatToIntBits(buf[478]) == Float.floatToIntBits(1.0f * expectGain));
+
+        // ② 宽带素材逐样本按位比对：out[i] 必须等于 mid[i] * gain_l，且 gain 全程不变。
+        final float[] in = new float[480];
+        for (int i = 0; i < 480; ++i) {
+            final double t = (double) i / 48000.0;
+            // 三个不整除块长的频率，保证样本相位扫满全周、不撞零交叉。
+            in[i] = (float) (0.30 * Math.sin(2 * Math.PI * 503.0 * t)
+                    + 0.25 * Math.sin(2 * Math.PI * 7301.0 * t)
+                    + 0.20 * Math.sin(2 * Math.PI * 11003.0 * t));
+        }
+        final Spatial.SpatialState st2 = newState();
+        st2.setTargetPosition(new Spatial.Vec3(0.0f, 0.0f, -Spatial.kDistanceRefM));
+        // 先跑 8 块让增益/距离收敛（rear=0 时目标增益恰为初值，收敛后按位不变）。
+        for (int k = 0; k < 8; ++k) {
+            for (int i = 0; i < 240; ++i) {
+                buf[2 * i] = in[2 * i];
+                buf[2 * i + 1] = in[2 * i + 1];
+            }
+            st2.process(buf, 240, listener, params, 1.0f);
+        }
+        final float g0 = st2.gainL();
+        boolean gainConst = true;
+        boolean bitEq = true;
+        int firstBad = -1;
+        int badCount = 0;
+        for (int k = 0; k < 80; ++k) {
+            for (int i = 0; i < 240; ++i) {
+                buf[2 * i] = in[2 * i];
+                buf[2 * i + 1] = in[2 * i + 1];
+            }
+            st2.process(buf, 240, listener, params, 1.0f);
+            if (Float.floatToIntBits(st2.gainL()) != Float.floatToIntBits(g0)) gainConst = false;
+            for (int i = 0; i < 240; ++i) {
+                final float mid = 0.5f * (in[2 * i] + in[2 * i + 1]);
+                if (Float.floatToIntBits(buf[2 * i]) != Float.floatToIntBits(mid * g0)) {
+                    bitEq = false;
+                    ++badCount;
+                    if (firstBad < 0) firstBad = k * 240 + i;
+                }
+            }
+        }
+        check("rear=0 时 gain 在 80 块内按位不变", gainConst);
+        check("rear=0 时 19200 个样本按位等于 mid*gain（首个不符 @" + firstBad
+                + "，共 " + badCount + " 个）", bitEq);
+        end("SpatialRearChainBitExactAtFront", f);
     }
 
     // ------------------------------------------------ 6. 听者朝向/几何（C++ SpatialListenerYawRotatesScene）
@@ -304,7 +446,7 @@ public final class SpatialCheck {
         near("center pan gain", pg[0], 0.70711f, kTol);
 
         final Spatial.SpatialState st = newState();
-        st.setTargetPosition(new Spatial.Vec3(0.0f, 0.0f, -1.0f));
+        st.setTargetPosition(new Spatial.Vec3(0.0f, 0.0f, -Spatial.kDistanceRefM));
         for (int k = 0; k < 20; ++k) {
             fill(buf, 240, 1.0f, 1.0f);
             st.process(buf, 240, listener, params, 1.0f);
@@ -314,7 +456,7 @@ public final class SpatialCheck {
         near("center out R", buf[479], 1.0f, 2e-3f);
 
         final Spatial.SpatialState st2 = newState();
-        st2.setTargetPosition(new Spatial.Vec3(0.0f, 0.0f, -1.0f));
+        st2.setTargetPosition(new Spatial.Vec3(0.0f, 0.0f, -Spatial.kDistanceRefM));
         for (int k = 0; k < 20; ++k) {
             fill(buf, 240, 1.0f, 0.0f);   // 硬左素材：单声道化后 mid=0.5 -> 双耳各 0.5
             st2.process(buf, 240, listener, params, 1.0f);
@@ -331,7 +473,7 @@ public final class SpatialCheck {
         final Spatial.SpatialParams params = new Spatial.SpatialParams();
         final Spatial.ListenerPose listener = Spatial.defaultListener();
         final Spatial.SpatialState st = newState();
-        st.setTargetPosition(new Spatial.Vec3(0.0f, 0.0f, -1.0f));
+        st.setTargetPosition(new Spatial.Vec3(0.0f, 0.0f, -Spatial.kDistanceRefM));
         final float[] buf = new float[480];
         // 60 块 = 300 ms = 6*tau，平滑收敛到 0.5（tau=50 ms）
         for (int k = 0; k < 60; ++k) {
@@ -429,14 +571,14 @@ public final class SpatialCheck {
         final Spatial.ListenerPose listener = Spatial.defaultListener();
         final float[] buf = new float[480];
         final Spatial.SpatialState st = newState();
-        st.setTargetPosition(new Spatial.Vec3(0.0f, 0.0f, -1.0f));   // 正前
+        st.setTargetPosition(new Spatial.Vec3(0.0f, 0.0f, -Spatial.kDistanceRefM));   // 正前（参考距离）
         for (int k = 0; k < 40; ++k) {
             zeros(buf);
             st.process(buf, 240, listener, params, 1.0f);
         }
         near("gain_l 正前收敛", st.gainL(), 1.0f, 1e-3f);
 
-        st.setTargetPosition(new Spatial.Vec3(1.0f, 0.0f, 0.0f));     // 突跳到正右侧（左耳目标 0）
+        st.setTargetPosition(new Spatial.Vec3(Spatial.kDistanceRefM, 0.0f, 0.0f));  // 突跳到正右侧（左耳目标 0）
         st.process(buf, 240, listener, params, 1.0f);
         near("gain_l 5ms 只走 9.5%", st.gainL(), 0.9048f, 0.01f);     // 无台阶
         // ITD 从 0 -> 30.24 帧，限速 2 帧/块
@@ -685,5 +827,191 @@ public final class SpatialCheck {
         check("判据有信号 max_interior>0.001", maxInterior > 0.001f);   // 守卫：判据本身有效
         check("接缝残差 max_boundary=" + maxBoundary + " (<0.01)", maxBoundary < 0.01f);
         end("SpatialDelayRampHasNoBlockJumps", f);
+    }
+    // ------------------------------------------------ 20. v0.46 冲激响应取证（镜像 C++ 同名用例）
+    //
+    // 为什么用冲激响应：稳态正弦只能测"某个频点被压了多少"，测不出"这里有没有一个
+    // 局部凹陷"。耳廓陷波的特征恰恰是**局部**凹陷（两侧还在），必须看整条频响。
+    // 为什么只取左耳：两耳之间是纯延时（ITD），左右相加成梳状，会把谱形状搅乱。
+
+    private static final int kIrFs = 48000;
+    private static final int kIrFrames = 8192;   // > 最长反射 874 帧 + 余量
+
+    /** 单频点 DTFT：|sum h[n] e^{-jwn}|。 */
+    private static float irMagAt(float[] h, float freqHz) {
+        final double w = 2.0 * Math.PI * (double) freqHz / kIrFs;
+        double re = 0.0;
+        double im = 0.0;
+        for (int n = 0; n < h.length; ++n) {
+            final double a = w * (double) n;
+            re += h[n] * Math.cos(a);
+            im -= h[n] * Math.sin(a);
+        }
+        return (float) Math.sqrt(re * re + im * im);
+    }
+
+    private static float irDb(float[] h, float freqHz, float ref) {
+        return 20.0f * (float) Math.log10(irMagAt(h, freqHz) / ref);
+    }
+
+    /** 抓某方位的左耳冲激响应（先跑 1 s 静音让块级平滑量收敛）。 */
+    private static float[] captureLeftIr(float azimuthDeg) {
+        final Spatial.SpatialState st = newState();
+        final Spatial.SpatialParams params = new Spatial.SpatialParams();
+        final Spatial.ListenerPose listener = Spatial.defaultListener();
+        final float rad = azimuthDeg * Spatial.kDegToRad;
+        st.setTargetPosition(new Spatial.Vec3((float) Math.sin(rad) * Spatial.kDistanceRefM,
+                0.0f, -(float) Math.cos(rad) * Spatial.kDistanceRefM));
+        final float[] buf = new float[240 * 2];
+        for (int k = 0; k < 200; ++k) {
+            zeros(buf);
+            st.process(buf, 240, listener, params, 1.0f);
+        }
+        final float[] ir = new float[kIrFrames];
+        int got = 0;
+        zeros(buf);
+        buf[0] = 1.0f;   // 冲激：L=R=1 -> 单声道化后 mid=1
+        buf[1] = 1.0f;
+        st.process(buf, 240, listener, params, 1.0f);
+        for (int i = 0; i < 240; ++i) ir[got++] = buf[2 * i];
+        while (got < kIrFrames) {
+            zeros(buf);
+            st.process(buf, 240, listener, params, 1.0f);
+            for (int i = 0; i < 240 && got < kIrFrames; ++i) ir[got++] = buf[2 * i];
+        }
+        return ir;
+    }
+
+    private static double irEnergy(float[] h, int from, int to) {
+        double e = 0.0;
+        final int end = Math.min(to, h.length);
+        for (int n = from; n < end; ++n) e += (double) h[n] * h[n];
+        return Math.sqrt(e);
+    }
+
+    private static int irPeakLag(float[] h) {
+        int best = 0;
+        for (int n = 0; n < h.length; ++n) {
+            if (Math.abs(h[n]) > Math.abs(h[best])) best = n;
+        }
+        return best;
+    }
+
+    /** ③ 耳廓陷波：正后方 7~8 kHz 必须真的凹下去，而不是"理论上有个 biquad"。 */
+    private static void rearNotchIsARealDip() {
+        final int f = begin("SpatialRearNotchIsARealDip");
+        final float[] front = captureLeftIr(0.0f);
+        final float[] back = captureLeftIr(180.0f);
+        final float ref = irMagAt(front, 1000.0f);
+
+        final float atCenter = irDb(back, 8000.0f, ref);   // 正后 sm_rear_=1 -> 中心 8 kHz
+        final float atLow = irDb(back, 3000.0f, ref);
+        final float atHigh = irDb(back, 12000.0f, ref);
+        System.out.println("      （正后 8 kHz=" + atCenter + " dB，3 kHz=" + atLow
+                + "，12 kHz=" + atHigh + "）");
+        check("正后 8 kHz 深于 -8 dB（实测约 -17.6）", atCenter < -8.0f);
+        check("8 kHz 比 3 kHz 低 6 dB 以上（局部凹陷，不是整体变闷）",
+                atCenter < atLow - 6.0f);
+        check("8 kHz 比 12 kHz 低 4 dB 以上", atCenter < atHigh - 4.0f);
+
+        // 正前方一点都不能动：rear=0 时 beta=0，陷波器逐位透明。
+        near("正前 8 kHz 未被动过", irDb(front, 8000.0f, ref), 0.0f, 1e-4f);
+        near("正前 6 kHz 未被动过", irDb(front, 6000.0f, ref), 0.0f, 1e-4f);
+        end("SpatialRearNotchIsARealDip", f);
+    }
+
+    /** ④ 早期反射：正后方冲激响应在 7~19 ms 之间必须有"第二次到达"。 */
+    private static void rearEarlyReflectionsArriveLate() {
+        final int f = begin("SpatialRearEarlyReflectionsArriveLate");
+        final float[] front = captureLeftIr(0.0f);
+        final float[] back = captureLeftIr(180.0f);
+        final int ms7 = kIrFs * 7 / 1000;
+        final int ms20 = kIrFs * 20 / 1000;
+        final double frontTail = irEnergy(front, ms7, ms20);
+        final double backTail = irEnergy(back, ms7, ms20);
+        System.out.println("      （7~20 ms 能量：正后=" + backTail + "  正前=" + frontTail + "）");
+        check("正后 7~20 ms 有可观反射能量（>0.05）", backTail > 0.05);
+        check("正后反射能量是正前的 20 倍以上", backTail > 20.0 * frontTail);
+
+        // 反射延迟随 rear 变长：第一路 7.5->11 ms，第二路 12.4->18.2 ms。
+        // 判据用 135/150 这两个"真有反射"的方位来比，而不是 45——45 在前半球，
+        // rear=0，后向链整条是关的，拿它比等于跟数值零比，测不出方向性。
+        // 实测 7~20 ms 能量：180=0.1046，150=0.0677，135=0.0488。
+        final float[] br = captureLeftIr(135.0f);
+        final float[] b150 = captureLeftIr(150.0f);
+        final double eBr = irEnergy(br, ms7, ms20);
+        final double eB150 = irEnergy(b150, ms7, ms20);
+        System.out.println("      （7~20 ms 能量：180=" + backTail + "  150=" + eB150
+                + "  135=" + eBr + "）");
+        check("正后反射能量 > 135° 的 1.5 倍（实测 2.14）", backTail > 1.5 * eBr);
+        check("正后反射能量 > 150° 的 1.4 倍（实测 1.55）", backTail > 1.4 * eB150);
+
+        final int ms10 = kIrFs * 10 / 1000;
+        final int ms12 = kIrFs * 12 / 1000;
+        final double b = irEnergy(back, ms10, ms12);
+        final double q = irEnergy(br, ms10, ms12);
+        System.out.println("      （10~12 ms 能量：正后=" + b + "  135°=" + q + "）");
+        check("正后 10~12 ms 能量 > 135° 的 1.5 倍（第一路反射更晚更弱）", b > 1.5 * q);
+        end("SpatialRearEarlyReflectionsArriveLate", f);
+    }
+
+    /** 总判据：把"前"与"后"的频响逐点相减，谱距 RMS = "两个方位听起来有多不一样"。 */
+    private static void frontBackSpectralDistance() {
+        final int f = begin("SpatialFrontBackSpectralDistance");
+        final float[] bands = new float[]{500f, 1000f, 2000f, 3000f, 4000f,
+                6000f, 7000f, 8000f, 10000f, 12000f};
+        final float[] front = captureLeftIr(0.0f);
+        final float[] fr = captureLeftIr(45.0f);
+        final float[] br = captureLeftIr(135.0f);
+        final float[] back = captureLeftIr(180.0f);
+
+        final double sdFB = spectralDistance(front, back, bands);
+        final double sdFR = spectralDistance(fr, br, bands);
+        final double sdBB = spectralDistance(back, br, bands);
+        System.out.println("      （按位置归一的谱距 RMS：前/后=" + sdFB + "  前右/后右=" + sdFR
+                + "  后/后右=" + sdBB + " dB）");
+        // v0.45 基线：4.70 / 2.66 / 3.05 dB。v0.46：7.93 / 3.65 / 4.97 dB。
+        check("正前 vs 正后谱距 > 6.5 dB（基线 4.70）", sdFB > 6.5);
+        check("斜前 vs 斜后谱距 > 3.2 dB（基线 2.66）", sdFR > 3.2);
+        check("正后 vs 斜后谱距 > 4.0 dB（基线 3.05，否则身后仍糊成一团）", sdBB > 4.0);
+
+        // 后半球整段都要"明显不像前方"，不只是正后方一个点。
+        // 实测 135°=4.51 150°=4.81 165°=6.68 180°=7.93（基线 2.66/2.93/3.76/4.70）。
+        // 注意别把 120° 放进来 —— 那里 rear 刚过 0.68，线索本来就该弱。
+        boolean allBehind = true;
+        final StringBuilder detail = new StringBuilder();
+        for (float az = 135.0f; az <= 180.0f + 1e-3f; az += 15.0f) {
+            final double sd = spectralDistance(front, captureLeftIr(az), bands);
+            detail.append(" az=").append((int) az).append(':').append(String.format("%.2f", sd));
+            if (sd <= 4.0) allBehind = false;
+        }
+        System.out.println("      （后半球逐方位谱距：" + detail + " dB）");
+        check("后半球 135/150/165/180° 每处谱距 > 4.0 dB", allBehind);
+        end("SpatialFrontBackSpectralDistance", f);
+    }
+
+    private static double spectralDistance(float[] a, float[] b, float[] bands) {
+        final float ra = irMagAt(a, 1000.0f);
+        final float rb = irMagAt(b, 1000.0f);
+        double acc = 0.0;
+        for (int i = 0; i < bands.length; ++i) {
+            final double d = (double) irDb(b, bands[i], rb) - (double) irDb(a, bands[i], ra);
+            acc += d * d;
+        }
+        return Math.sqrt(acc / bands.length);
+    }
+
+    /** 后向染色绝不能破坏 ITD —— 它是唯一靠得住的前后无关线索。 */
+    private static void rearChainLeavesItdIntact() {
+        final int f = begin("SpatialRearChainLeavesItdIntact");
+        final int lag180 = irPeakLag(captureLeftIr(180.0f));
+        final int lag45 = irPeakLag(captureLeftIr(45.0f));
+        final int lag135 = irPeakLag(captureLeftIr(135.0f));
+        System.out.println("      （峰值滞后：180°=" + lag180 + " 45°=" + lag45
+                + " 135°=" + lag135 + " 帧）");
+        eq("正后方 ITD = 0", lag180, 0);
+        eq("45° 左耳领先 21 帧（0.438 ms）", lag45, 21);
+        eq("135° 与 45° 峰值滞后绝对值相同（后向链只加谱、不加时延）", lag135, 21);
+        end("SpatialRearChainLeavesItdIntact", f);
     }
 }

@@ -5,7 +5,11 @@ import com.audiohub.source.GraphFit;
  *
  * 复刻 HubGraphView 的输入：density=3、顶部预留 dp24、标签盒 60dp×30dp、球半径上下限；
  * 断言「视野自适应」的硬约束：最远节点连球半径与标签都落在画布内（12% 边距）、
- * 视野半径 ∈ [2.6 m, 硬上限]、ppu 不超过近景 2.6 m 比例、方位角不变、环按真比例。
+ * 视野半径 ∈ [MIN_VIEW_RADIUS_M, 硬上限]、ppu 不超过近景 comfortable 比例、
+ * 方位角不变、环按真比例。
+ *
+ * v0.45：球半径改为「世界半径 × ppu」，像素上下限只剩 1.5 px 下限（与
+ * Scene3D.CFG.R_PX_FLOOR 同值）；HUB_BALL_R=0.20、NODE_BALL_R=0.105。
  *
  * 运行：powershell -ExecutionPolicy Bypass -File android\verify\run-graphfit-check.ps1
  */
@@ -18,8 +22,12 @@ public final class GraphFitCheck {
     private static final float TOP = 24f * D;               // sp(16)+dp(8)
     private static final float LABEL_HALF_W = 60f * D;
     private static final float LABEL_V = 30f * D;
-    private static final float HUB_MIN = 18f * D, HUB_MAX = 56f * D;
-    private static final float NODE_MIN = 8f * D, NODE_MAX = 22f * D;
+
+    // v0.45：不再用 dp 夹紧球半径，只留一个 1.5 px 的极小下限 + 一个不生效的大上限。
+    private static final float BALL_MIN = 1.5f;
+    private static final float BALL_MAX = 100000f;
+    private static final float HUB_R = 0.20f;
+    private static final float NODE_R = 0.105f;
 
     private static void check(String name, boolean ok) {
         checks++;
@@ -30,8 +38,7 @@ public final class GraphFitCheck {
     }
 
     private static GraphFit.Item node(float wx, float wz, boolean hub) {
-        return new GraphFit.Item(wx, wz, hub ? 0.23f : 0.145f,
-                hub ? HUB_MIN : NODE_MIN, hub ? HUB_MAX : NODE_MAX);
+        return new GraphFit.Item(wx, wz, hub ? HUB_R : NODE_R, BALL_MIN, BALL_MAX);
     }
 
     private static float halfW(float w) {
@@ -62,25 +69,22 @@ public final class GraphFitCheck {
                 {1080, 900}, {1080, 780}, {1080, 700}, {1440, 1200}, {720, 900}, {720, 600},
         };
 
-        // 1) 无节点：保持原来的 2.6 m 近景观感（ppu = comfortable）
+        // 1) 无节点：直接用近景 comfortable（ppu = minHalf / MIN_VIEW_RADIUS_M）
         for (float[] cv : canvases) {
             final GraphFit.Result r = GraphFit.fit(cv[0], cv[1], TOP, null, LABEL_HALF_W, LABEL_V);
             final String tag = "empty " + (int) cv[0] + "x" + (int) cv[1];
-            check(tag + " view=2.6", Math.abs(r.viewRadiusM - GraphFit.MIN_VIEW_RADIUS_M) < 1e-3f);
+            check(tag + " view=minView", Math.abs(r.viewRadiusM - GraphFit.MIN_VIEW_RADIUS_M) < 1e-3f);
             check(tag + " ppu=comfortable", Math.abs(r.ppu - comfortable(cv[0], cv[1])) < 1e-3f);
         }
 
-        // 2) 近节点不放大（视野半径不小于 2.6 m，ppu 不超过近景比例）
+        // 2) 近节点（0.1–1 m）：不许放大到比 MIN_VIEW_RADIUS_M 更近，且必须装得下
         final GraphFit.Item[] near = {node(0, 0, true), node(1, 0, false), node(-0.8f, 0.6f, false)};
         for (float[] cv : canvases) {
             final GraphFit.Result r = GraphFit.fit(cv[0], cv[1], TOP, near, LABEL_HALF_W, LABEL_V);
             final String tag = "near " + (int) cv[0] + "x" + (int) cv[1];
-            check(tag + " view>=2.6", r.viewRadiusM >= GraphFit.MIN_VIEW_RADIUS_M - 1e-3f);
+            check(tag + " view>=minView", r.viewRadiusM >= GraphFit.MIN_VIEW_RADIUS_M - 1e-3f);
+            check(tag + " ppu<=comfortable", r.ppu <= comfortable(cv[0], cv[1]) + 1e-3f);
             check(tag + " fits", fitsInside(r, cv[0], cv[1], near));
-            if (cv[0] >= 1080f) {
-                // 常用宽度下近景仍是原来的 2.6 m 观感；<240dp 的窄画布会为了标签整体缩远一点。
-                check(tag + " view=2.6", Math.abs(r.viewRadiusM - GraphFit.MIN_VIEW_RADIUS_M) < 1e-3f);
-            }
         }
 
         // 3) 远处节点（10 m / 100 m / ±320 m / 对角）：落在画布内、方位不变、环真比例
@@ -122,6 +126,15 @@ public final class GraphFitCheck {
         check("monotonic 2m>=20m", r1.ppu >= r2.ppu - 1e-3f);
         check("monotonic 20m>=200m", r2.ppu >= r3.ppu - 1e-3f);
         check("ring ratio", Math.abs((2.4f * r3.ppu) / (1.0f * r3.ppu) - 2.4f) < 1e-4f);
+
+        // 5b) 球半径与 ppu 严格等比：同一 ppu 下半径比恒等于世界半径比（相对大小固定）
+        for (float[] cv : canvases) {
+            final GraphFit.Result r = GraphFit.fit(cv[0], cv[1], TOP, near, LABEL_HALF_W, LABEL_V);
+            final float rh = node(0, 0, true).radiusPx(r.ppu);
+            final float rn = node(1, 0, false).radiusPx(r.ppu);
+            final String tag = "ratio " + (int) cv[0] + "x" + (int) cv[1];
+            check(tag + " hub:node=" + (HUB_R / NODE_R), Math.abs(rh / rn - HUB_R / NODE_R) < 1e-4f);
+        }
 
         // 6) 随机 500 组 × 全部画布：1..8 个节点、坐标 ±320 m 内，必须全部装得下
         final java.util.Random rnd = new java.util.Random(20261027L);

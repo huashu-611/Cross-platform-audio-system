@@ -82,28 +82,28 @@ public final class Scene3D {
         public static final double CAM_DIST = 3.4;
 
         // —— 默认摆放：32 个互不重叠的预计算槽位 ——
-        public static final double SLOT_R_MIN = 0.85;
-        public static final double SLOT_R_MAX = 2.2;
+        public static final double SLOT_R_MIN = 0.35;
+        public static final double SLOT_R_MAX = 2.0;
         /** 前方（-Z）节点投影会贴近 hub，太近会叠球。 */
-        public static final double SLOT_FRONT_MIN = 1.35;
+        public static final double SLOT_FRONT_MIN = 0.55;
         /** 后方（+Z，靠近相机）再远投影会掉出屏幕下沿。 */
-        public static final double SLOT_REAR_MAX = 1.5;
+        public static final double SLOT_REAR_MAX = 1.45;
         /** 槽位间最小平面距离（米），保证球不叠。 */
-        public static final double SLOT_GAP = 0.42;
+        public static final double SLOT_GAP = 0.30;
 
         // —— 拖动 / 相机 ——
-        /** 拖节点离听者太近会“穿过头”。 */
-        public static final double DRAG_R_MIN = 0.45;
+        /** 拖节点离听者太近会“穿过头”。v0.46：0.3 m 以内音量都是 100%。 */
+        public static final double DRAG_R_MIN = 0.1;
         /** 房间边界（地面 R=2 环外侧留一点余量）。 */
         public static final double DRAG_R_MAX = 2.3;
 
         // —— 球体尺寸：屏幕半径 = 透视投影 × 距离缩放（近大远小，与音量衰减同向）——
-        /** 旧 HUB_R=46px 反解：46*2.6/522.71≈0.229。 */
-        public static final double HUB_BALL_R = 0.23;
-        /** 旧 NODE_R=29px 反解：29*2.6/522.71≈0.144。 */
-        public static final double NODE_BALL_R = 0.145;
-        /** 距离 1 m 时缩放 = 1。 */
-        public static final double SIZE_REF = 1.0;
+        /** v0.45：世界半径，屏幕半径 = 本值 × ppu（不再有任何像素夹紧）。 */
+        public static final double HUB_BALL_R = 0.20;
+        /** v0.45：同上；默认相机 3.4 m 时 ppu≈154 → 16 px。 */
+        public static final double NODE_BALL_R = 0.105;
+        /** 仅留档：与音频侧 kDistanceRefM 同值（v0.46 = 0.3）。视觉尺寸不再叠距离缩放。 */
+        public static final double SIZE_REF = 0.3;
         /** scale = (sizeRef/dist)^sizePow。 */
         public static final double SIZE_POW = 0.55;
         public static final double SIZE_MIN = 0.55;
@@ -117,17 +117,19 @@ public final class Scene3D {
         /** 俯仰下限，避免视线与地面平行（unproject 退化）。 */
         public static final double PITCH_MIN = 6;
         public static final double PITCH_MAX = 74;
-        /** 滚轮缩放下限/上限。 */
-        public static final double DIST_MIN = 1.2;
-        public static final double DIST_MAX = 6.0;
+        /** v0.45：缩放范围收紧（原来 1.2~6.0 太宽，滚两下就飞出去）。 */
+        public static final double DIST_MIN = 1.45;
+        public static final double DIST_MAX = 6.2;
 
         public static final double NEAR = 0.05;
         public static final double FOCAL_PX = FOCAL;
-        /** 球半径像素夹紧：远处可读、近处不压邻居。 */
-        public static final double HUB_R_MIN = 26;
-        public static final double HUB_R_MAX = 64;
-        public static final double NODE_R_MIN = 12;
-        public static final double NODE_R_MAX = 40;
+        /**
+         * v0.45：取消球半径的像素夹紧（与 scene3d.js 的 rPxFloor 同一口径）。
+         * 以前 HUB_R_MIN/HUB_R_MAX/NODE_R_MIN/NODE_R_MAX 把屏幕半径夹在固定像素区间里，
+         * 于是"缩放"只改变球之间的距离、不改变球的大小（球大小不变而周围星球变远）。
+         * 现在半径纯 = 世界半径 × ppu，只留一个极小地板防止退化成亚像素点。
+         */
+        public static final double R_PX_FLOOR = 1.5;
         public static final double DPR_MAX = 2;
         /** 非 hub 节点 >8 时只给选中/悬停画名称（报告 §2.1.3/R3）。 */
         public static final int LABEL_LOD = 8;
@@ -403,13 +405,14 @@ public final class Scene3D {
     }
 
     /**
-     * 槽位初始半径表（逐字自 scene3d.js）：32 个互不相同的半径，覆盖 0.85–2.2 m。
+     * 槽位初始半径表（逐字自 scene3d.js）：32 个互不相同的半径，覆盖 0.75–2.00 m。
+     * v0.46：整张表压到「0.75–2.00 m」，与音量口径（0.3 m=100%、2 m=1%）同尺度。
      */
     private static final double[] SLOT_RADII = {
-            2.00, 1.55, 1.20, 1.85, 0.95, 2.10, 1.30, 2.20,
-            1.05, 1.70, 1.45, 0.85, 1.90, 1.15, 2.05, 1.60,
-            1.00, 1.75, 0.90, 2.15, 1.35, 1.50, 1.80, 1.10,
-            1.65, 1.25, 1.95, 0.85, 1.40, 1.85, 1.05, 1.55
+            2.00, 1.55, 1.20, 1.85, 0.95, 1.98, 1.30, 2.00,
+            1.05, 1.70, 1.45, 0.85, 1.90, 1.15, 1.95, 1.60,
+            1.00, 1.75, 0.90, 1.98, 1.35, 1.50, 1.80, 1.10,
+            1.65, 1.25, 1.92, 0.75, 1.40, 1.85, 1.05, 1.55
     };
 
     private static final List<Slot> SLOTS = buildSlots();
@@ -671,25 +674,23 @@ public final class Scene3D {
     // 九、球半径（逐行移植 scene3d.js projectAll() 的尺寸计算）
     // =====================================================================
 
-    /** 汇聚端球半径（px）：clamp(0.23 * ppu, 26, 64)。 */
+    /** 汇聚端球半径（px）= 世界半径 × ppu，只受极小地板约束。 */
     public static double hubRadiusPx(double ppu) {
-        return clamp(CFG.HUB_BALL_R * ppu, CFG.HUB_R_MIN, CFG.HUB_R_MAX);
+        return Math.max(CFG.HUB_BALL_R * ppu, CFG.R_PX_FLOOR);
     }
 
     /**
-     * 近大远小系数：clamp((1.0/max(dist,0.2))^0.55, 0.55, 1.5)。
-     * 距离 1 m 时 = 1，越远越小 —— 与音量衰减同向。
+     * v0.45：恒为 1 —— 距离缩放已经由"透视投影近大远小"本身提供，
+     * 再乘一层 (sizeRef/dist)^sizePow 等于同一效果算两遍，
+     * 拖动时尺寸跳变，并让"相对大小"随距离漂移。方法保留只为兼容调用方与自检。
      */
     public static double nodeSizeScale(double dist) {
-        return clamp(
-                Math.pow(CFG.SIZE_REF / Math.max(dist, 0.2), CFG.SIZE_POW),
-                CFG.SIZE_MIN, CFG.SIZE_MAX);
+        return 1.0;
     }
 
-    /** 普通节点球半径（px）：clamp(0.145 * ppu * sizeScale, 12, 40)。 */
+    /** 普通节点球半径（px）= 世界半径 × ppu（不再叠距离缩放）。 */
     public static double nodeRadiusPx(double ppu, double dist) {
-        return clamp(CFG.NODE_BALL_R * ppu * nodeSizeScale(dist),
-                CFG.NODE_R_MIN, CFG.NODE_R_MAX);
+        return Math.max(CFG.NODE_BALL_R * ppu, CFG.R_PX_FLOOR);
     }
 
     // =====================================================================

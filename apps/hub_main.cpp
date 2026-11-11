@@ -29,7 +29,7 @@ namespace {
 // 版本标记：与 APK versionName / ui/package.json 保持一致。
 // 启动横幅会打出来，现场排查时第一件事就是确认"跑的是不是修好的那一版"。
 // 以前没有版本号，只能靠 md5 去猜，多台机器、多个打包产物时特别容易搞混。
-const char* const kVersionTag = "0.43";
+const char* const kVersionTag = "0.46";
 
 // --log 的路径可能是 UTF-8 中文。Windows 的 CRT 会用 ANSI 代码页解释窄路径，
 // 中文路径直接打不开；这里统一按 UTF-8 解码成宽字符再 _wfopen，然后 _dup2
